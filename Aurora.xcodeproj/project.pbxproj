@@ -6,23 +6,70 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		84D085012F094A5A00C35112 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085002F0949F700C35112 /* ContentView.swift */; };
+		84D085022F094A5A00C35112 /* AuroraApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D084FF2F0949CC00C35112 /* AuroraApp.swift */; };
+		84D085062F094CED00C35112 /* libtdjson.1.8.59.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = 84D085052F094CED00C35112 /* libtdjson.1.8.59.dylib */; };
+		84D085082F094D2C00C35112 /* libtdjson.1.8.59.dylib in CopyFiles */ = {isa = PBXBuildFile; fileRef = 84D085052F094CED00C35112 /* libtdjson.1.8.59.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		84D0850A2F094EE800C35112 /* TDLibClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085092F094D8400C35112 /* TDLibClient.swift */; };
+		84D0850C2F094FC700C35112 /* Config.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D0850B2F094FC000C35112 /* Config.swift */; };
+		84D0850E2F095F3200C35112 /* TelegramModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D0850D2F095F2F00C35112 /* TelegramModels.swift */; };
+		84D085102F095F7E00C35112 /* TelegramService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D0850F2F095F7C00C35112 /* TelegramService.swift */; };
+		84D085122F095FA000C35112 /* TelegramStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085112F095F9B00C35112 /* TelegramStore.swift */; };
+		84D0851D2F09691700C35112 /* ChatInspectorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D0851C2F09689200C35112 /* ChatInspectorView.swift */; };
+		84D0851E2F09691700C35112 /* ComposerBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D0851B2F09687C00C35112 /* ComposerBar.swift */; };
+		84D0851F2F09691700C35112 /* MessageGroupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D0851A2F09686100C35112 /* MessageGroupView.swift */; };
+		84D085202F09691700C35112 /* MessagesPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085192F09684A00C35112 /* MessagesPane.swift */; };
+		84D085212F09691700C35112 /* ChatHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085182F09682D00C35112 /* ChatHeader.swift */; };
+		84D085222F09691700C35112 /* ChatScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085172F09680600C35112 /* ChatScreen.swift */; };
+		84D085242F096ED700C35112 /* MessageBubble.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085232F096ED500C35112 /* MessageBubble.swift */; };
+		84D085262F096F4600C35112 /* ChatRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085252F096F4500C35112 /* ChatRow.swift */; };
+		84E687892F097FF400C89BE7 /* ChatTitleButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84E687882F097FF200C89BE7 /* ChatTitleButton.swift */; };
+		84E6878B2F09869100C89BE7 /* BottomScrim.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84E6878A2F09868F00C89BE7 /* BottomScrim.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		84D085072F094D0800C35112 /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				84D085082F094D2C00C35112 /* libtdjson.1.8.59.dylib in CopyFiles */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		84D084E32F09476900C35112 /* Aurora.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Aurora.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		84D084FF2F0949CC00C35112 /* AuroraApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuroraApp.swift; sourceTree = "<group>"; };
+		84D085002F0949F700C35112 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		84D085032F094BC300C35112 /* TDLibBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = TDLibBridge.h; sourceTree = "<group>"; };
+		84D085052F094CED00C35112 /* libtdjson.1.8.59.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libtdjson.1.8.59.dylib; path = Vendor/TDLib/lib/libtdjson.1.8.59.dylib; sourceTree = "<group>"; };
+		84D085092F094D8400C35112 /* TDLibClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TDLibClient.swift; sourceTree = "<group>"; };
+		84D0850B2F094FC000C35112 /* Config.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Config.swift; sourceTree = "<group>"; };
+		84D0850D2F095F2F00C35112 /* TelegramModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelegramModels.swift; sourceTree = "<group>"; };
+		84D0850F2F095F7C00C35112 /* TelegramService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelegramService.swift; sourceTree = "<group>"; };
+		84D085112F095F9B00C35112 /* TelegramStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelegramStore.swift; sourceTree = "<group>"; };
+		84D085172F09680600C35112 /* ChatScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatScreen.swift; sourceTree = "<group>"; };
+		84D085182F09682D00C35112 /* ChatHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatHeader.swift; sourceTree = "<group>"; };
+		84D085192F09684A00C35112 /* MessagesPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessagesPane.swift; sourceTree = "<group>"; };
+		84D0851A2F09686100C35112 /* MessageGroupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageGroupView.swift; sourceTree = "<group>"; };
+		84D0851B2F09687C00C35112 /* ComposerBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerBar.swift; sourceTree = "<group>"; };
+		84D0851C2F09689200C35112 /* ChatInspectorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatInspectorView.swift; sourceTree = "<group>"; };
+		84D085232F096ED500C35112 /* MessageBubble.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageBubble.swift; sourceTree = "<group>"; };
+		84D085252F096F4500C35112 /* ChatRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatRow.swift; sourceTree = "<group>"; };
+		84E687882F097FF200C89BE7 /* ChatTitleButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTitleButton.swift; sourceTree = "<group>"; };
+		84E6878A2F09868F00C89BE7 /* BottomScrim.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BottomScrim.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
-
-/* Begin PBXFileSystemSynchronizedRootGroup section */
-		84D084E52F09476900C35112 /* Aurora */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = Aurora;
-			sourceTree = "<group>";
-		};
-/* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		84D084E02F09476900C35112 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				84D085062F094CED00C35112 /* libtdjson.1.8.59.dylib in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -32,7 +79,10 @@
 		84D084DA2F09476900C35112 = {
 			isa = PBXGroup;
 			children = (
-				84D084E52F09476900C35112 /* Aurora */,
+				84D084F72F09490B00C35112 /* Core */,
+				84D084F42F0948C600C35112 /* Features */,
+				84D084F22F0948AC00C35112 /* App */,
+				84D085042F094CEC00C35112 /* Frameworks */,
 				84D084E42F09476900C35112 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -45,6 +95,117 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		84D084F22F0948AC00C35112 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				84D085002F0949F700C35112 /* ContentView.swift */,
+				84D084FF2F0949CC00C35112 /* AuroraApp.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		84D084F42F0948C600C35112 /* Features */ = {
+			isa = PBXGroup;
+			children = (
+				84D084FC2F09494400C35112 /* Chat */,
+				84D084FB2F09493A00C35112 /* Chats */,
+				84D084FA2F09492D00C35112 /* Auth */,
+			);
+			path = Features;
+			sourceTree = "<group>";
+		};
+		84D084F52F0948D700C35112 /* UI */ = {
+			isa = PBXGroup;
+			children = (
+				84D084FE2F09495900C35112 /* Theme */,
+				84D084FD2F09494C00C35112 /* Components */,
+			);
+			path = UI;
+			sourceTree = "<group>";
+		};
+		84D084F72F09490B00C35112 /* Core */ = {
+			isa = PBXGroup;
+			children = (
+				84D084F92F09492200C35112 /* Config */,
+				84D084F82F09491600C35112 /* TDLib */,
+				84D084F52F0948D700C35112 /* UI */,
+			);
+			path = Core;
+			sourceTree = "<group>";
+		};
+		84D084F82F09491600C35112 /* TDLib */ = {
+			isa = PBXGroup;
+			children = (
+				84D085112F095F9B00C35112 /* TelegramStore.swift */,
+				84D0850F2F095F7C00C35112 /* TelegramService.swift */,
+				84D0850D2F095F2F00C35112 /* TelegramModels.swift */,
+				84D085092F094D8400C35112 /* TDLibClient.swift */,
+				84D085032F094BC300C35112 /* TDLibBridge.h */,
+			);
+			path = TDLib;
+			sourceTree = "<group>";
+		};
+		84D084F92F09492200C35112 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				84D0850B2F094FC000C35112 /* Config.swift */,
+			);
+			path = Config;
+			sourceTree = "<group>";
+		};
+		84D084FA2F09492D00C35112 /* Auth */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Auth;
+			sourceTree = "<group>";
+		};
+		84D084FB2F09493A00C35112 /* Chats */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Chats;
+			sourceTree = "<group>";
+		};
+		84D084FC2F09494400C35112 /* Chat */ = {
+			isa = PBXGroup;
+			children = (
+				84E6878A2F09868F00C89BE7 /* BottomScrim.swift */,
+				84E687882F097FF200C89BE7 /* ChatTitleButton.swift */,
+				84D085252F096F4500C35112 /* ChatRow.swift */,
+				84D085232F096ED500C35112 /* MessageBubble.swift */,
+				84D0851C2F09689200C35112 /* ChatInspectorView.swift */,
+				84D0851B2F09687C00C35112 /* ComposerBar.swift */,
+				84D0851A2F09686100C35112 /* MessageGroupView.swift */,
+				84D085192F09684A00C35112 /* MessagesPane.swift */,
+				84D085182F09682D00C35112 /* ChatHeader.swift */,
+				84D085172F09680600C35112 /* ChatScreen.swift */,
+			);
+			path = Chat;
+			sourceTree = "<group>";
+		};
+		84D084FD2F09494C00C35112 /* Components */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Components;
+			sourceTree = "<group>";
+		};
+		84D084FE2F09495900C35112 /* Theme */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Theme;
+			sourceTree = "<group>";
+		};
+		84D085042F094CEC00C35112 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				84D085052F094CED00C35112 /* libtdjson.1.8.59.dylib */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -55,13 +216,11 @@
 				84D084DF2F09476900C35112 /* Sources */,
 				84D084E02F09476900C35112 /* Frameworks */,
 				84D084E12F09476900C35112 /* Resources */,
+				84D085072F094D0800C35112 /* CopyFiles */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-			);
-			fileSystemSynchronizedGroups = (
-				84D084E52F09476900C35112 /* Aurora */,
 			);
 			name = Aurora;
 			packageProductDependencies = (
@@ -119,6 +278,23 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				84D0851D2F09691700C35112 /* ChatInspectorView.swift in Sources */,
+				84D0851E2F09691700C35112 /* ComposerBar.swift in Sources */,
+				84D0851F2F09691700C35112 /* MessageGroupView.swift in Sources */,
+				84D085242F096ED700C35112 /* MessageBubble.swift in Sources */,
+				84D085202F09691700C35112 /* MessagesPane.swift in Sources */,
+				84D085212F09691700C35112 /* ChatHeader.swift in Sources */,
+				84D085262F096F4600C35112 /* ChatRow.swift in Sources */,
+				84D085222F09691700C35112 /* ChatScreen.swift in Sources */,
+				84D085122F095FA000C35112 /* TelegramStore.swift in Sources */,
+				84E6878B2F09869100C89BE7 /* BottomScrim.swift in Sources */,
+				84D085102F095F7E00C35112 /* TelegramService.swift in Sources */,
+				84D0850A2F094EE800C35112 /* TDLibClient.swift in Sources */,
+				84D0850C2F094FC700C35112 /* Config.swift in Sources */,
+				84D085012F094A5A00C35112 /* ContentView.swift in Sources */,
+				84D085022F094A5A00C35112 /* AuroraApp.swift in Sources */,
+				84E687892F097FF400C89BE7 /* ChatTitleButton.swift in Sources */,
+				84D0850E2F095F3200C35112 /* TelegramModels.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -250,28 +426,47 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				AUTOMATION_APPLE_EVENTS = NO;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 4F34Y2LNZG;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = NO;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
+				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
+				ENABLE_RESOURCE_ACCESS_CALENDARS = NO;
+				ENABLE_RESOURCE_ACCESS_CAMERA = NO;
+				ENABLE_RESOURCE_ACCESS_CONTACTS = NO;
+				ENABLE_RESOURCE_ACCESS_LOCATION = NO;
+				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = NO;
 				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/Vendor/TDLib/include";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
 					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/Vendor/TDLib/lib",
+					"$(PROJECT_DIR)/Vendor/TDLib/lib",
 				);
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = org.cae744519ec3ac28.Aurora;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
+				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
+				RUNTIME_EXCEPTION_ALLOW_JIT = NO;
+				RUNTIME_EXCEPTION_ALLOW_UNSIGNED_EXECUTABLE_MEMORY = NO;
+				RUNTIME_EXCEPTION_DEBUGGING_TOOL = NO;
+				RUNTIME_EXCEPTION_DISABLE_EXECUTABLE_PAGE_PROTECTION = NO;
+				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = NO;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Core/TDLib/TDLibBridge.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};
@@ -282,28 +477,47 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				AUTOMATION_APPLE_EVENTS = NO;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 4F34Y2LNZG;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = NO;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
+				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
+				ENABLE_RESOURCE_ACCESS_CALENDARS = NO;
+				ENABLE_RESOURCE_ACCESS_CAMERA = NO;
+				ENABLE_RESOURCE_ACCESS_CONTACTS = NO;
+				ENABLE_RESOURCE_ACCESS_LOCATION = NO;
+				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = NO;
 				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/Vendor/TDLib/include";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
 					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/Vendor/TDLib/lib",
+					"$(PROJECT_DIR)/Vendor/TDLib/lib",
 				);
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = org.cae744519ec3ac28.Aurora;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
+				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
+				RUNTIME_EXCEPTION_ALLOW_JIT = NO;
+				RUNTIME_EXCEPTION_ALLOW_UNSIGNED_EXECUTABLE_MEMORY = NO;
+				RUNTIME_EXCEPTION_DEBUGGING_TOOL = NO;
+				RUNTIME_EXCEPTION_DISABLE_EXECUTABLE_PAGE_PROTECTION = NO;
+				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = NO;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Core/TDLib/TDLibBridge.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};
