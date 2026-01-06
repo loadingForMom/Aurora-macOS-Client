@@ -60,8 +60,11 @@ struct ChatMessageGroupView: View {
                         let k = max(0, 1 - min(distanceToBottom / 360, 1))
 
                         // Stronger amplitude (you asked for more).
-                        let y = (-jellyScrollImpulse * 0.85 * k)
-                        return content.offset(y: y)
+                        let y = (-jellyScrollImpulse * 1.45 * k)
+                        let stretch = 1 + min(abs(jellyScrollImpulse) / 320, 0.22) * k
+                        return content
+                            .scaleEffect(x: 1, y: stretch, anchor: .bottom)
+                            .offset(y: y)
                     }
                 }
             }

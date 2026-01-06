@@ -132,8 +132,8 @@ struct MessagesPane: View {
 
     private func pushJellyImpulse(delta: CGFloat) {
         // Stronger and smoother: clamp larger, quantize smaller.
-        let clamped = max(-420, min(420, delta))
-        let quantized = (clamped / 6).rounded() * 6
+        let clamped = max(-700, min(700, delta))
+        let quantized = (clamped / 4).rounded() * 4
 
         if quantized == jellyScrollImpulse { return }
         jellyScrollImpulse = quantized
