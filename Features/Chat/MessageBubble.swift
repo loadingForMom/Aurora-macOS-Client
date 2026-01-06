@@ -10,14 +10,13 @@ import SwiftUI
 struct MessageBubble: View {
     let msg: TGMessage
 
-    // Trackpad “reveal exact time” (0…maxReveal), passed from parent.
+    /// Trackpad “reveal exact time” (0…maxReveal), passed from parent.
     let revealTimeX: CGFloat
 
-    // Defaults so call sites can just do MessageBubble(msg: msg)
     var onRetry: () -> Void = {}
     var onDelete: () -> Void = {}
 
-    /// Kept for compatibility; not used by default now (jelly is applied via visualEffect in parent).
+    /// Kept for compatibility; jelly is applied via visualEffect in parent now.
     var jellyOffsetY: CGFloat = 0
 
     private let maxReveal: CGFloat = 72
@@ -55,7 +54,6 @@ struct MessageBubble: View {
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .opacity(min(1, reveal / 16))
-                    // Slide in from the right edge while bubbles slide left.
                     .offset(x: (maxReveal - reveal))
                     .padding(.trailing, 2)
                     .allowsHitTesting(false)
@@ -88,7 +86,6 @@ struct MessageBubble: View {
                 )
 
             if !isRevealingTime {
-                // In iMessage-style “reveal time mode” the per-bubble time disappears.
                 HStack(spacing: 6) {
                     if msg.isEdited {
                         Text("edited")
@@ -100,7 +97,6 @@ struct MessageBubble: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             } else {
-                // Still show delivery state if it’s not “sent”.
                 if case .sent = msg.sendState {
                     EmptyView()
                 } else {
@@ -143,7 +139,7 @@ struct MessageBubble: View {
 
     private var bubbleBackground: some ShapeStyle {
         if msg.isOutgoing {
-            // Force iMessage-blue on macOS regardless of system accent color.
+            // Make outgoing bubbles always “Messages blue” on macOS.
             return AnyShapeStyle(Color(nsColor: .systemBlue))
         } else {
             return AnyShapeStyle(.thinMaterial)

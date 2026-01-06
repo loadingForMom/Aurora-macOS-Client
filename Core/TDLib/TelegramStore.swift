@@ -41,13 +41,46 @@ final class TelegramStore: ObservableObject {
     @Published var myProfilePhotoPath: String?
 
     // MARK: - Chat avatars (photo per chat)
-
+    // Original paths (whatever TDLib gave us)
     @Published var chatAvatarPathByChatId: [Int64: String] = [:]
-    private var chatAvatarFileIdByChatId: [Int64: Int32] = [:]
+
+    // TDLib file ids for chat avatars (small / big)
+    private struct ChatAvatarMeta {
+        var smallFileId: Int32?
+        var bigFileId: Int32?
+        var smallPath: String?
+        var bigPath: String?
+    }
+    private var chatAvatarMetaByChatId: [Int64: ChatAvatarMeta] = [:]
+
+    // fileId -> chatId mapping (for updateFile)
     private var chatIdByAvatarFileId: [Int32: Int64] = [:]
     private var requestedAvatarFileIds: Set<Int32> = []
+
+    // My photo file id
     private var myPhotoFileId: Int32?
 
+    // MARK: - Thumbnail cache
+    private let imageMemCache = NSCache<NSString, NSImage>()
+    private let thumbsDirURL: URL
+    private let defaultListThumbMaxPx: Int = 128
+    private let defaultProfileThumbMaxPx: Int = 128
+    // Inspector avatars are often displayed very large; 512px can look soft on Retina.
+    private let defaultInspectorThumbMaxPx: Int = 1024
+    // Poster/background avatar can be even larger.
+    private let defaultPosterThumbMaxPx: Int = 2048
+
+    private func screenScale() -> CGFloat {
+        // Best-effort; UI sizes are in points.
+        NSScreen.main?.backingScaleFactor ?? 2.0
+    }
+
+    private func maxPixel(forPointSize pt: CGFloat, clampTo maxClamp: Int) -> Int {
+        let px = Int((pt * screenScale()).rounded(.up))
+        return min(max(32, px), maxClamp)
+    }
+
+    // MARK: - TDLib boot flags
     private var didLoadInitialData = false
     private var didSendTdlibParameters = false
 
@@ -103,6 +136,14 @@ final class TelegramStore: ObservableObject {
     private var reachedHistoryStart: Set<Int64> = []
 
     init() {
+        // Thumbs directory
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("Aurora/thumbs", isDirectory: true)
+        thumbsDirURL = dir
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        imageMemCache.countLimit = 256
+
         td.startReceiveLoop { [weak self] upd in
             Task { @MainActor in
                 self?.pushLog(upd)
@@ -130,9 +171,92 @@ final class TelegramStore: ObservableObject {
         return usersById[id]?.displayName ?? ""
     }
 
+    /// Default for Settings sidebar header (~36pt)
     var myProfileNSImage: NSImage? {
-        guard let p = myProfilePhotoPath, !p.isEmpty else { return nil }
-        return NSImage(contentsOfFile: p)
+        myProfileNSImage(pointSize: 36)
+    }
+
+    func myProfileNSImage(pointSize: CGFloat) -> NSImage? {
+        guard let src = myProfilePhotoPath, !src.isEmpty else { return nil }
+        let maxPx = maxPixel(forPointSize: pointSize, clampTo: defaultProfileThumbMaxPx)
+        return loadOrMakeThumbNSImage(sourcePath: src,
+                                      fileId: myPhotoFileId,
+                                      kind: "me",
+                                      maxPixel: maxPx,
+                                      jpegQuality: 0.92)
+    }
+
+    /// For chat list / header etc.
+    func chatAvatarNSImage(
+        chatId: Int64,
+        pointSize: CGFloat,
+        preferHiRes: Bool = false,
+        maxClamp: Int? = nil,
+        kindOverride: String? = nil
+    ) -> NSImage? {
+        let cap = maxClamp ?? (preferHiRes ? defaultInspectorThumbMaxPx : defaultListThumbMaxPx)
+        let maxPx = maxPixel(forPointSize: pointSize, clampTo: cap)
+
+        // Pick best available source path
+        let meta = chatAvatarMetaByChatId[chatId]
+        let src: String? = {
+            if preferHiRes {
+                if let p = meta?.bigPath, !p.isEmpty { return p }
+                if let p = meta?.smallPath, !p.isEmpty { return p }
+                return chatAvatarPathByChatId[chatId]
+            } else {
+                if let p = meta?.smallPath, !p.isEmpty { return p }
+                if let p = meta?.bigPath, !p.isEmpty { return p }
+                return chatAvatarPathByChatId[chatId]
+            }
+        }()
+
+        guard let srcPath = src, !srcPath.isEmpty else { return nil }
+
+        // Choose fileId (helps stable thumb naming)
+        let fid: Int32? = {
+            if preferHiRes { return meta?.bigFileId ?? meta?.smallFileId }
+            return meta?.smallFileId ?? meta?.bigFileId
+        }()
+
+        let kind = kindOverride ?? (preferHiRes ? "chat_big" : "chat_small")
+        let q: CGFloat = preferHiRes ? 0.92 : 0.88
+
+        return loadOrMakeThumbNSImage(
+            sourcePath: srcPath,
+            fileId: fid,
+            kind: kind,
+            maxPixel: maxPx,
+            jpegQuality: q
+        )
+    }
+
+    /// Call when opening inspector so we can fetch the bigger avatar if TDLib has it.
+    func prefetchChatAvatarHiResIfNeeded(chatId: Int64) {
+        guard let meta = chatAvatarMetaByChatId[chatId] else { return }
+        guard let bigId = meta.bigFileId else { return }
+
+        // If we already have a usable big path, generate both inspector + poster thumbs.
+        if let p = meta.bigPath, !p.isEmpty, FileManager.default.fileExists(atPath: p) {
+            _ = loadOrMakeThumbNSImage(
+                sourcePath: p,
+                fileId: bigId,
+                kind: "chat_big",
+                maxPixel: defaultInspectorThumbMaxPx,
+                jpegQuality: 0.92
+            )
+
+            _ = loadOrMakeThumbNSImage(
+                sourcePath: p,
+                fileId: bigId,
+                kind: "chat_poster",
+                maxPixel: defaultPosterThumbMaxPx,
+                jpegQuality: 0.92
+            )
+            return
+        }
+
+        downloadFileIfNeeded(fileId: bigId, priority: 10)
     }
 
     // MARK: - Read / viewed helpers
@@ -155,9 +279,10 @@ final class TelegramStore: ObservableObject {
         viewMessages(chatId: chatId, messageIds: [c.lastMessageId], forceRead: true)
     }
 
+    /// Legacy helper if some UI still passes path around (kept as-is).
     func chatAvatarNSImage(chatId: Int64) -> NSImage? {
-        guard let p = chatAvatarPathByChatId[chatId], !p.isEmpty else { return nil }
-        return NSImage(contentsOfFile: p)
+        // Default small usage; better to call the size-aware variant.
+        chatAvatarNSImage(chatId: chatId, pointSize: 40, preferHiRes: false)
     }
 
     func userDisplayName(_ userId: Int64?) -> String {
@@ -215,7 +340,6 @@ final class TelegramStore: ObservableObject {
         )
         localIdBySendingId[sendingId] = localId
 
-        // TDLib matching: sending_id in messageSendOptions -> echoed back in messageSendingStatePending.sending_id
         let options: [String: Any] = [
             "@type": "messageSendOptions",
             "disable_notification": false,
@@ -251,8 +375,6 @@ final class TelegramStore: ObservableObject {
     func retrySend(message: TGMessage) {
         guard message.chatId != 0 else { return }
 
-        // Best path: TDLib resendMessages (it will delete failed msg if resent successfully).
-        // Only valid when canRetry == true (from messageSendingStateFailed.can_retry).
         if message.canRetry, message.id != 0 {
             markMessagePending(chatId: message.chatId, id: message.id)
 
@@ -266,7 +388,6 @@ final class TelegramStore: ObservableObject {
             return
         }
 
-        // Fallback: send as a new message (keeps the failed one in the timeline).
         sendText(chatId: message.chatId, text: message.text)
     }
 
@@ -342,10 +463,7 @@ final class TelegramStore: ObservableObject {
         isLoadingHistory = (selectedChatId == chatId)
         reachedHistoryStart.remove(chatId)
 
-        // Keep optimistic locals? Here we clear for "truth" — but if you want locals to persist across reload,
-        // you can merge instead of wiping.
         messagesByChatId[chatId] = []
-
         cancelHistoryJobs(for: chatId)
 
         let extra = "history:\(chatId):latest:\(UUID().uuidString)"
@@ -391,10 +509,8 @@ final class TelegramStore: ObservableObject {
 
         isLoadingHistory = (selectedChatId == chatId)
 
-        // IMPORTANT: ignore local negative placeholder ids for paging anchor.
         let serverMsgs = current.filter { $0.id > 0 }
         guard let oldestServerId = serverMsgs.min(by: { $0.id < $1.id })?.id else {
-            // If we somehow have only local placeholders, just bail.
             isLoadingHistory = false
             return
         }
@@ -410,7 +526,7 @@ final class TelegramStore: ObservableObject {
             kind: .older
         )
 
-        sendChatHistory(chatId: chatId, fromMessageId: oldestServerId, offset: -pageSize, limit: pageSize, extra: extra)
+        sendChatHistory(chatId: chatId, fromMessageId: oldestServerId, offset: 0, limit: pageSize, extra: extra)
     }
 
     // MARK: - Storage / Cache (Settings helpers)
@@ -705,16 +821,15 @@ final class TelegramStore: ObservableObject {
             }
         }
 
-        if let (chat, avatarFileId, avatarPath) = parseChatObject(upd) {
+        if let (chat, smallId, bigId, bestPath) = parseChatObject(upd) {
             chatsById[chat.id] = chat
 
-            if let p = avatarPath {
+            if let p = bestPath {
                 chatAvatarPathByChatId[chat.id] = p
             }
 
-            if let fid = avatarFileId {
-                registerChatAvatar(chatId: chat.id, fileId: fid)
-            }
+            registerChatAvatar(chatId: chat.id, smallFileId: smallId, bigFileId: bigId, initialBestPath: bestPath)
+
             if selectedChatId == nil {
                 selectedChatId = chat.id
                 loadLatestHistory(chatId: chat.id)
@@ -761,26 +876,19 @@ final class TelegramStore: ObservableObject {
 
         if let path = parseUpdateFilePathIfMyPhoto(upd) {
             myProfilePhotoPath = path
+            // Pre-generate a reasonable thumb once (won't redo on next launch because of mtime naming)
+            _ = myProfileNSImage(pointSize: 36)
         }
 
-        if let (chatId, path) = parseUpdateFilePathIfChatAvatar(upd) {
-            chatAvatarPathByChatId[chatId] = path
+        if let (chatId, fileId, path) = parseUpdateFilePathIfChatAvatar(upd) {
+            applyChatAvatarFileUpdate(chatId: chatId, fileId: fileId, path: path)
         }
 
-        if let (chatId, avatarFileId, avatarPath) = parseUpdateChatPhoto(upd) {
-            if let p = avatarPath {
+        if let (chatId, smallId, bigId, bestPath) = parseUpdateChatPhoto(upd) {
+            if let p = bestPath {
                 chatAvatarPathByChatId[chatId] = p
             }
-
-            if let fid = avatarFileId {
-                registerChatAvatar(chatId: chatId, fileId: fid)
-            } else {
-                chatAvatarPathByChatId.removeValue(forKey: chatId)
-                if let old = chatAvatarFileIdByChatId.removeValue(forKey: chatId) {
-                    chatIdByAvatarFileId.removeValue(forKey: old)
-                    requestedAvatarFileIds.remove(old)
-                }
-            }
+            registerChatAvatar(chatId: chatId, smallFileId: smallId, bigFileId: bigId, initialBestPath: bestPath)
         }
 
         if let user = parseUserObject(upd) {
@@ -830,16 +938,6 @@ final class TelegramStore: ObservableObject {
                 job.nextFromMessageId = oldest
             }
 
-            do {
-                let ordered = sortChronological(Array(job.accById.values))
-                let cap = min(job.targetCount, ordered.count)
-                messagesByChatId[job.chatId] = Array(ordered.suffix(cap))
-
-                if selectedChatId == job.chatId {
-                    isLoadingHistory = true
-                }
-            }
-
             let currentCount = job.accById.count
             let remaining = max(0, job.targetCount - currentCount)
 
@@ -857,6 +955,11 @@ final class TelegramStore: ObservableObject {
                 }
             } else {
                 historyJobs[res.extra] = job
+                if selectedChatId == job.chatId {
+                    let ordered = sortChronological(Array(job.accById.values))
+                    let cap = min(job.targetCount, ordered.count)
+                    messagesByChatId[job.chatId] = Array(ordered.suffix(cap))
+                }
                 sendChatHistory(chatId: job.chatId,
                                 fromMessageId: job.nextFromMessageId,
                                 offset: 0,
@@ -870,13 +973,160 @@ final class TelegramStore: ObservableObject {
             requestUserIfNeeded(msg.senderUserId)
 
             if tryReconcileOutgoingPendingMessage(msg) {
-                // Reconciled: do not append (prevents duplicates)
+                // Reconciled: do not append
             } else {
                 appendMessage(msg, chatId: chatId)
             }
 
             updateChatLastFromLocalTimeline(chatId: chatId)
         }
+    }
+
+    // MARK: - Avatar apply / download
+
+    private func registerChatAvatar(chatId: Int64, smallFileId: Int32?, bigFileId: Int32?, initialBestPath: String?) {
+        var meta = chatAvatarMetaByChatId[chatId] ?? ChatAvatarMeta()
+        meta.smallFileId = smallFileId
+        meta.bigFileId = bigFileId
+
+        // If we already have a path (from parse), try to attribute it.
+        if let p = initialBestPath, !p.isEmpty, FileManager.default.fileExists(atPath: p) {
+            // Heuristic: prefer small slot if exists.
+            if meta.smallPath == nil {
+                meta.smallPath = p
+            } else if meta.bigPath == nil {
+                meta.bigPath = p
+            }
+        }
+
+        chatAvatarMetaByChatId[chatId] = meta
+
+        if let sid = smallFileId {
+            chatIdByAvatarFileId[sid] = chatId
+            downloadFileIfNeeded(fileId: sid, priority: 16) // always fetch small
+        }
+
+        if let bid = bigFileId {
+            chatIdByAvatarFileId[bid] = chatId
+            // do NOT auto-download big; we do it on inspector open
+        }
+    }
+
+    private func applyChatAvatarFileUpdate(chatId: Int64, fileId: Int32, path: String) {
+        var meta = chatAvatarMetaByChatId[chatId] ?? ChatAvatarMeta()
+
+        if meta.smallFileId == fileId {
+            meta.smallPath = path
+        } else if meta.bigFileId == fileId {
+            meta.bigPath = path
+        } else {
+            // Unknown which; just store as best known
+            if meta.smallPath == nil { meta.smallPath = path }
+            else if meta.bigPath == nil { meta.bigPath = path }
+        }
+
+        chatAvatarMetaByChatId[chatId] = meta
+
+        // Prefer small for general UI
+        let best = (meta.smallPath?.isEmpty == false ? meta.smallPath : meta.bigPath)
+        if let best, !best.isEmpty {
+            chatAvatarPathByChatId[chatId] = best
+        }
+
+        // Pre-generate thumbs lazily:
+        // - always generate the small/list thumb (cheap and future-proof)
+        // - if this is the big avatar file, also generate inspector + poster thumbs
+        let isBig = (meta.bigFileId == fileId)
+
+        _ = loadOrMakeThumbNSImage(
+            sourcePath: path,
+            fileId: fileId,
+            kind: isBig ? "chat_big" : "chat_small",
+            maxPixel: isBig ? defaultInspectorThumbMaxPx : defaultListThumbMaxPx,
+            jpegQuality: isBig ? 0.94 : 0.88
+        )
+
+        if isBig {
+            _ = loadOrMakeThumbNSImage(
+                sourcePath: path,
+                fileId: fileId,
+                kind: "chat_poster",
+                maxPixel: defaultPosterThumbMaxPx,
+                jpegQuality: 0.95
+            )
+        }
+
+        // IMPORTANT: chatAvatarMetaByChatId is not @Published.
+        // If only the big avatar updated, SwiftUI might not redraw unless we poke it.
+        objectWillChange.send()
+    }
+
+    private func downloadFileIfNeeded(fileId: Int32, priority: Int) {
+        if requestedAvatarFileIds.contains(fileId) { return }
+        requestedAvatarFileIds.insert(fileId)
+
+        let req: [String: Any] = [
+            "@type": "downloadFile",
+            "file_id": fileId,
+            "priority": priority,
+            "offset": 0,
+            "limit": 0,
+            "synchronous": false
+        ]
+        sendJSON(req)
+    }
+
+    // MARK: - Thumbnail load/make
+
+    private func loadOrMakeThumbNSImage(sourcePath: String,
+                                        fileId: Int32?,
+                                        kind: String,
+                                        maxPixel: Int,
+                                        jpegQuality: CGFloat) -> NSImage? {
+        guard !sourcePath.isEmpty else { return nil }
+        guard FileManager.default.fileExists(atPath: sourcePath) else { return nil }
+
+        // Key includes maxPixel because same source can have multiple sizes.
+        let memKey = "\(sourcePath)|\(kind)|\(maxPixel)" as NSString
+        if let cached = imageMemCache.object(forKey: memKey) {
+            return cached
+        }
+
+        let fid = fileId ?? stableThumbFallbackFileId(
+            sourcePath: sourcePath,
+            kind: kind,
+            maxPixel: maxPixel
+        )
+
+        guard let thumbPath = AuroraImageThumb.ensureThumbnail(
+            sourcePath: sourcePath,
+            cacheDirURL: thumbsDirURL,
+            fileId: fid,
+            kind: kind,
+            maxPixel: maxPixel,
+            jpegQuality: jpegQuality
+        ) else {
+            // fallback: still avoid “load full” if possible by ImageIO thumb -> NSImage
+            if let img = AuroraImageThumb.decodeThumbnailNSImage(sourcePath: sourcePath, maxPixel: maxPixel) {
+                imageMemCache.setObject(img, forKey: memKey)
+                return img
+            }
+            return nil
+        }
+
+        // Load thumb (small file), cache in memory.
+        if let img = NSImage(contentsOfFile: thumbPath) {
+            imageMemCache.setObject(img, forKey: memKey)
+            return img
+        }
+
+        // Last-resort decode
+        if let img = AuroraImageThumb.decodeThumbnailNSImage(sourcePath: sourcePath, maxPixel: maxPixel) {
+            imageMemCache.setObject(img, forKey: memKey)
+            return img
+        }
+
+        return nil
     }
 
     // MARK: - Chat last/preview application
@@ -890,7 +1140,6 @@ final class TelegramStore: ObservableObject {
     }
 
     private func keepOptimisticChatPreviewIfNeeded(chatId: Int64) {
-        // If the last local message is pending/failed, prefer it for the sidebar preview.
         guard let localLast = messagesByChatId[chatId]?.last else { return }
         guard localLast.isOutgoing else { return }
 
@@ -943,7 +1192,6 @@ final class TelegramStore: ObservableObject {
         if arr.count > 800 { arr.removeFirst(arr.count - 800) }
         messagesByChatId[msg.chatId] = arr
 
-        // Update chat list preview immediately
         if var c = chatsById[msg.chatId] {
             c.lastMessageId = msg.id
             c.lastMessageDate = msg.date
@@ -993,17 +1241,6 @@ final class TelegramStore: ObservableObject {
         keepOptimisticChatPreviewIfNeeded(chatId: chatId)
     }
 
-    private func markMessageFailed(chatId: Int64, id: Int64, error: String, canRetry: Bool) {
-        guard var arr = messagesByChatId[chatId] else { return }
-        guard let idx = arr.firstIndex(where: { $0.id == id }) else { return }
-        var m = arr[idx]
-        m.sendState = .failed(errorText: error)
-        m.canRetry = canRetry
-        arr[idx] = m
-        messagesByChatId[chatId] = sortChronological(arr)
-        keepOptimisticChatPreviewIfNeeded(chatId: chatId)
-    }
-
     private func updateChatLastFromLocalTimeline(chatId: Int64) {
         guard let last = messagesByChatId[chatId]?.last else { return }
         if var c = chatsById[chatId] {
@@ -1033,7 +1270,6 @@ final class TelegramStore: ObservableObject {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "message" else { return nil }
 
-        // Only function responses carry @extra; updates don't.
         let extra = obj["@extra"] as? String
         guard extra != nil else { return nil }
 
@@ -1042,10 +1278,7 @@ final class TelegramStore: ObservableObject {
     }
 
     private func handleFunctionResponseMessage(_ resp: FunctionResponseMessage) {
-        // sendMessage returns a "local/temporary" message with sending_state pending.
-        // We'll use sendingId to match our placeholder.
         let msg = resp.message
-
         if tryReconcileOutgoingPendingMessage(msg) {
             updateChatLastFromLocalTimeline(chatId: msg.chatId)
         }
@@ -1090,11 +1323,8 @@ final class TelegramStore: ObservableObject {
             }
         }
 
-        // msg already has sendState from sending_state.failed (if present),
-        // but update includes canonical "error" too. We'll prefer that string.
         msg.sendState = .failed(errorText: errText)
 
-        // Extract can_retry from sending_state.failed if present.
         var canRetry = msg.canRetry
         if let sending = msgObj["sending_state"] as? [String: Any],
            (sending["@type"] as? String) == "messageSendingStateFailed" {
@@ -1111,13 +1341,10 @@ final class TelegramStore: ObservableObject {
         final.sendState = .sent
         final.canRetry = false
 
-        // Replace old temporary message id with final message
         replaceMessage(chatId: chatId, oldId: succ.oldMessageId, newMessage: final)
 
-        // Cleanup maps
         if let localId = localIdByTempMessageId[succ.oldMessageId] {
             pendingByLocalId.removeValue(forKey: localId)
-            // sendingId mapping too
             localIdBySendingId = localIdBySendingId.filter { $0.value != localId }
             localIdByTempMessageId.removeValue(forKey: succ.oldMessageId)
         }
@@ -1127,14 +1354,9 @@ final class TelegramStore: ObservableObject {
 
     private func handleSendFailed(_ fail: SendFailed) {
         let chatId = fail.message.chatId
-
-        // Replace old temp message with failed snapshot (same id semantics)
         replaceMessage(chatId: chatId, oldId: fail.oldMessageId, newMessage: fail.message)
 
-        // Cleanup temp-id map (keep others so Retry can work)
         if let localId = localIdByTempMessageId[fail.oldMessageId] {
-            // We keep pendingByLocalId entry around only if you want "resend as pending placeholder".
-            // For now: drop it, message is now real TDLib failed message.
             pendingByLocalId.removeValue(forKey: localId)
             localIdBySendingId = localIdBySendingId.filter { $0.value != localId }
             localIdByTempMessageId.removeValue(forKey: fail.oldMessageId)
@@ -1144,13 +1366,11 @@ final class TelegramStore: ObservableObject {
     }
 
     private func tryReconcileOutgoingPendingMessage(_ msg: TGMessage) -> Bool {
-        // Only useful for outgoing messages that are pending (or failed) with a known sendingId.
         guard msg.isOutgoing else { return false }
         guard let sid = msg.sendingId else { return false }
         guard let localId = localIdBySendingId[sid] else { return false }
         guard var link = pendingByLocalId[localId] else { return false }
 
-        // Replace placeholder with TDLib-provided temp message (so future sendSucceeded can use old_message_id).
         let chatId = link.chatId
         let placeholderId = link.placeholderId
 
@@ -1160,14 +1380,10 @@ final class TelegramStore: ObservableObject {
 
         replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: merged)
 
-        // Update link placeholderId to the actual TDLib temp message id
         link.placeholderId = merged.id
         pendingByLocalId[localId] = link
-
-        // Map TDLib temp id -> localId for sendSucceeded cleanup
         localIdByTempMessageId[merged.id] = localId
 
-        // If the msg already failed (TDLib can return failed state), make sure chat preview reflects.
         keepOptimisticChatPreviewIfNeeded(chatId: chatId)
         return true
     }
@@ -1220,7 +1436,6 @@ final class TelegramStore: ObservableObject {
         let newText = renderPreviewTextFromContent(newContent)
         let old = arr[idx]
 
-        // Preserve local/send metadata
         let updated = TGMessage(
             id: old.id,
             chatId: old.chatId,
@@ -1237,8 +1452,6 @@ final class TelegramStore: ObservableObject {
 
         arr[idx] = updated
         messagesByChatId[chatId] = sortChronological(arr)
-
-        // If it was the last message, keep chat preview in sync
         updateChatLastFromLocalTimeline(chatId: chatId)
     }
 
@@ -1265,7 +1478,6 @@ final class TelegramStore: ObservableObject {
             messagesByChatId[chatId] = arr
         }
 
-        // Cleanup temp-id maps if a pending message got irrecoverably deleted instead of updateMessageSendFailed.
         for id in messageIds {
             if let localId = localIdByTempMessageId[id] {
                 pendingByLocalId.removeValue(forKey: localId)
@@ -1330,7 +1542,8 @@ final class TelegramStore: ObservableObject {
         return ids.map { $0.int64Value }
     }
 
-    private func parseChatObject(_ upd: String) -> (TGChat, Int32?, String?)? {
+    /// Returns (chat, smallFileId, bigFileId, bestExistingPath)
+    private func parseChatObject(_ upd: String) -> (TGChat, Int32?, Int32?, String?)? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "chat" else { return nil }
 
@@ -1351,32 +1564,16 @@ final class TelegramStore: ObservableObject {
             lastMessageId = msg.id
         }
 
-        var avatarFileId: Int32? = nil
-        var avatarPath: String? = nil
+        var smallId: Int32? = nil
+        var bigId: Int32? = nil
+        var bestPath: String? = nil
 
         if let photo = obj["photo"] as? [String: Any] {
-            if let big = photo["big"] as? [String: Any] {
-                if let idNum = big["id"] as? NSNumber { avatarFileId = idNum.int32Value }
-                if let local = big["local"] as? [String: Any],
-                   let p = local["path"] as? String,
-                   !p.isEmpty,
-                   FileManager.default.fileExists(atPath: p) {
-                    avatarPath = p
-                }
-            }
-
-            if avatarFileId == nil || avatarPath == nil {
-                if let small = photo["small"] as? [String: Any] {
-                    if avatarFileId == nil, let idNum = small["id"] as? NSNumber { avatarFileId = idNum.int32Value }
-                    if avatarPath == nil,
-                       let local = small["local"] as? [String: Any],
-                       let p = local["path"] as? String,
-                       !p.isEmpty,
-                       FileManager.default.fileExists(atPath: p) {
-                        avatarPath = p
-                    }
-                }
-            }
+            let extracted = extractChatPhotoIdsAndPaths(photo)
+            smallId = extracted.smallId
+            bigId = extracted.bigId
+            // Prefer small for UI; fall back to big.
+            bestPath = extracted.smallPath ?? extracted.bigPath
         }
 
         var chat = TGChat(
@@ -1392,7 +1589,7 @@ final class TelegramStore: ObservableObject {
         chat.lastReadInboxMessageId = lastReadInboxMessageId
         chat.lastMessageId = lastMessageId
 
-        return (chat, avatarFileId, avatarPath)
+        return (chat, smallId, bigId, bestPath)
     }
 
     private func parseChatKind(_ obj: [String: Any]) -> TGChatKind {
@@ -1524,6 +1721,48 @@ final class TelegramStore: ObservableObject {
         return PhotoExtract(fileId: fileId, path: path)
     }
 
+    private struct ChatPhotoExtract {
+        let smallId: Int32?
+        let bigId: Int32?
+        let smallPath: String?
+        let bigPath: String?
+    }
+
+    private func extractChatPhotoIdsAndPaths(_ photo: [String: Any]) -> ChatPhotoExtract {
+        func pick(from entry: [String: Any]) -> (Int32?, String?) {
+            let id = (entry["id"] as? NSNumber)?.int32Value
+            guard let local = entry["local"] as? [String: Any] else { return (id, nil) }
+
+            let done = (local["is_downloading_completed"] as? Bool) ?? false
+            let p = (local["path"] as? String) ?? ""
+            guard !p.isEmpty else { return (id, nil) }
+
+            if done || FileManager.default.fileExists(atPath: p) {
+                return (id, p)
+            }
+            return (id, nil)
+        }
+
+        var smallId: Int32? = nil
+        var bigId: Int32? = nil
+        var smallPath: String? = nil
+        var bigPath: String? = nil
+
+        if let small = photo["small"] as? [String: Any] {
+            let (id, p) = pick(from: small)
+            smallId = id
+            smallPath = p
+        }
+
+        if let big = photo["big"] as? [String: Any] {
+            let (id, p) = pick(from: big)
+            bigId = id
+            bigPath = p
+        }
+
+        return ChatPhotoExtract(smallId: smallId, bigId: bigId, smallPath: smallPath, bigPath: bigPath)
+    }
+
     private func parseUpdateUser(upt upd: String) -> (TGUser, Int32?, String?)? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "updateUser" else { return nil }
@@ -1584,6 +1823,46 @@ final class TelegramStore: ObservableObject {
         if done { return path }
         if FileManager.default.fileExists(atPath: path) { return path }
         return nil
+    }
+
+    private func parseUpdateFilePathIfChatAvatar(_ upd: String) -> (Int64, Int32, String)? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateFile" else { return nil }
+        guard let file = obj["file"] as? [String: Any] else { return nil }
+        guard let idNum = file["id"] as? NSNumber else { return nil }
+
+        let fid = idNum.int32Value
+        guard let chatId = chatIdByAvatarFileId[fid] else { return nil }
+
+        guard let local = file["local"] as? [String: Any] else { return nil }
+        let done = (local["is_downloading_completed"] as? Bool) ?? false
+        let path = (local["path"] as? String) ?? ""
+
+        guard !path.isEmpty else { return nil }
+
+        if FileManager.default.fileExists(atPath: path) {
+            return (chatId, fid, path)
+        }
+
+        guard done else { return nil }
+        return (chatId, fid, path)
+    }
+
+    private func parseUpdateChatPhoto(_ upd: String) -> (Int64, Int32?, Int32?, String?)? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateChatPhoto" else { return nil }
+        guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
+
+        guard let photo = obj["photo"] as? [String: Any] else {
+            // Removed photo
+            chatAvatarPathByChatId.removeValue(forKey: chatId)
+            chatAvatarMetaByChatId.removeValue(forKey: chatId)
+            return (chatId, nil, nil, nil)
+        }
+
+        let extracted = extractChatPhotoIdsAndPaths(photo)
+        let best = extracted.smallPath ?? extracted.bigPath
+        return (chatId, extracted.smallId, extracted.bigId, best)
     }
 
     private struct MessagesResponse { let extra: String; let messages: [TGMessage] }
@@ -1671,107 +1950,11 @@ final class TelegramStore: ObservableObject {
             canRetry: canRetry
         )
 
-        // If TDLib says edited via edit_date, reflect it.
         if editDate > 0 {
             m.editedAt = editDate
         }
 
         return m
-    }
-
-    // MARK: - Logging
-
-    private func pushLog(_ s: String) {
-        logs.append(s)
-        if logs.count > 250 { logs.removeFirst(logs.count - 250) }
-    }
-}
-
-extension TelegramStore {
-
-    // MARK: - Chat avatars (TDLib)
-
-    private func registerChatAvatar(chatId: Int64, fileId: Int32) {
-        chatAvatarFileIdByChatId[chatId] = fileId
-        chatIdByAvatarFileId[fileId] = chatId
-
-        if let existingPath = chatAvatarPathByChatId[chatId],
-           !existingPath.isEmpty,
-           FileManager.default.fileExists(atPath: existingPath) {
-            return
-        }
-
-        if requestedAvatarFileIds.contains(fileId) { return }
-        requestedAvatarFileIds.insert(fileId)
-
-        let req: [String: Any] = [
-            "@type": "downloadFile",
-            "file_id": fileId,
-            "priority": 16,
-            "offset": 0,
-            "limit": 0,
-            "synchronous": false
-        ]
-        sendJSON(req)
-    }
-
-    private func parseUpdateChatPhoto(_ upd: String) -> (Int64, Int32?, String?)? {
-        guard let obj = parseJSON(upd) else { return nil }
-        guard (obj["@type"] as? String) == "updateChatPhoto" else { return nil }
-        guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
-
-        guard let photo = obj["photo"] as? [String: Any] else {
-            return (chatId, nil, nil)
-        }
-
-        var avatarFileId: Int32? = nil
-        var avatarPath: String? = nil
-
-        if let big = photo["big"] as? [String: Any] {
-            if let idNum = big["id"] as? NSNumber { avatarFileId = idNum.int32Value }
-            if let local = big["local"] as? [String: Any],
-               let p = local["path"] as? String,
-               !p.isEmpty,
-               FileManager.default.fileExists(atPath: p) {
-                avatarPath = p
-            }
-        }
-
-        if avatarFileId == nil || avatarPath == nil {
-            if let small = photo["small"] as? [String: Any] {
-                if avatarFileId == nil, let idNum = small["id"] as? NSNumber { avatarFileId = idNum.int32Value }
-                if avatarPath == nil,
-                   let local = small["local"] as? [String: Any],
-                   let p = local["path"] as? String,
-                   !p.isEmpty,
-                   FileManager.default.fileExists(atPath: p) {
-                    avatarPath = p
-                }
-            }
-        }
-
-        return (chatId, avatarFileId, avatarPath)
-    }
-
-    private func parseUpdateFilePathIfChatAvatar(_ upd: String) -> (Int64, String)? {
-        guard let obj = parseJSON(upd) else { return nil }
-        guard (obj["@type"] as? String) == "updateFile" else { return nil }
-        guard let file = obj["file"] as? [String: Any] else { return nil }
-        guard let idNum = file["id"] as? NSNumber else { return nil }
-
-        let fid = idNum.int32Value
-        guard let chatId = chatIdByAvatarFileId[fid] else { return nil }
-
-        guard let local = file["local"] as? [String: Any] else { return nil }
-        let done = (local["is_downloading_completed"] as? Bool) ?? false
-        let path = (local["path"] as? String) ?? ""
-
-        if !path.isEmpty, FileManager.default.fileExists(atPath: path) {
-            return (chatId, path)
-        }
-
-        guard done, !path.isEmpty else { return nil }
-        return (chatId, path)
     }
 
     // MARK: - Chat read inbox update parser
@@ -1785,4 +1968,29 @@ extension TelegramStore {
         let unread = (obj["unread_count"] as? NSNumber)?.int32Value ?? 0
         return (chatId, lastRead, unread)
     }
+
+    // MARK: - Logging
+
+    private func pushLog(_ s: String) {
+        logs.append(s)
+        if logs.count > 250 { logs.removeFirst(logs.count - 250) }
+    }
+}
+// MARK: - Stable thumb id fallback (avoid fileId == 0 collisions)
+
+private func fnv1a32(_ s: String) -> UInt32 {
+    var h: UInt32 = 2166136261
+    for b in s.utf8 {
+        h ^= UInt32(b)
+        h &*= 16777619
+    }
+    return h
+}
+
+private func stableThumbFallbackFileId(sourcePath: String, kind: String, maxPixel: Int) -> Int32 {
+    // Make a stable, non-zero, positive Int32.
+    let key = "\(kind)|\(maxPixel)|\(sourcePath)"
+    let h = fnv1a32(key)
+    let nonZeroPositive = (h & 0x7fffffff) | 1
+    return Int32(nonZeroPositive)
 }

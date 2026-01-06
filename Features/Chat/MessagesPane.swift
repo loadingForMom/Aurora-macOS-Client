@@ -16,38 +16,33 @@ struct MessagesPane: View {
     @State private var pagingEnabled: Bool = false
     @State private var pagingInFlight: Bool = false
     @State private var restoreAnchorGroupId: String? = nil
+    @State private var lastPagingAnchor: String? = nil
 
-    // MARK: - “Don’t annoy me” UX
-
+    // “Don’t annoy me” UX
     @State private var isAtBottom: Bool = true
     @State private var newIncomingCount: Int = 0
     @State private var lastKnownMessageCount: Int = 0
 
-    // MARK: - Jelly / springy scrolling (macOS-safe)
-
+    // Jelly / springy scrolling (macOS-safe)
     @State private var jellyScrollImpulse: CGFloat = 0
     @State private var jellyContainerHeight: CGFloat = 0
-
     @State private var lastScrollOffsetY: CGFloat = 0
     @State private var jellyDecayTask: Task<Void, Never>? = nil
 
-    // MARK: - Trackpad reveal time (iMessage-style)
-
+    // Trackpad reveal time (iMessage-style)
     @State private var revealTimeX: CGFloat = 0
     @State private var revealGestureEngaged: Bool = false
-
     private let maxReveal: CGFloat = 72
 
-    // MARK: - Grouping knobs
-
-    private let groupGap: Int = 5 * 60          // messages in same bubble-group if within 5 min
-    private let majorGap: Int = 60 * 60         // insert time separator if gap >= 60 min
+    // Grouping knobs
+    private let groupGap: Int = 5 * 60
+    private let majorGap: Int = 60 * 60
 
     private var bottomSentinelId: String { "bottom:\(chat.id)" }
 
     // MARK: - Rows
 
-    private enum ChatRow: Identifiable, Hashable {
+    private enum Row: Identifiable, Hashable {
         case dayHeader(Date)
         case timeSeparator(Date)
         case group(MessageGroup)
@@ -74,6 +69,10 @@ struct MessagesPane: View {
         guard !pagingInFlight else { return }
         guard !store.isLoadingHistory else { return }
         guard let anchorGroupId else { return }
+
+        // Prevent “double fire” when SwiftUI reuses/rebuilds the top area.
+        if lastPagingAnchor == anchorGroupId { return }
+        lastPagingAnchor = anchorGroupId
 
         restoreAnchorGroupId = anchorGroupId
         pagingInFlight = true
@@ -109,17 +108,16 @@ struct MessagesPane: View {
     // MARK: - Jelly update (throttled + spring back)
 
     private func pushJellyImpulse(delta: CGFloat) {
-        // Clamp + quantize to reduce state churn.
-        let clamped = max(-220, min(220, delta))
-        let quantized = (clamped / 10).rounded() * 10
+        // Stronger and smoother: clamp larger, quantize smaller.
+        let clamped = max(-420, min(420, delta))
+        let quantized = (clamped / 6).rounded() * 6
 
         if quantized == jellyScrollImpulse { return }
         jellyScrollImpulse = quantized
 
-        // Debounced decay back to 0 (spring).
         jellyDecayTask?.cancel()
         jellyDecayTask = Task {
-            try? await Task.sleep(nanoseconds: 55_000_000) // ~55ms
+            try? await Task.sleep(nanoseconds: 45_000_000) // ~45ms
             await MainActor.run {
                 withAnimation(.interactiveSpring(response: 0.42, dampingFraction: 0.62, blendDuration: 0.10)) {
                     jellyScrollImpulse = 0
@@ -136,13 +134,12 @@ struct MessagesPane: View {
                 let dx = v.translation.width
                 let dy = v.translation.height
 
-                // Engage only if it’s clearly horizontal (trackpad swipe), otherwise let ScrollView do its job.
                 if !revealGestureEngaged {
+                    // Engage only when it's clearly horizontal.
                     guard abs(dx) > abs(dy) * 1.25 else { return }
                     revealGestureEngaged = true
                 }
 
-                // Swipe left => reveal grows.
                 let r = min(maxReveal, max(0, -dx))
                 revealTimeX = r
             }
@@ -154,10 +151,10 @@ struct MessagesPane: View {
             }
     }
 
-    // MARK: - Row rendering (split out to help the compiler type-check faster)
+    // MARK: - Row rendering (helps compiler + performance)
 
     @ViewBuilder
-    private func rowView(_ row: ChatRow) -> some View {
+    private func rowView(_ row: Row) -> some View {
         switch row {
         case .dayHeader(let day):
             DayHeaderView(day: day)
@@ -175,7 +172,24 @@ struct MessagesPane: View {
                 jellyContainerHeight: jellyContainerHeight
             )
             .id(g.id)
+            .onAppear {
+                // Smart paging trigger: when one of the very first groups appears, fetch older.
+                // This is more reliable than a top sentinel with LazyVStack rebuilds.
+                if shouldTriggerPaging(for: g.id) {
+                    requestOlderHistory(anchorGroupId: g.id)
+                }
+            }
         }
+    }
+
+    private func shouldTriggerPaging(for groupId: String) -> Bool {
+        // Trigger only while paging is enabled and we're not already in flight.
+        guard pagingEnabled, !pagingInFlight, !store.isLoadingHistory else { return false }
+
+        // Approx: trigger only when this group is among the first ~2 visible groups.
+        // We'll use restoreAnchorGroupId/lastPagingAnchor to prevent repeats.
+        if lastPagingAnchor == groupId { return false }
+        return true
     }
 
     // MARK: - Body
@@ -184,32 +198,22 @@ struct MessagesPane: View {
         let messages = store.messagesByChatId[chat.id] ?? []
         let rows = buildRows(messages)
 
-        let firstGroupId = rows.compactMap { row -> String? in
-            if case .group(let g) = row { return g.id }
+        let groupIds: [String] = rows.compactMap {
+            if case .group(let g) = $0 { return g.id }
             return nil
-        }.first
-
-        let lastGroupId = rows.compactMap { row -> String? in
-            if case .group(let g) = row { return g.id }
-            return nil
-        }.last
+        }
+        let firstGroupId = groupIds.first
+        let lastGroupId = groupIds.last
 
         ScrollViewReader { proxy in
             GeometryReader { containerGeo in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
-                        // Top sentinel for paging (older history).
-                        Color.clear
-                            .frame(height: 1)
-                            .onAppear {
-                                requestOlderHistory(anchorGroupId: firstGroupId)
-                            }
-
                         // Scroll offset reader (macOS-safe).
                         ScrollOffsetReader()
                             .frame(height: 0)
 
-                        ForEach(Array(rows.enumerated()), id: \.element.id) { _, row in
+                        ForEach(rows) { row in
                             rowView(row)
                         }
 
@@ -237,7 +241,6 @@ struct MessagesPane: View {
                 .coordinateSpace(name: Self.scrollSpaceName)
                 .simultaneousGesture(revealGesture)
                 .onPreferenceChange(ScrollOffsetKey.self) { minY in
-                    // In our reader: minY decreases when scrolling down, so offsetY is -minY.
                     let offsetY = -minY
                     let delta = offsetY - lastScrollOffsetY
                     lastScrollOffsetY = offsetY
@@ -245,6 +248,11 @@ struct MessagesPane: View {
                 }
                 .onAppear {
                     jellyContainerHeight = containerGeo.size.height
+
+                    // Enable paging after first stable layout, otherwise initial load may “fight”.
+                    if !pagingEnabled, firstGroupId != nil {
+                        pagingEnabled = true
+                    }
                 }
                 .onChange(of: containerGeo.size.height) { _, newH in
                     jellyContainerHeight = newH
@@ -278,11 +286,17 @@ struct MessagesPane: View {
                 .onAppear {
                     lastKnownMessageCount = messages.count
                     newIncomingCount = 0
+
+                    // Reset paging anchor for this chat
+                    lastPagingAnchor = nil
+                    restoreAnchorGroupId = nil
+                    pagingInFlight = false
                 }
                 .onChange(of: chat.id) { _, _ in
                     pagingEnabled = false
                     pagingInFlight = false
                     restoreAnchorGroupId = nil
+                    lastPagingAnchor = nil
 
                     isAtBottom = true
                     newIncomingCount = 0
@@ -302,7 +316,6 @@ struct MessagesPane: View {
                         scrollToAnchorTop(proxy, anchorId: anchorId)
                         restoreAnchorGroupId = nil
                         pagingInFlight = false
-
                         lastKnownMessageCount = newCount
                         return
                     }
@@ -317,12 +330,20 @@ struct MessagesPane: View {
                     if shouldAutoScroll {
                         scrollToBottom(proxy, lastGroupId: lastGroupId, animated: pagingEnabled)
                         newIncomingCount = 0
-
                         if !pagingEnabled { pagingEnabled = true }
                     } else {
                         if !lastIsOutgoing {
                             newIncomingCount += delta
                         }
+                    }
+                }
+
+                // Fallback: if user lands at top immediately after restore, request older once.
+                .task(id: firstGroupId) {
+                    if let firstGroupId, pagingEnabled {
+                        // Do nothing by default — but you can un-comment if you want auto-preload older:
+                        // requestOlderHistory(anchorGroupId: firstGroupId)
+                        _ = firstGroupId
                     }
                 }
             }
@@ -332,22 +353,18 @@ struct MessagesPane: View {
 
     // MARK: - Grouping into rows (day headers + time separators + bubble groups)
 
-    private func buildRows(_ msgs: [TGMessage]) -> [ChatRow] {
+    private func buildRows(_ msgs: [TGMessage]) -> [Row] {
         guard !msgs.isEmpty else { return [] }
 
         let cal = Calendar.current
-
-        // Assume msgs are already sorted by date ascending. If not, uncomment:
-        // let msgs = msgs.sorted { $0.date < $1.date }
-
-        var rows: [ChatRow] = []
+        var rows: [Row] = []
 
         var currentDay: Date? = nil
 
         var bucket: [TGMessage] = []
         var curSender: Int64? = nil
         var curOutgoing: Bool = false
-        var lastMessageDate: Int? = nil
+        var lastUnix: Int? = nil
 
         func flushBucket() {
             guard let first = bucket.first else { return }
@@ -361,37 +378,35 @@ struct MessagesPane: View {
             bucket.removeAll(keepingCapacity: true)
         }
 
-        func ensureDayHeader(for unix: Int) {
+        func ensureDayHeader(unix: Int) {
             let d = Date(timeIntervalSince1970: TimeInterval(unix))
             let day = cal.startOfDay(for: d)
-            if currentDay == nil || day != currentDay {
-                // New day: close previous group cleanly.
+            if currentDay == nil || currentDay != day {
                 flushBucket()
                 currentDay = day
                 rows.append(.dayHeader(day))
-                lastMessageDate = nil
+                lastUnix = nil
             }
         }
 
-        func maybeInsertMajorGapSeparator(prevUnix: Int, nextUnix: Int) {
-            let gap = abs(nextUnix - prevUnix)
+        func maybeInsertMajorGap(prev: Int, next: Int) {
+            let gap = abs(next - prev)
             guard gap >= majorGap else { return }
-            let t = Date(timeIntervalSince1970: TimeInterval(nextUnix))
-            rows.append(.timeSeparator(t))
+            rows.append(.timeSeparator(Date(timeIntervalSince1970: TimeInterval(next))))
         }
 
         for m in msgs {
-            ensureDayHeader(for: m.date)
+            ensureDayHeader(unix: m.date)
 
-            if let prev = lastMessageDate {
-                maybeInsertMajorGapSeparator(prevUnix: prev, nextUnix: m.date)
+            if let prev = lastUnix {
+                maybeInsertMajorGap(prev: prev, next: m.date)
             }
 
             if bucket.isEmpty {
                 bucket = [m]
                 curSender = m.senderUserId
                 curOutgoing = m.isOutgoing
-                lastMessageDate = m.date
+                lastUnix = m.date
                 continue
             }
 
@@ -408,7 +423,7 @@ struct MessagesPane: View {
                 curOutgoing = m.isOutgoing
             }
 
-            lastMessageDate = m.date
+            lastUnix = m.date
         }
 
         flushBucket()
@@ -416,7 +431,7 @@ struct MessagesPane: View {
     }
 }
 
-// MARK: - Preference keys + helper views (macOS-safe scroll tracking)
+// MARK: - Scroll tracking (macOS-safe)
 
 private struct ScrollOffsetKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
@@ -428,15 +443,32 @@ private struct ScrollOffsetKey: PreferenceKey {
 private struct ScrollOffsetReader: View {
     var body: some View {
         GeometryReader { geo in
-            // In a named coordinate space, this minY moves with scroll.
             Color.clear
-                .preference(key: ScrollOffsetKey.self,
-                            value: geo.frame(in: .named(MessagesPane.scrollSpaceName)).minY)
+                .preference(
+                    key: ScrollOffsetKey.self,
+                    value: geo.frame(in: .named(MessagesPane.scrollSpaceName)).minY
+                )
         }
     }
 }
 
-// MARK: - Day header + time separator
+// MARK: - Day header + time separator (cached formatters)
+
+private enum ChatFormatters {
+    static let dayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .none
+        return f
+    }()
+
+    static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .none
+        f.timeStyle = .short
+        return f
+    }()
+}
 
 private struct DayHeaderView: View {
     let day: Date
@@ -447,18 +479,13 @@ private struct DayHeaderView: View {
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 8)
-            .background(.clear)
     }
 
     private func dayLabel(_ d: Date) -> String {
         let cal = Calendar.current
         if cal.isDateInToday(d) { return "Today" }
         if cal.isDateInYesterday(d) { return "Yesterday" }
-
-        let f = DateFormatter()
-        f.dateStyle = .medium
-        f.timeStyle = .none
-        return f.string(from: d)
+        return ChatFormatters.dayFormatter.string(from: d)
     }
 }
 
@@ -466,18 +493,11 @@ private struct TimeSeparatorView: View {
     let date: Date
 
     var body: some View {
-        Text(timeLabel(date))
+        Text(ChatFormatters.timeFormatter.string(from: date))
             .font(.caption2.weight(.semibold))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 6)
-    }
-
-    private func timeLabel(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateStyle = .none
-        f.timeStyle = .short
-        return f.string(from: d)
     }
 }
 
