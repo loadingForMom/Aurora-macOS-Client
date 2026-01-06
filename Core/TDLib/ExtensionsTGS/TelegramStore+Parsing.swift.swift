@@ -17,8 +17,17 @@ extension TelegramStore {
     }
 
     func parseJSON(_ upd: String) -> [String: Any]? {
-        guard let data = upd.data(using: .utf8) else { return nil }
-        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        if upd == lastParsedUpdate {
+            return lastParsedObject
+        }
+
+        guard let data = upd.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return nil }
+
+        lastParsedUpdate = upd
+        lastParsedObject = obj
+        return obj
     }
 
     // MARK: - Auth
