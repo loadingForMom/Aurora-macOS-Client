@@ -15,8 +15,6 @@ private enum _InspectorCS {
     static let scroll = "InspectorScroll"
 }
 
-// MARK: - Pinned title slot probe (viewport overlay; does NOT scroll)
-
 private struct _PinnedTitleSlotProbe: View {
     let title: String
     let topPadding: CGFloat
@@ -25,7 +23,6 @@ private struct _PinnedTitleSlotProbe: View {
 
     var body: some View {
         VStack(spacing: titleSpacing) {
-            // Avatar placeholder (matches pinned chrome layout)
             Color.clear
                 .frame(width: avatarSize, height: avatarSize)
 
@@ -43,7 +40,6 @@ private struct _PinnedTitleSlotProbe: View {
         }
         .padding(.top, topPadding)
         .frame(maxWidth: .infinity)
-        // Keep it in the tree for measurement but invisible.
         .opacity(0.001)
         .accessibilityHidden(true)
         .allowsHitTesting(false)
@@ -54,77 +50,68 @@ struct ChatInspectorView: View {
     @EnvironmentObject private var store: TelegramStore
     let chat: TGChat
 
-    // MARK: - Layout (tuned for macOS inspector column)
-
     private let heroHeight: CGFloat = 340
-    private let overlapFraction: CGFloat = 0.58       // stronger overlap to eliminate the mid-gap between top glass and lower blur
+    private let overlapFraction: CGFloat = 0.58
     private let pinnedChromeHeight: CGFloat = 280
-    // more room for larger avatar + title and a softer fade
 
     private let pinnedTopPadding: CGFloat = 20
     private let pinnedAvatarSize: CGFloat = 70
     private let pinnedTitleSpacing: CGFloat = 8
 
-    // MARK: - Pin logic tuning
-
-    /// “Дошло до места” (порог). До него pinned = 0.
     private let appearThreshold: CGFloat = 2
-
-    /// Насколько быстро проявляется pinned chrome (мини‑аватар + имя).
     private let appearRange: CGFloat = 20
-
-    /// Блюр должен “обогнать” chrome: к моменту полной видимости pinned,
-    /// постер уже почти в полном блюре.
-    private var blurRange: CGFloat { appearThreshold + appearRange } // ~12pt
-
-    /// Кнопки исчезают уже после того, как pinned‑состояние сформировалось.
+    private var blurRange: CGFloat { appearThreshold + appearRange }
     private var actionsFadeStart: CGFloat { appearThreshold + appearRange }
     private let actionsFadeRange: CGFloat = 50
-
     private let maxPosterBlur: CGFloat = 18
-
-    // MARK: - Measurements (ScrollView coordinate space)
 
     @State private var heroTitleScrollMinY: CGFloat = .nan
     @State private var pinnedTitleScrollMinY: CGFloat = .nan
-    @State private var pinBaselineDelta: CGFloat = .nan // captured at rest so beyondPin starts at 0
+    @State private var pinBaselineDelta: CGFloat = .nan
     @State private var hasBaseline: Bool = false
-    // Baseline warmup: during the first few ticks after appear, layout can still shift (esp. long titles/emoji).
-    // We track the MAX raw delta so `beyondPin` starts at 0 instead of starting “already pinned”.
     @State private var baselineWarmupUntil: CFAbsoluteTime = 0
-    // Track actual scroll movement so warmup doesn’t “eat” the first slow drag.
     @State private var scrollTopMinY: CGFloat = .nan
     @State private var baselineScrollTopMinY: CGFloat = .nan
-    // Debounced settle check to re-zero tiny residual beyondPin after fast fling/bounce.
     @State private var settleBaselineWork: DispatchWorkItem?
 
-    private var avatarImage: NSImage? {
-        store.chatAvatarNSImage(chatId: chat.id)
+    // IMPORTANT:
+    // Для инспектора берём две разные миниатюры:
+    // - posterImage: крупная (для постера/blur), но всё ещё thumbnail, не полный decode исходника.
+    // - chromeAvatarImage: маленькая (для pinned chrome), чтобы не тащить огромную картинку в UI.
+    //
+    // Ключевое: размер постера зависит от ширины окна. Если брать фиксированное значение,
+    // на широких инспекторах (и особенно на Retina) получится “мыло”.
+    private func posterImage(forWidth width: CGFloat) -> NSImage? {
+        let posterPointSize = max(width, heroHeight) // points
+        return store.chatAvatarNSImage(
+            chatId: chat.id,
+            pointSize: posterPointSize,
+            preferHiRes: true,
+            maxClamp: 3072,
+            kindOverride: "chat_poster"
+        )
     }
 
-    // MARK: - Derived progress
+    private var chromeAvatarImage: NSImage? {
+        store.chatAvatarNSImage(chatId: chat.id, pointSize: pinnedAvatarSize, preferHiRes: true)
+    }
 
-    /// How far the hero title moved above the pinned title slot (in the SAME ScrollView coord space).
     private var beyondPin: CGFloat {
         guard heroTitleScrollMinY.isFinite, pinnedTitleScrollMinY.isFinite else { return 0 }
-        // Until we have a baseline, treat the view as “resting” so buttons never start blurred.
         guard hasBaseline, pinBaselineDelta.isFinite else { return 0 }
         let rawDelta = pinnedTitleScrollMinY - heroTitleScrollMinY
         return max(0, rawDelta - pinBaselineDelta)
     }
 
-    /// Progress for pinned chrome appearance (thresholded).
     private var handoffProgress: CGFloat {
         let x = max(0, beyondPin - appearThreshold)
         return (x / appearRange).clamped(0, 1)
     }
 
-    /// Progress for poster blur (fast).
     private var blurProgress: CGFloat {
         (beyondPin / blurRange).clamped(0, 1)
     }
 
-    /// Gamma-corrected alpha so the first few % aren’t visually “already there”.
     private var chromeAlpha: Double {
         pow(Double(handoffProgress), 1.6)
     }
@@ -145,7 +132,6 @@ struct ChatInspectorView: View {
 
     private var actionsBlur: CGFloat {
         let p = actionsFadeProgress
-        // Never blur in the expanded state; start blurring only once fade has actually begun.
         if p <= 0.02 { return 0 }
         return 2.2 * p
     }
@@ -166,11 +152,6 @@ struct ChatInspectorView: View {
         Double((1 - (handoffProgress * 1.35)).clamped(0, 1))
     }
 
-    // Toggle quickly when debugging
-    #if DEBUG
-    private let showDebugOverlay: Bool = false
-    #endif
-
     private func resetBaseline() {
         settleBaselineWork?.cancel()
         settleBaselineWork = nil
@@ -188,44 +169,35 @@ struct ChatInspectorView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.14, execute: work)
     }
 
-    /// After fast scroll/bounce, SwiftUI can leave us with a tiny residual delta at rest.
-    /// If we’re back at the top and not actually pinned, snap the baseline to the current rawDelta.
     private func snapBaselineIfNeeded() {
         guard hasBaseline, pinBaselineDelta.isFinite else { return }
         guard heroTitleScrollMinY.isFinite, pinnedTitleScrollMinY.isFinite else { return }
         guard baselineScrollTopMinY.isFinite, scrollTopMinY.isFinite else { return }
 
-        // Only when we’re essentially back at the top.
         let nearTop = abs(scrollTopMinY - baselineScrollTopMinY) < 0.9
         guard nearTop else { return }
 
         let rawDelta = pinnedTitleScrollMinY - heroTitleScrollMinY
         let residual = max(0, rawDelta - pinBaselineDelta)
 
-        // If we’re not in pinned mode (or barely starting), and residual is tiny, re-zero it.
         if handoffProgress < 0.05, residual > 0, residual < 8 {
             pinBaselineDelta = rawDelta
         }
     }
 
-    // MARK: - Baseline capture (warmup, then lock)
     private func updateBaseline() {
         guard heroTitleScrollMinY.isFinite, pinnedTitleScrollMinY.isFinite else { return }
 
         let rawDelta = pinnedTitleScrollMinY - heroTitleScrollMinY
         let now = CFAbsoluteTimeGetCurrent()
 
-        // First sample
         if !pinBaselineDelta.isFinite {
             pinBaselineDelta = rawDelta
             hasBaseline = true
             return
         }
 
-        // During warmup, layout may still move the probe/title a few points.
         if now < baselineWarmupUntil {
-            // If the user starts scrolling, immediately lock baseline to the CURRENT state.
-            // This prevents fast fling up/down from ever capturing a “moving” baseline.
             if baselineScrollTopMinY.isFinite, scrollTopMinY.isFinite {
                 if abs(scrollTopMinY - baselineScrollTopMinY) > 1.5 {
                     baselineWarmupUntil = 0
@@ -234,7 +206,6 @@ struct ChatInspectorView: View {
                 }
             }
 
-            // If still warming up (no user scroll yet), track MAX raw delta so resting state yields beyondPin == 0.
             if now < baselineWarmupUntil {
                 pinBaselineDelta = max(pinBaselineDelta, rawDelta)
             }
@@ -243,124 +214,114 @@ struct ChatInspectorView: View {
         hasBaseline = true
     }
 
-    // MARK: - Body
-
     var body: some View {
-        ZStack(alignment: .top) {
+        GeometryReader { geo in
+            let width = geo.size.width
 
-            PosterBackground(
-                image: avatarImage,
-                headerHeight: heroHeight,
-                overlapFraction: overlapFraction,
-                posterBlurRadius: posterBlurRadius,
-                frostAmount: blurProgress
-            )
-            .ignoresSafeArea()
+            ZStack(alignment: .top) {
+                PosterBackground(
+                    image: posterImage(forWidth: width),
+                    headerHeight: heroHeight,
+                    overlapFraction: overlapFraction,
+                    posterBlurRadius: posterBlurRadius,
+                    frostAmount: blurProgress
+                )
+                .ignoresSafeArea()
 
-            ScrollView(showsIndicators: false) {
-                VStack(spacing: 16) {
-                    // Scroll offset probe (moves with content)
-                    Color.clear
-                        .frame(height: 0)
-                        .background(
-                            GeometryReader { geo in
-                                Color.clear.preference(
-                                    key: _ScrollTopMinYKey.self,
-                                    value: geo.frame(in: .named(_InspectorCS.scroll)).minY
-                                )
-                            }
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 16) {
+                        Color.clear
+                            .frame(height: 0)
+                            .background(
+                                GeometryReader { geo in
+                                    Color.clear.preference(
+                                        key: _ScrollTopMinYKey.self,
+                                        value: geo.frame(in: .named(_InspectorCS.scroll)).minY
+                                    )
+                                }
+                            )
+
+                        HeroHeader(
+                            height: heroHeight,
+                            title: chat.title,
+                            subtitle: chat.kind.label.isEmpty ? "Chat" : chat.kind.label,
+                            titleOpacity: heroTitleOpacity,
+                            titleScale: heroTitleScale,
+                            titleLift: heroTitleLift,
+                            subtitleOpacity: subtitleOpacity,
+                            actionsOpacity: actionsOpacity,
+                            actionsBlur: actionsBlur
                         )
 
-                    HeroHeader(
-                        height: heroHeight,
-                        title: chat.title,
-                        subtitle: chat.kind.label.isEmpty ? "Chat" : chat.kind.label,
-                        titleOpacity: heroTitleOpacity,
-                        titleScale: heroTitleScale,
-                        titleLift: heroTitleLift,
-                        subtitleOpacity: subtitleOpacity,
-                        actionsOpacity: actionsOpacity,
-                        actionsBlur: actionsBlur
-                    )
-
-                    QuickActionsCard()
-                    PlaceholderOptionsCard()
-                    MoreStubsCard()
-                    DebugFillers()
+                        QuickActionsCard()
+                        PlaceholderOptionsCard()
+                        MoreStubsCard()
+                        DebugFillers()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 28)
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 28)
-            }
-            .coordinateSpace(name: _InspectorCS.scroll)
-            .ignoresSafeArea(.container, edges: .top)
-            .overlay(alignment: .top) {
-                _PinnedTitleSlotProbe(
+                .coordinateSpace(name: _InspectorCS.scroll)
+                .ignoresSafeArea(.container, edges: .top)
+                .overlay(alignment: .top) {
+                    _PinnedTitleSlotProbe(
+                        title: chat.title,
+                        topPadding: pinnedTopPadding,
+                        avatarSize: pinnedAvatarSize,
+                        titleSpacing: pinnedTitleSpacing
+                    )
+                }
+                .scrollEdgeEffectStyle(.soft, for: .top)
+                .onPreferenceChange(_HeroTitleMinYKey.self) {
+                    heroTitleScrollMinY = $0
+                    updateBaseline()
+                }
+                .onPreferenceChange(_PinnedTitleMinYKey.self) {
+                    pinnedTitleScrollMinY = $0
+                    updateBaseline()
+                }
+                .onAppear {
+                    // Important: попросим hi-res у TDLib только когда инспектор реально открыт
+                    store.prefetchChatAvatarHiResIfNeeded(chatId: chat.id)
+
+                    resetBaseline()
+                    DispatchQueue.main.async { updateBaseline() }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { updateBaseline() }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { updateBaseline() }
+                }
+                .onChange(of: chat.id) { _ in
+                    store.prefetchChatAvatarHiResIfNeeded(chatId: chat.id)
+
+                    resetBaseline()
+                    DispatchQueue.main.async { updateBaseline() }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { updateBaseline() }
+                }
+                .onPreferenceChange(_ScrollTopMinYKey.self) {
+                    scrollTopMinY = $0
+
+                    if !baselineScrollTopMinY.isFinite, $0.isFinite {
+                        baselineScrollTopMinY = $0
+                    }
+
+                    updateBaseline()
+                    scheduleBaselineSettleCheck()
+                }
+
+                PinnedHeaderChrome(
                     title: chat.title,
+                    avatar: chromeAvatarImage,
+                    height: pinnedChromeHeight,
                     topPadding: pinnedTopPadding,
                     avatarSize: pinnedAvatarSize,
-                    titleSpacing: pinnedTitleSpacing
+                    titleSpacing: pinnedTitleSpacing,
+                    chromeAlpha: chromeAlpha
                 )
+                .ignoresSafeArea(.container, edges: .top)
+                .allowsHitTesting(false)
             }
-            .scrollEdgeEffectStyle(.soft, for: .top)
-            .onPreferenceChange(_HeroTitleMinYKey.self) {
-                heroTitleScrollMinY = $0
-                updateBaseline()
-            }
-            .onPreferenceChange(_PinnedTitleMinYKey.self) {
-                pinnedTitleScrollMinY = $0
-                updateBaseline()
-            }
-            .onAppear {
-                resetBaseline()
-                DispatchQueue.main.async { updateBaseline() }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { updateBaseline() }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { updateBaseline() }
-            }
-            .onChange(of: chat.id) { _ in
-                resetBaseline()
-                DispatchQueue.main.async { updateBaseline() }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { updateBaseline() }
-            }
-            .onPreferenceChange(_ScrollTopMinYKey.self) {
-                scrollTopMinY = $0
-
-                // Capture the initial “top rest” position once (used to detect return-to-top).
-                if !baselineScrollTopMinY.isFinite, $0.isFinite {
-                    baselineScrollTopMinY = $0
-                }
-
-                updateBaseline()
-                scheduleBaselineSettleCheck()
-            }
-
-            PinnedHeaderChrome(
-                title: chat.title,
-                avatar: avatarImage,
-                height: pinnedChromeHeight,
-                topPadding: pinnedTopPadding,
-                avatarSize: pinnedAvatarSize,
-                titleSpacing: pinnedTitleSpacing,
-                chromeAlpha: chromeAlpha
-            )
-            .ignoresSafeArea(.container, edges: .top)
-            .allowsHitTesting(false)
-
-            #if DEBUG
-            if showDebugOverlay {
-                Text("beyondPin \(Int(beyondPin))  handoff \(String(format: "%.2f", Double(handoffProgress)))  blur \(String(format: "%.2f", Double(blurProgress)))")
-                    .font(.caption2)
-                    .padding(6)
-                    .background(.regularMaterial)
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .padding(.top, 6)
-                    .padding(.leading, 6)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            #endif
+            .background(Color(nsColor: .windowBackgroundColor))
         }
-        .background(Color(nsColor: .windowBackgroundColor))
     }
-
 }
 
 // MARK: - Background (photo + stretched strip + overlap blur)
@@ -392,18 +353,14 @@ private struct PosterBackground: View {
                             .blur(radius: posterBlurRadius, opaque: true)
                             .overlay(photoDimming)
                             .overlay(Color.black.opacity(0.06 * frostAmount))
-                            // Blend the photo into the lower material so there’s no visible “band”.
                             .overlay(photoMaterialBlend)
 
                         if let strip = img.bottomStripImage(height: 28) {
                             Image(nsImage: strip)
                                 .resizable(resizingMode: .stretch)
                                 .frame(width: width, height: max(0, totalHeight - headerHeight))
-                                // Blend better with the hero photo: reduce the base blur and let it follow posterBlurRadius more.
                                 .blur(radius: 24 + (posterBlurRadius * 0.80), opaque: true)
-                                // Less dark tint so it doesn’t read as a “band”.
                                 .overlay(Color.black.opacity(0.03))
-                                // Soft top fade so the seam at `headerHeight` is less noticeable.
                                 .overlay(
                                     LinearGradient(
                                         stops: [
@@ -445,8 +402,6 @@ private struct PosterBackground: View {
         .allowsHitTesting(false)
     }
 
-    // Material fade on the hero photo itself.
-    // This removes the hard transition where the lower overlap material begins.
     private var photoMaterialBlend: some View {
         let base: AnyView = {
             if reduceTransparency {
@@ -457,14 +412,11 @@ private struct PosterBackground: View {
         }()
 
         return base
-            // In dark mode, Liquid Glass can create a bright “highlight belt”.
-            // Counter it with a subtle dark tint; in light mode keep a neutral window tint.
             .overlay(colorScheme == .dark
                      ? Color.black.opacity(0.08)
                      : Color(nsColor: .windowBackgroundColor).opacity(0.04))
             .mask(
                 LinearGradient(
-                    // Smoother ramp: avoids a mid-level plateau that reads as a horizontal band.
                     stops: [
                         .init(color: .clear,               location: 0.00),
                         .init(color: .clear,               location: 0.22),
@@ -497,14 +449,12 @@ private struct PosterBackground: View {
 
         return base
             .frame(width: width, height: overlayHeight)
-            // Neutral tint for legibility. In dark mode, keep it lighter to avoid a visible belt.
             .overlay(colorScheme == .dark
                      ? Color.black.opacity(0.03)
                      : Color(nsColor: .windowBackgroundColor).opacity(0.06))
             .mask(
                 LinearGradient(
                     stops: [
-                        // Avoid a fully-clear band at the top — it reads as a “gap” between blur layers.
                         .init(color: .black.opacity(0.03),  location: 0.00),
                         .init(color: .black.opacity(0.08),  location: max(0.00, overlapRatio * 0.10)),
                         .init(color: .black.opacity(0.18),  location: max(0.00, overlapRatio * 0.30)),
@@ -543,7 +493,6 @@ private struct HeroHeader: View {
 
             VStack(spacing: 4) {
                 ZStack {
-                    // Measurement copy (in ScrollView coordinate space, no transforms)
                     Text(title)
                         .font(.system(size: 26, weight: .bold, design: .rounded))
                         .multilineTextAlignment(.center)
@@ -559,7 +508,6 @@ private struct HeroHeader: View {
                             }
                         )
 
-                    // Visible copy (with transforms for “pin feel”)
                     Text(title)
                         .font(.system(size: 26, weight: .bold, design: .rounded))
                         .multilineTextAlignment(.center)
@@ -578,8 +526,6 @@ private struct HeroHeader: View {
                     .lineLimit(1)
                     .opacity(subtitleOpacity)
 
-                // IMPORTANT: don’t apply `.blur(radius: 0)` — it can still trigger offscreen rendering
-                // and make SF Symbols look soft at rest. Only blur while we’re actually fading.
                 Group {
                     if actionsBlur > 0.001 {
                         HeroActionRow()
@@ -604,8 +550,6 @@ private struct HeroHeader: View {
 
 private struct HeroActionRow: View {
     var body: some View {
-        // IMPORTANT: GlassEffectContainer can composite the extracted glass layer above sibling content.
-        // For crisp icons, keep glass local to each circle background.
         HStack(spacing: 10) {
             HeroActionButton(icon: "message.fill", label: "Chat")
             HeroActionButton(icon: "phone.fill", label: "Audio")
@@ -633,8 +577,6 @@ private struct HeroActionButton: View {
                             .fill(Color.black.opacity(0.25))
                             .frame(width: 44, height: 44)
                     } else {
-                        // IMPORTANT: glass only on the background shape.
-                        // Keep the symbol as a separate layer above it.
                         Color.clear
                             .frame(width: 44, height: 44)
                             .glassEffect(in: Circle())
@@ -694,7 +636,6 @@ private struct PinnedHeaderChrome: View {
             .frame(maxWidth: .infinity)
         }
         .frame(height: height)
-        // No explicit divider: the glass fade should blend without a hard line.
     }
 
     private var chromeBackground: some View {
@@ -718,7 +659,6 @@ private struct PinnedHeaderChrome: View {
                 )
                 .opacity(0.70)
             )
-            // Extra blur/softness at the very top (stronger “glass” there), fading out downward.
             .overlay(
                 Group {
                     if reduceTransparency {
@@ -726,7 +666,6 @@ private struct PinnedHeaderChrome: View {
                     } else {
                         Rectangle()
                             .fill(.ultraThinMaterial)
-                            // In dark mode, avoid a bright highlight belt by slightly darkening.
                             .overlay(colorScheme == .dark ? Color.black.opacity(0.06) : Color.clear)
                             .mask(
                                 LinearGradient(
@@ -748,9 +687,7 @@ private struct PinnedHeaderChrome: View {
                 LinearGradient(
                     stops: [
                         .init(color: .black,               location: 0.00),
-                        // Hold the glass “solid” longer.
                         .init(color: .black,               location: 0.35),
-                        // Start the fade later and make it much longer.
                         .init(color: .black.opacity(0.92),  location: 0.60),
                         .init(color: .black.opacity(0.70),  location: 0.75),
                         .init(color: .black.opacity(0.45),  location: 0.86),
@@ -970,8 +907,6 @@ private struct _PinnedTitleMinYKey: PreferenceKey {
         value = min(value, next)
     }
 }
-
-// MARK: - Helpers
 
 private extension CGFloat {
     func clamped(_ min: CGFloat, _ max: CGFloat) -> CGFloat {

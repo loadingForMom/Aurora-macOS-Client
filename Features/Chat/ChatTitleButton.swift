@@ -9,11 +9,16 @@ import SwiftUI
 
 struct ChatTitleButton: View {
     let title: String
+    let avatarPath: String?
 
     var body: some View {
         HStack(spacing: 10) {
-            avatar
-
+            AvatarCircle(
+                title: title,
+                path: avatarPath,
+                size: 26,
+                font: .caption.weight(.semibold)
+            )
             Text(title)
                 .font(.headline)
                 .lineLimit(1)
@@ -21,30 +26,5 @@ struct ChatTitleButton: View {
         .padding(.vertical, 2)
         .padding(.horizontal, 6)
         .contentShape(Rectangle())
-    }
-
-    // Пока без настоящих фоток: делаем iMessage-style плейсхолдер.
-    // Фото подтянем позже через TDLib (getUserProfilePhotos + downloadFile).
-    private var avatar: some View {
-        ZStack {
-            Circle()
-                .fill(.thinMaterial)
-            Text(initials(from: title))
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-        }
-        .frame(width: 26, height: 26)
-    }
-
-    private func initials(from name: String) -> String {
-        let parts = name
-            .split(separator: " ")
-            .prefix(2)
-            .map { String($0.prefix(1)).uppercased() }
-
-        if parts.isEmpty {
-            return "?"
-        }
-        return parts.joined()
     }
 }

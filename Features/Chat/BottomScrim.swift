@@ -7,8 +7,6 @@
 
 import SwiftUI
 
-/// A bottom “blur + fade” layer so messages can visually slide under the composer,
-/// similar to Messages/iMessage.
 struct BottomScrim: View {
     var height: CGFloat = 140
 

@@ -10,10 +10,10 @@ struct ChatMessageGroupView: View {
     let chat: TGChat
     let group: MessageGroup
 
-    // Trackpad “reveal exact time” (0…maxReveal)
+    /// Trackpad “reveal exact time” (0…maxReveal)
     let revealTimeX: CGFloat
 
-    // Jelly inputs (computed by parent from scroll offset deltas).
+    /// Jelly impulse (computed by parent from scroll deltas)
     let jellyScrollImpulse: CGFloat
     let jellyContainerHeight: CGFloat
 
@@ -53,39 +53,25 @@ struct ChatMessageGroupView: View {
                         onRetry: { store.retrySend(message: msg) },
                         onDelete: { store.deleteMessages(chatId: msg.chatId, messageIds: [msg.id], revoke: true) }
                     )
-                    .applyIf(abs(jellyScrollImpulse) > 0.01) { view in
-                        view.visualEffect { content, proxy in
-                            // Use named coordinate space (macOS-safe, no .scrollView dependency).
-                            let frame = proxy.frame(in: .named(MessagesPane.scrollSpaceName))
-                            let distanceToBottom = max(0, jellyContainerHeight - frame.maxY)
+                    .visualEffect { content, proxy in
+                        // Anchor jelly to bottom of visible container.
+                        let frame = proxy.frame(in: .named(MessagesPane.scrollSpaceName))
+                        let distanceToBottom = max(0, jellyContainerHeight - frame.maxY)
+                        let k = max(0, 1 - min(distanceToBottom / 360, 1))
 
-                            // 0…1: near bottom = stronger, higher up = weaker
-                            let k = max(0, 1 - min(distanceToBottom / 320, 1))
-
-                            // Stronger amplitude knobs:
-                            //  - impulse multiplier controls “stretch” during scroll
-                            let y = (-jellyScrollImpulse * 0.55 * k)
-                            return content.offset(y: y)
-                        }
+                        // Stronger amplitude (you asked for more).
+                        let y = (-jellyScrollImpulse * 0.85 * k)
+                        return content.offset(y: y)
                     }
                 }
             }
         }
         .onAppear {
-            // Mark incoming messages as viewed when they become visible.
             guard !group.isOutgoing else { return }
             let ids = group.messages.map { $0.id }
             store.viewMessages(chatId: chat.id, messageIds: ids, forceRead: false)
         }
         .frame(maxWidth: .infinity, alignment: group.isOutgoing ? .trailing : .leading)
         .padding(.vertical, 2)
-    }
-}
-
-// Small helper to conditionally apply modifiers without wrecking type inference.
-private extension View {
-    @ViewBuilder
-    func applyIf<T: View>(_ condition: Bool, transform: (Self) -> T) -> some View {
-        if condition { transform(self) } else { self }
     }
 }

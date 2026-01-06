@@ -1,5 +1,5 @@
 //
-//  Untitled.swift
+//  ChatHeader.swift
 //  Aurora
 //
 //  Created by Sasha on 1/3/26.
@@ -11,7 +11,13 @@ import AppKit
 struct ChatHeader: View {
     let title: String
     let isGroup: Bool
-    let avatar: NSImage?
+
+    /// NOTE:
+    /// Это поле оставлено строкой для совместимости с твоими вызовами.
+    /// Идея оптимизации: сюда лучше передавать уже thumb-path (не оригинал TDLib),
+    /// но если где-то передаётся оригинал — он всё равно будет выглядеть, просто может быть тяжелее.
+    let avatarPath: String?
+
     var onToggleInspector: () -> Void
 
     var body: some View {
@@ -31,21 +37,12 @@ struct ChatHeader: View {
 
             Button(action: onToggleInspector) {
                 HStack(spacing: 10) {
-                    ZStack {
-                        Circle().fill(.thinMaterial)
-
-                        if let avatar {
-                            Image(nsImage: avatar)
-                                .resizable()
-                                .scaledToFill()
-                                .clipShape(Circle())
-                        } else {
-                            Text(initials(from: title))
-                                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .frame(width: 28, height: 28)
+                    AvatarCircle(
+                        title: title,
+                        path: avatarPath,
+                        size: 28,
+                        font: .system(size: 11, weight: .semibold, design: .rounded)
+                    )
                     .overlay(Circle().strokeBorder(.white.opacity(0.14), lineWidth: 1))
 
                     VStack(spacing: 2) {
@@ -82,17 +79,5 @@ struct ChatHeader: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .background(.ultraThinMaterial)
-    }
-
-    private func initials(from title: String) -> String {
-        let parts = title
-            .split(separator: " ")
-            .prefix(2)
-            .map { String($0.prefix(1)).uppercased() }
-
-        if parts.isEmpty, let first = title.first {
-            return String(first).uppercased()
-        }
-        return parts.joined()
     }
 }
