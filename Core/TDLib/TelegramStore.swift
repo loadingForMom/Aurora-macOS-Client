@@ -7,6 +7,7 @@
 
 import Foundation
 import Combine
+import AppKit
 
 @MainActor
 final class TelegramStore: ObservableObject {
@@ -23,16 +24,83 @@ final class TelegramStore: ObservableObject {
     @Published var logs: [String] = []
     @Published var showLogs: Bool = false
 
+    // MARK: - Storage / Cache (for Settings)
+
+    @Published var storageByFileType: [StorageFileTypeStat] = []
+    @Published var storageTotalBytes: Int64 = 0
+    @Published var storageLastRefreshedAt: Date? = nil
+    @Published var cacheLimitBytes: Int64 = 2_147_483_648 // 2 GB default
+
+    private let cacheLimitBytesKey = "aurora.cache_limit_bytes"
+    private var storageExtrasInFlight: Set<String> = []
+    private var didRequestInitialStorageStats = false
+
+    // MARK: - Current user (for Settings sidebar header)
+
+    @Published var myUserId: Int64?
+    @Published var myProfilePhotoPath: String?
+
+    // MARK: - Chat avatars (photo per chat)
+
+    @Published var chatAvatarPathByChatId: [Int64: String] = [:]
+    private var chatAvatarFileIdByChatId: [Int64: Int32] = [:]
+    private var chatIdByAvatarFileId: [Int32: Int64] = [:]
+    private var requestedAvatarFileIds: Set<Int32> = []
+    private var myPhotoFileId: Int32?
+
     private var didLoadInitialData = false
     private var didSendTdlibParameters = false
+
+    // MARK: - Optimistic sending infra
+
+    private struct PendingLink {
+        let chatId: Int64
+        var placeholderId: Int64
+        let localId: UUID
+        let sendingId: Int32
+        let text: String
+        let date: Int
+    }
+
+    /// localId -> pending link (placeholder bookkeeping)
+    private var pendingByLocalId: [UUID: PendingLink] = [:]
+
+    /// sendingId -> localId (stable matching with TDLib pending messages)
+    private var localIdBySendingId: [Int32: UUID] = [:]
+
+    /// TDLib temp message id (old_message_id) -> localId (so sendSucceeded can clean up)
+    private var localIdByTempMessageId: [Int64: UUID] = [:]
+
+    /// Our own placeholder message ids (negative, unique)
+    private var nextLocalTempId: Int64 = -1
+
+    private func makeLocalTempId() -> Int64 {
+        nextLocalTempId -= 1
+        return nextLocalTempId
+    }
+
+    private func makeSendingId() -> Int32 {
+        var x: Int32 = Int32.random(in: 1...Int32.max)
+        while localIdBySendingId[x] != nil {
+            x = Int32.random(in: 1...Int32.max)
+        }
+        return x
+    }
+
+    // MARK: - History jobs
+
+    private enum HistoryJobKind { case latest, older }
 
     private struct HistoryJob {
         let chatId: Int64
         let targetCount: Int
         var nextFromMessageId: Int64
         var accById: [Int64: TGMessage]
+        let kind: HistoryJobKind
     }
+
     private var historyJobs: [String: HistoryJob] = [:]
+    private var reachedHistoryStart: Set<Int64> = []
 
     init() {
         td.startReceiveLoop { [weak self] upd in
@@ -43,6 +111,10 @@ final class TelegramStore: ObservableObject {
         }
 
         td.send(#"{"@type":"getOption","name":"version"}"#)
+
+        if let n = UserDefaults.standard.object(forKey: cacheLimitBytesKey) as? NSNumber {
+            cacheLimitBytes = n.int64Value
+        }
     }
 
     var sortedChats: [TGChat] {
@@ -53,23 +125,116 @@ final class TelegramStore: ObservableObject {
         }
     }
 
+    var myDisplayName: String {
+        guard let id = myUserId else { return "" }
+        return usersById[id]?.displayName ?? ""
+    }
+
+    var myProfileNSImage: NSImage? {
+        guard let p = myProfilePhotoPath, !p.isEmpty else { return nil }
+        return NSImage(contentsOfFile: p)
+    }
+
+    // MARK: - Read / viewed helpers
+
+    func viewMessages(chatId: Int64, messageIds: [Int64], forceRead: Bool = false) {
+        guard !messageIds.isEmpty else { return }
+        let req: [String: Any] = [
+            "@type": "viewMessages",
+            "chat_id": chatId,
+            "message_ids": messageIds,
+            "force_read": forceRead
+        ]
+        sendJSON(req)
+    }
+
+    func markChatAsReadToLatestIfNeeded(chatId: Int64) {
+        guard let c = chatsById[chatId] else { return }
+        if c.unreadCount <= 0 { return }
+        if c.lastMessageId == 0 { return }
+        viewMessages(chatId: chatId, messageIds: [c.lastMessageId], forceRead: true)
+    }
+
+    func chatAvatarNSImage(chatId: Int64) -> NSImage? {
+        guard let p = chatAvatarPathByChatId[chatId], !p.isEmpty else { return nil }
+        return NSImage(contentsOfFile: p)
+    }
+
     func userDisplayName(_ userId: Int64?) -> String {
         guard let id = userId else { return "" }
         return usersById[id]?.displayName ?? "User \(id)"
     }
 
-    func selectChat(_ chatId: Int64) {
-        selectedChatId = chatId
+    func selectChat(_ chatId: Int64, forceReload: Bool = false) {
+        let isSame = (selectedChatId == chatId)
+        if !isSame {
+            selectedChatId = chatId
+        }
+
+        if !forceReload, let existing = messagesByChatId[chatId], !existing.isEmpty {
+            return
+        }
+
         loadLatestHistory(chatId: chatId)
     }
+
+    // MARK: - Public message actions (send / retry / edit / delete)
 
     func sendText(chatId: Int64, text: String) {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
 
+        let now = Int(Date().timeIntervalSince1970)
+        let localId = UUID()
+        let sendingId = makeSendingId()
+        let placeholderId = makeLocalTempId()
+
+        let pending = TGMessage(
+            id: placeholderId,
+            chatId: chatId,
+            date: now,
+            isOutgoing: true,
+            senderUserId: myUserId,
+            text: clean,
+            sendState: .pending,
+            localId: localId,
+            sendingId: sendingId,
+            editedAt: nil,
+            canRetry: false
+        )
+
+        optimisticInsertMessage(pending)
+
+        pendingByLocalId[localId] = PendingLink(
+            chatId: chatId,
+            placeholderId: placeholderId,
+            localId: localId,
+            sendingId: sendingId,
+            text: clean,
+            date: now
+        )
+        localIdBySendingId[sendingId] = localId
+
+        // TDLib matching: sending_id in messageSendOptions -> echoed back in messageSendingStatePending.sending_id
+        let options: [String: Any] = [
+            "@type": "messageSendOptions",
+            "disable_notification": false,
+            "from_background": false,
+            "protect_content": false,
+            "update_order_of_installed_sticker_sets": false,
+            "scheduling_state": NSNull(),
+            "sending_id": Int(sendingId),
+            "only_preview": false
+        ]
+
         let req: [String: Any] = [
             "@type": "sendMessage",
+            "@extra": "send:\(localId.uuidString)",
             "chat_id": chatId,
+            "message_thread_id": 0,
+            "reply_to": NSNull(),
+            "options": options,
+            "reply_markup": NSNull(),
             "input_message_content": [
                 "@type": "inputMessageText",
                 "text": [
@@ -78,6 +243,63 @@ final class TelegramStore: ObservableObject {
                     "entities": []
                 ],
                 "clear_draft": true
+            ]
+        ]
+        sendJSON(req)
+    }
+
+    func retrySend(message: TGMessage) {
+        guard message.chatId != 0 else { return }
+
+        // Best path: TDLib resendMessages (it will delete failed msg if resent successfully).
+        // Only valid when canRetry == true (from messageSendingStateFailed.can_retry).
+        if message.canRetry, message.id != 0 {
+            markMessagePending(chatId: message.chatId, id: message.id)
+
+            let req: [String: Any] = [
+                "@type": "resendMessages",
+                "@extra": "resend:\(message.chatId):\(message.id):\(UUID().uuidString)",
+                "chat_id": message.chatId,
+                "message_ids": [message.id]
+            ]
+            sendJSON(req)
+            return
+        }
+
+        // Fallback: send as a new message (keeps the failed one in the timeline).
+        sendText(chatId: message.chatId, text: message.text)
+    }
+
+    func deleteMessages(chatId: Int64, messageIds: [Int64], revoke: Bool = true) {
+        guard !messageIds.isEmpty else { return }
+        let req: [String: Any] = [
+            "@type": "deleteMessages",
+            "@extra": "delete:\(chatId):\(UUID().uuidString)",
+            "chat_id": chatId,
+            "message_ids": messageIds,
+            "revoke": revoke
+        ]
+        sendJSON(req)
+    }
+
+    func editMessageText(chatId: Int64, messageId: Int64, newText: String) {
+        let clean = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+
+        let req: [String: Any] = [
+            "@type": "editMessageText",
+            "@extra": "edit:\(chatId):\(messageId):\(UUID().uuidString)",
+            "chat_id": chatId,
+            "message_id": messageId,
+            "reply_markup": NSNull(),
+            "input_message_content": [
+                "@type": "inputMessageText",
+                "text": [
+                    "@type": "formattedText",
+                    "text": clean,
+                    "entities": []
+                ],
+                "clear_draft": false
             ]
         ]
         sendJSON(req)
@@ -117,23 +339,331 @@ final class TelegramStore: ObservableObject {
     // MARK: - History
 
     private func loadLatestHistory(chatId: Int64) {
-        isLoadingHistory = true
-        let extra = "history:\(chatId):\(UUID().uuidString)"
-        historyJobs[extra] = HistoryJob(chatId: chatId, targetCount: 160, nextFromMessageId: 0, accById: [:])
-        sendChatHistory(chatId: chatId, fromMessageId: 0, limit: 100, extra: extra)
+        isLoadingHistory = (selectedChatId == chatId)
+        reachedHistoryStart.remove(chatId)
+
+        // Keep optimistic locals? Here we clear for "truth" — but if you want locals to persist across reload,
+        // you can merge instead of wiping.
+        messagesByChatId[chatId] = []
+
+        cancelHistoryJobs(for: chatId)
+
+        let extra = "history:\(chatId):latest:\(UUID().uuidString)"
+        historyJobs[extra] = HistoryJob(
+            chatId: chatId,
+            targetCount: 160,
+            nextFromMessageId: 0,
+            accById: [:],
+            kind: .latest
+        )
+        sendChatHistory(chatId: chatId, fromMessageId: 0, offset: 0, limit: 100, extra: extra)
     }
 
-    private func sendChatHistory(chatId: Int64, fromMessageId: Int64, limit: Int, extra: String) {
+    private func cancelHistoryJobs(for chatId: Int64) {
+        let keys = historyJobs.compactMap { (k, v) in v.chatId == chatId ? k : nil }
+        for k in keys { historyJobs.removeValue(forKey: k) }
+    }
+
+    private func sendChatHistory(chatId: Int64, fromMessageId: Int64, offset: Int, limit: Int, extra: String) {
         let req: [String: Any] = [
             "@type": "getChatHistory",
             "@extra": extra,
             "chat_id": chatId,
             "from_message_id": fromMessageId,
-            "offset": 0,
+            "offset": offset,
             "limit": limit,
             "only_local": false
         ]
         sendJSON(req)
+    }
+
+    /// Lazy paging: call this when the user scrolls to the top of the messages list.
+    func loadMoreHistory(chatId: Int64, pageSize: Int = 80) {
+        if isLoadingHistory { return }
+        if reachedHistoryStart.contains(chatId) { return }
+
+        guard let current = messagesByChatId[chatId], !current.isEmpty else {
+            loadLatestHistory(chatId: chatId)
+            return
+        }
+
+        if current.count >= 800 { return }
+
+        isLoadingHistory = (selectedChatId == chatId)
+
+        // IMPORTANT: ignore local negative placeholder ids for paging anchor.
+        let serverMsgs = current.filter { $0.id > 0 }
+        guard let oldestServerId = serverMsgs.min(by: { $0.id < $1.id })?.id else {
+            // If we somehow have only local placeholders, just bail.
+            isLoadingHistory = false
+            return
+        }
+
+        let target = min(800, current.count + pageSize)
+        let extra = "history:\(chatId):older:\(UUID().uuidString)"
+
+        historyJobs[extra] = HistoryJob(
+            chatId: chatId,
+            targetCount: target,
+            nextFromMessageId: oldestServerId,
+            accById: Dictionary(uniqueKeysWithValues: current.map { ($0.id, $0) }),
+            kind: .older
+        )
+
+        sendChatHistory(chatId: chatId, fromMessageId: oldestServerId, offset: -pageSize, limit: pageSize, extra: extra)
+    }
+
+    // MARK: - Storage / Cache (Settings helpers)
+
+    func refreshStorageStatistics() {
+        let extra = "storage:full:\(UUID().uuidString)"
+        storageExtrasInFlight.insert(extra)
+
+        let req: [String: Any] = [
+            "@type": "getStorageStatistics",
+            "@extra": extra,
+            "chat_limit": 0
+        ]
+        sendJSON(req)
+    }
+
+    func applyCacheLimitBytes(_ bytes: Int64) {
+        let clamped = max(0, bytes)
+        cacheLimitBytes = clamped
+        UserDefaults.standard.set(NSNumber(value: clamped), forKey: cacheLimitBytesKey)
+        optimizeStorage(maxBytes: clamped)
+    }
+
+    func clearAllCache() {
+        optimizeStorage(maxBytes: 0)
+    }
+
+    private func optimizeStorage(maxBytes: Int64) {
+        let extra = "storage:optimize:\(UUID().uuidString)"
+        storageExtrasInFlight.insert(extra)
+
+        let fileTypes: [[String: Any]] = [
+            ["@type": "fileTypePhoto"],
+            ["@type": "fileTypeVideo"],
+            ["@type": "fileTypeAnimation"],
+            ["@type": "fileTypeDocument"],
+            ["@type": "fileTypeAudio"],
+            ["@type": "fileTypeVoiceNote"],
+            ["@type": "fileTypeVideoNote"],
+            ["@type": "fileTypeSticker"],
+            ["@type": "fileTypeWallpaper"],
+            ["@type": "fileTypeProfilePhoto"],
+            ["@type": "fileTypeThumbnail"],
+            ["@type": "fileTypeTemp"],
+            ["@type": "fileTypeUnknown"]
+        ]
+
+        let req: [String: Any] = [
+            "@type": "optimizeStorage",
+            "@extra": extra,
+            "size": maxBytes,
+            "ttl": 0,
+            "count": 0,
+            "immunity_delay": 0,
+            "file_types": fileTypes,
+            "chat_ids": [],
+            "exclude_chat_ids": [],
+            "return_deleted_file_statistics": false,
+            "chat_limit": 0
+        ]
+
+        sendJSON(req)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.refreshStorageStatistics()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            self?.refreshStorageStatistics()
+        }
+    }
+
+    private struct ParsedStorageStatistics {
+        let extra: String?
+        let byFileType: [StorageFileTypeStat]
+    }
+
+    private func parseStorageStatisticsAny(_ upd: String) -> ParsedStorageStatistics? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard let type = obj["@type"] as? String else { return nil }
+
+        let extra = obj["@extra"] as? String
+
+        if type == "error" {
+            if let extra { storageExtrasInFlight.remove(extra) }
+            return nil
+        }
+
+        if type == "ok" {
+            if let extra { storageExtrasInFlight.remove(extra) }
+            return nil
+        }
+
+        func extraIsAcceptableForStorage() -> Bool {
+            if storageExtrasInFlight.isEmpty { return true }
+            guard let extra else { return true }
+            return storageExtrasInFlight.contains(extra)
+        }
+
+        if type == "storageStatisticsFast" {
+            guard extraIsAcceptableForStorage() else { return nil }
+
+            let files = (obj["files_size"] as? NSNumber)?.int64Value ?? 0
+            let db = (obj["database_size"] as? NSNumber)?.int64Value ?? 0
+            let lpdb = (obj["language_pack_database_size"] as? NSNumber)?.int64Value ?? 0
+            let log = (obj["log_size"] as? NSNumber)?.int64Value ?? 0
+
+            let stats: [StorageFileTypeStat] = [
+                StorageFileTypeStat(fileTypeKey: "fastFiles", bytes: files, count: 0),
+                StorageFileTypeStat(fileTypeKey: "fastDatabase", bytes: db, count: 0),
+                StorageFileTypeStat(fileTypeKey: "fastLanguagePackDatabase", bytes: lpdb, count: 0),
+                StorageFileTypeStat(fileTypeKey: "fastLog", bytes: log, count: 0)
+            ].filter { $0.bytes > 0 }
+
+            return ParsedStorageStatistics(extra: extra, byFileType: mergeAndSortStorage(stats))
+        }
+
+        if type == "storageStatistics" {
+            guard extraIsAcceptableForStorage() else { return nil }
+
+            let byChatAny = (obj["by_chat"] as? [Any]) ?? []
+            let byChat = byChatAny.compactMap { $0 as? [String: Any] }
+
+            var acc: [String: StorageFileTypeStat] = [:]
+            for c in byChat {
+                let byTypeAny = (c["by_file_type"] as? [Any]) ?? []
+                let byType = byTypeAny
+                    .compactMap { $0 as? [String: Any] }
+                    .compactMap(parseStorageByFileType(_:))
+                for s in byType {
+                    acc[s.fileTypeKey] = (acc[s.fileTypeKey] ?? s).adding(bytes: s.bytes, count: s.count)
+                }
+            }
+
+            return ParsedStorageStatistics(extra: extra, byFileType: mergeAndSortStorage(Array(acc.values)))
+        }
+
+        return nil
+    }
+
+    private func applyStorageStatistics(_ parsed: ParsedStorageStatistics) {
+        if let extra = parsed.extra {
+            storageExtrasInFlight.remove(extra)
+        }
+
+        storageByFileType = parsed.byFileType
+        storageTotalBytes = parsed.byFileType.reduce(0) { $0 + $1.bytes }
+        storageLastRefreshedAt = Date()
+    }
+
+    private func parseStorageByFileType(_ obj: [String: Any]) -> StorageFileTypeStat? {
+        guard let ft = obj["file_type"] as? [String: Any],
+              let ftType = ft["@type"] as? String else { return nil }
+
+        let bytes = (obj["size"] as? NSNumber)?.int64Value ?? 0
+        let count = (obj["count"] as? NSNumber)?.int32Value ?? 0
+
+        return StorageFileTypeStat(fileTypeKey: ftType, bytes: bytes, count: count)
+    }
+
+    private func mergeAndSortStorage(_ stats: [StorageFileTypeStat]) -> [StorageFileTypeStat] {
+        var acc: [String: StorageFileTypeStat] = [:]
+        for s in stats {
+            acc[s.fileTypeKey] = (acc[s.fileTypeKey] ?? s).adding(bytes: s.bytes, count: s.count)
+        }
+        return acc.values.sorted { $0.bytes > $1.bytes }
+    }
+
+    struct StorageFileTypeStat: Identifiable, Hashable {
+        let fileTypeKey: String
+        let bytes: Int64
+        let count: Int32
+
+        var id: String { fileTypeKey }
+
+        var title: String {
+            switch fileTypeKey {
+            case "fastFiles": return "Кэш"
+            case "fastDatabase": return "База данных"
+            case "fastLanguagePackDatabase": return "Языки"
+            case "fastLog": return "Логи"
+            case "fileTypeVideo", "fileTypeVideoNote", "fileTypeAnimation": return "Видео"
+            case "fileTypePhoto": return "Фото"
+            case "fileTypeSticker": return "Стикеры"
+            case "fileTypeAudio": return "Музыка"
+            case "fileTypeVoiceNote": return "Спикеры"
+            case "fileTypeDocument": return "Файлы"
+            case "fileTypeProfilePhoto": return "Аватары"
+            case "fileTypeThumbnail": return "Миниатюры"
+            case "fileTypeWallpaper": return "Обои"
+            case "fileTypeTemp": return "Временные"
+            case "fileTypeDatabase": return "База сообщений"
+            case "fileTypeUnknown": return "Кэш (всего)"
+            default: return "Другое"
+            }
+        }
+
+        var humanBytes: String {
+            ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        }
+
+        func adding(bytes addBytes: Int64, count addCount: Int32) -> StorageFileTypeStat {
+            StorageFileTypeStat(fileTypeKey: fileTypeKey, bytes: self.bytes + addBytes, count: self.count + addCount)
+        }
+    }
+
+    struct StorageBucket: Identifiable, Hashable {
+        let title: String
+        let bytes: Int64
+
+        var id: String { title }
+
+        var humanBytes: String {
+            ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        }
+    }
+
+    var storageBuckets: [StorageBucket] {
+        var acc: [String: Int64] = [:]
+
+        func bucketTitle(for fileTypeKey: String) -> String {
+            switch fileTypeKey {
+            case "fastFiles": return "Кэш"
+            case "fastDatabase": return "База данных"
+            case "fastLanguagePackDatabase": return "Языки"
+            case "fastLog": return "Логи"
+            case "fileTypeVideo", "fileTypeVideoNote", "fileTypeAnimation": return "Видео"
+            case "fileTypePhoto": return "Фото"
+            case "fileTypeAudio": return "Музыка"
+            case "fileTypeVoiceNote": return "Спикеры"
+            case "fileTypeSticker": return "Стикеры"
+            case "fileTypeThumbnail", "fileTypeProfilePhoto", "fileTypeWallpaper": return "Прочее"
+            case "fileTypeDatabase": return "База сообщений"
+            case "fileTypeUnknown": return "Кэш (всего)"
+            case "fileTypeTemp": return "Прочее"
+            default: return "Другое"
+            }
+        }
+
+        for s in storageByFileType {
+            let t = bucketTitle(for: s.fileTypeKey)
+            acc[t, default: 0] += s.bytes
+        }
+
+        return acc
+            .map { StorageBucket(title: $0.key, bytes: $0.value) }
+            .sorted { $0.bytes > $1.bytes }
+    }
+
+    var clearableCacheBytes: Int64 {
+        if let fast = storageByFileType.first(where: { $0.fileTypeKey == "fastFiles" }) {
+            return fast.bytes
+        }
+        return storageTotalBytes
     }
 
     // MARK: - Update processing
@@ -141,6 +671,15 @@ final class TelegramStore: ObservableObject {
     private func handleUpdate(_ upd: String) {
         if let st = parseAuthState(from: upd) {
             authState = st
+        }
+
+        if let (chatId, lastMessageId, preview, date) = parseUpdateChatLastMessage(upd) {
+            applyChatLastMessageUpdate(chatId: chatId, lastMessageId: lastMessageId, preview: preview, date: date)
+            keepOptimisticChatPreviewIfNeeded(chatId: chatId)
+        }
+
+        if let (chatId, lastReadInboxMessageId, unreadCount) = parseUpdateChatReadInbox(upd) {
+            applyChatReadInboxUpdate(chatId: chatId, lastReadInboxMessageId: lastReadInboxMessageId, unreadCount: unreadCount)
         }
 
         if authState == "authorizationStateWaitTdlibParameters", !didSendTdlibParameters {
@@ -151,8 +690,13 @@ final class TelegramStore: ObservableObject {
 
         if authState == "authorizationStateReady", !didLoadInitialData {
             didLoadInitialData = true
-            td.send(#"{"@type":"getMe"}"#)
+            td.send(#"{"@type":"getMe","@extra":"getMe"}"#)
             td.send(#"{"@type":"getChats","limit":200}"#)
+        }
+
+        if authState == "authorizationStateReady", !didRequestInitialStorageStats {
+            didRequestInitialStorageStats = true
+            refreshStorageStatistics()
         }
 
         if let ids = parseChatsResponse(upd) {
@@ -161,8 +705,16 @@ final class TelegramStore: ObservableObject {
             }
         }
 
-        if let chat = parseChatObject(upd) {
+        if let (chat, avatarFileId, avatarPath) = parseChatObject(upd) {
             chatsById[chat.id] = chat
+
+            if let p = avatarPath {
+                chatAvatarPathByChatId[chat.id] = p
+            }
+
+            if let fid = avatarFileId {
+                registerChatAvatar(chatId: chat.id, fileId: fid)
+            }
             if selectedChatId == nil {
                 selectedChatId = chat.id
                 loadLatestHistory(chatId: chat.id)
@@ -177,11 +729,57 @@ final class TelegramStore: ObservableObject {
             if var c = chatsById[chatId] { c.order = order; chatsById[chatId] = c }
         }
 
-        if let (chatId, preview, date) = parseUpdateChatLastMessage(upd) {
-            if var c = chatsById[chatId] {
-                c.lastMessagePreview = preview
-                c.lastMessageDate = date
-                chatsById[chatId] = c
+        // MARK: - Current user (me) + profile photo
+
+        if let (me, photoFileId, photoPath) = parseMeUserResponse(upd) {
+            myUserId = me.id
+            usersById[me.id] = me
+
+            if let p = photoPath {
+                myProfilePhotoPath = p
+            }
+
+            if let fid = photoFileId {
+                myPhotoFileId = fid
+                downloadMyPhotoIfNeeded(fileId: fid)
+            }
+        }
+
+        if let (u, photoFileId, photoPath) = parseUpdateUser(upt: upd) {
+            usersById[u.id] = u
+
+            if let meId = myUserId, meId == u.id {
+                if let p = photoPath {
+                    myProfilePhotoPath = p
+                }
+                if let fid = photoFileId {
+                    myPhotoFileId = fid
+                    downloadMyPhotoIfNeeded(fileId: fid)
+                }
+            }
+        }
+
+        if let path = parseUpdateFilePathIfMyPhoto(upd) {
+            myProfilePhotoPath = path
+        }
+
+        if let (chatId, path) = parseUpdateFilePathIfChatAvatar(upd) {
+            chatAvatarPathByChatId[chatId] = path
+        }
+
+        if let (chatId, avatarFileId, avatarPath) = parseUpdateChatPhoto(upd) {
+            if let p = avatarPath {
+                chatAvatarPathByChatId[chatId] = p
+            }
+
+            if let fid = avatarFileId {
+                registerChatAvatar(chatId: chatId, fileId: fid)
+            } else {
+                chatAvatarPathByChatId.removeValue(forKey: chatId)
+                if let old = chatAvatarFileIdByChatId.removeValue(forKey: chatId) {
+                    chatIdByAvatarFileId.removeValue(forKey: old)
+                    requestedAvatarFileIds.remove(old)
+                }
             }
         }
 
@@ -189,6 +787,39 @@ final class TelegramStore: ObservableObject {
             usersById[user.id] = user
         }
 
+        if let storage = parseStorageStatisticsAny(upd) {
+            applyStorageStatistics(storage)
+        }
+
+        // MARK: - Response to sendMessage/editMessageText (responses can include @extra; updates do not)
+        if let msgResponse = parseMessageFunctionResponse(upd) {
+            handleFunctionResponseMessage(msgResponse)
+        }
+
+        // MARK: - Sending lifecycle updates
+        if let succ = parseUpdateMessageSendSucceeded(upd) {
+            handleSendSucceeded(succ)
+        }
+
+        if let fail = parseUpdateMessageSendFailed(upd) {
+            handleSendFailed(fail)
+        }
+
+        // MARK: - Edit / content changes
+        if let edited = parseUpdateMessageEdited(upd) {
+            applyMessageEdited(chatId: edited.chatId, messageId: edited.messageId, editDate: edited.editDate)
+        }
+
+        if let content = parseUpdateMessageContent(upd) {
+            applyMessageContentChanged(chatId: content.chatId, messageId: content.messageId, newContent: content.newContent)
+        }
+
+        // MARK: - Deletions
+        if let del = parseUpdateDeleteMessages(upd) {
+            applyMessagesDeleted(chatId: del.chatId, messageIds: del.messageIds)
+        }
+
+        // MARK: - History responses
         if let res = parseMessagesResponse(upd), var job = historyJobs[res.extra] {
             for m in res.messages {
                 job.accById[m.id] = m
@@ -199,42 +830,473 @@ final class TelegramStore: ObservableObject {
                 job.nextFromMessageId = oldest
             }
 
+            do {
+                let ordered = sortChronological(Array(job.accById.values))
+                let cap = min(job.targetCount, ordered.count)
+                messagesByChatId[job.chatId] = Array(ordered.suffix(cap))
+
+                if selectedChatId == job.chatId {
+                    isLoadingHistory = true
+                }
+            }
+
             let currentCount = job.accById.count
             let remaining = max(0, job.targetCount - currentCount)
 
             if remaining == 0 || res.messages.isEmpty {
-                let ordered = job.accById.values.sorted { $0.date < $1.date }
+                if job.kind == .older && res.messages.isEmpty {
+                    reachedHistoryStart.insert(job.chatId)
+                }
+
+                let ordered = sortChronological(Array(job.accById.values))
                 messagesByChatId[job.chatId] = Array(ordered.suffix(job.targetCount))
+
                 historyJobs.removeValue(forKey: res.extra)
-                if selectedChatId == job.chatId { isLoadingHistory = false }
+                if selectedChatId == job.chatId {
+                    isLoadingHistory = historyJobs.values.contains(where: { $0.chatId == job.chatId })
+                }
             } else {
                 historyJobs[res.extra] = job
                 sendChatHistory(chatId: job.chatId,
                                 fromMessageId: job.nextFromMessageId,
+                                offset: 0,
                                 limit: min(remaining, 100),
                                 extra: res.extra)
             }
         }
 
+        // MARK: - New messages
         if let (chatId, msg) = parseUpdateNewMessage(upd) {
             requestUserIfNeeded(msg.senderUserId)
-            var arr = messagesByChatId[chatId] ?? []
-            arr.append(msg)
-            if arr.count > 800 { arr.removeFirst(arr.count - 800) }
-            messagesByChatId[chatId] = arr
 
-            if var c = chatsById[chatId] {
-                c.lastMessagePreview = msg.previewText
-                c.lastMessageDate = msg.date
-                chatsById[chatId] = c
+            if tryReconcileOutgoingPendingMessage(msg) {
+                // Reconciled: do not append (prevents duplicates)
+            } else {
+                appendMessage(msg, chatId: chatId)
             }
+
+            updateChatLastFromLocalTimeline(chatId: chatId)
         }
+    }
+
+    // MARK: - Chat last/preview application
+
+    private func applyChatLastMessageUpdate(chatId: Int64, lastMessageId: Int64, preview: String, date: Int) {
+        guard var c = chatsById[chatId] else { return }
+        c.lastMessageId = lastMessageId
+        c.lastMessagePreview = preview
+        c.lastMessageDate = date
+        chatsById[chatId] = c
+    }
+
+    private func keepOptimisticChatPreviewIfNeeded(chatId: Int64) {
+        // If the last local message is pending/failed, prefer it for the sidebar preview.
+        guard let localLast = messagesByChatId[chatId]?.last else { return }
+        guard localLast.isOutgoing else { return }
+
+        if case .sent = localLast.sendState {
+            return
+        }
+
+        guard var c = chatsById[chatId] else { return }
+
+        switch localLast.sendState {
+        case .pending:
+            c.lastMessagePreview = "You: (sending…) \(localLast.previewText)"
+        case .failed:
+            c.lastMessagePreview = "You: (failed) \(localLast.previewText)"
+        case .sent:
+            break
+        }
+
+        c.lastMessageDate = localLast.date
+        c.lastMessageId = localLast.id
+        chatsById[chatId] = c
+    }
+
+    private func applyChatReadInboxUpdate(chatId: Int64, lastReadInboxMessageId: Int64, unreadCount: Int32) {
+        guard var c = chatsById[chatId] else { return }
+        c.lastReadInboxMessageId = lastReadInboxMessageId
+        c.unreadCount = unreadCount
+        chatsById[chatId] = c
     }
 
     private func requestUserIfNeeded(_ userId: Int64?) {
         guard let id = userId else { return }
         guard usersById[id] == nil else { return }
         td.send(#"{"@type":"getUser","user_id":\#(id)}"#)
+    }
+
+    // MARK: - Optimistic timeline helpers
+
+    private func sortChronological(_ arr: [TGMessage]) -> [TGMessage] {
+        arr.sorted {
+            if $0.date != $1.date { return $0.date < $1.date }
+            return $0.id < $1.id
+        }
+    }
+
+    private func optimisticInsertMessage(_ msg: TGMessage) {
+        var arr = messagesByChatId[msg.chatId] ?? []
+        arr.append(msg)
+        arr = sortChronological(arr)
+        if arr.count > 800 { arr.removeFirst(arr.count - 800) }
+        messagesByChatId[msg.chatId] = arr
+
+        // Update chat list preview immediately
+        if var c = chatsById[msg.chatId] {
+            c.lastMessageId = msg.id
+            c.lastMessageDate = msg.date
+            switch msg.sendState {
+            case .pending:
+                c.lastMessagePreview = "You: (sending…) \(msg.previewText)"
+            case .failed:
+                c.lastMessagePreview = "You: (failed) \(msg.previewText)"
+            case .sent:
+                c.lastMessagePreview = msg.previewText
+            }
+            chatsById[msg.chatId] = c
+        }
+    }
+
+    private func appendMessage(_ msg: TGMessage, chatId: Int64) {
+        var arr = messagesByChatId[chatId] ?? []
+        if arr.contains(where: { $0.id == msg.id }) {
+            return
+        }
+        arr.append(msg)
+        arr = sortChronological(arr)
+        if arr.count > 800 { arr.removeFirst(arr.count - 800) }
+        messagesByChatId[chatId] = arr
+    }
+
+    private func replaceMessage(chatId: Int64, oldId: Int64, newMessage: TGMessage) {
+        var arr = messagesByChatId[chatId] ?? []
+        if let idx = arr.firstIndex(where: { $0.id == oldId }) {
+            arr[idx] = newMessage
+        } else {
+            arr.append(newMessage)
+        }
+        arr = sortChronological(arr)
+        if arr.count > 800 { arr.removeFirst(arr.count - 800) }
+        messagesByChatId[chatId] = arr
+    }
+
+    private func markMessagePending(chatId: Int64, id: Int64) {
+        guard var arr = messagesByChatId[chatId] else { return }
+        guard let idx = arr.firstIndex(where: { $0.id == id }) else { return }
+        var m = arr[idx]
+        m.sendState = .pending
+        m.canRetry = false
+        arr[idx] = m
+        messagesByChatId[chatId] = sortChronological(arr)
+        keepOptimisticChatPreviewIfNeeded(chatId: chatId)
+    }
+
+    private func markMessageFailed(chatId: Int64, id: Int64, error: String, canRetry: Bool) {
+        guard var arr = messagesByChatId[chatId] else { return }
+        guard let idx = arr.firstIndex(where: { $0.id == id }) else { return }
+        var m = arr[idx]
+        m.sendState = .failed(errorText: error)
+        m.canRetry = canRetry
+        arr[idx] = m
+        messagesByChatId[chatId] = sortChronological(arr)
+        keepOptimisticChatPreviewIfNeeded(chatId: chatId)
+    }
+
+    private func updateChatLastFromLocalTimeline(chatId: Int64) {
+        guard let last = messagesByChatId[chatId]?.last else { return }
+        if var c = chatsById[chatId] {
+            c.lastMessageId = last.id
+            c.lastMessageDate = last.date
+            switch last.sendState {
+            case .pending:
+                c.lastMessagePreview = "You: (sending…) \(last.previewText)"
+            case .failed:
+                c.lastMessagePreview = "You: (failed) \(last.previewText)"
+            case .sent:
+                c.lastMessagePreview = last.previewText
+            }
+            chatsById[chatId] = c
+        }
+    }
+
+    // MARK: - Reconciliation with TDLib send lifecycle
+
+    private struct FunctionResponseMessage {
+        let extra: String?
+        let message: TGMessage
+        let raw: [String: Any]
+    }
+
+    private func parseMessageFunctionResponse(_ upd: String) -> FunctionResponseMessage? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "message" else { return nil }
+
+        // Only function responses carry @extra; updates don't.
+        let extra = obj["@extra"] as? String
+        guard extra != nil else { return nil }
+
+        guard let msg = parseMessageObject(obj) else { return nil }
+        return FunctionResponseMessage(extra: extra, message: msg, raw: obj)
+    }
+
+    private func handleFunctionResponseMessage(_ resp: FunctionResponseMessage) {
+        // sendMessage returns a "local/temporary" message with sending_state pending.
+        // We'll use sendingId to match our placeholder.
+        let msg = resp.message
+
+        if tryReconcileOutgoingPendingMessage(msg) {
+            updateChatLastFromLocalTimeline(chatId: msg.chatId)
+        }
+    }
+
+    private struct SendSucceeded {
+        let message: TGMessage
+        let oldMessageId: Int64
+    }
+
+    private func parseUpdateMessageSendSucceeded(_ upd: String) -> SendSucceeded? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateMessageSendSucceeded" else { return nil }
+        guard let oldNum = obj["old_message_id"] as? NSNumber else { return nil }
+        guard let msgObj = obj["message"] as? [String: Any] else { return nil }
+        guard let msg = parseMessageObject(msgObj) else { return nil }
+        return SendSucceeded(message: msg, oldMessageId: oldNum.int64Value)
+    }
+
+    private struct SendFailed {
+        let message: TGMessage
+        let oldMessageId: Int64
+        let errorText: String
+        let canRetry: Bool
+    }
+
+    private func parseUpdateMessageSendFailed(_ upd: String) -> SendFailed? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateMessageSendFailed" else { return nil }
+        guard let oldNum = obj["old_message_id"] as? NSNumber else { return nil }
+        guard let msgObj = obj["message"] as? [String: Any] else { return nil }
+        guard var msg = parseMessageObject(msgObj) else { return nil }
+
+        var errText = "Failed to send"
+        if let e = obj["error"] as? [String: Any] {
+            let em = (e["message"] as? String) ?? ""
+            let ec = (e["code"] as? NSNumber)?.intValue
+            if !em.isEmpty, let ec {
+                errText = "\(em) (\(ec))"
+            } else if !em.isEmpty {
+                errText = em
+            }
+        }
+
+        // msg already has sendState from sending_state.failed (if present),
+        // but update includes canonical "error" too. We'll prefer that string.
+        msg.sendState = .failed(errorText: errText)
+
+        // Extract can_retry from sending_state.failed if present.
+        var canRetry = msg.canRetry
+        if let sending = msgObj["sending_state"] as? [String: Any],
+           (sending["@type"] as? String) == "messageSendingStateFailed" {
+            canRetry = (sending["can_retry"] as? Bool) ?? canRetry
+        }
+
+        msg.canRetry = canRetry
+        return SendFailed(message: msg, oldMessageId: oldNum.int64Value, errorText: errText, canRetry: canRetry)
+    }
+
+    private func handleSendSucceeded(_ succ: SendSucceeded) {
+        let chatId = succ.message.chatId
+        var final = succ.message
+        final.sendState = .sent
+        final.canRetry = false
+
+        // Replace old temporary message id with final message
+        replaceMessage(chatId: chatId, oldId: succ.oldMessageId, newMessage: final)
+
+        // Cleanup maps
+        if let localId = localIdByTempMessageId[succ.oldMessageId] {
+            pendingByLocalId.removeValue(forKey: localId)
+            // sendingId mapping too
+            localIdBySendingId = localIdBySendingId.filter { $0.value != localId }
+            localIdByTempMessageId.removeValue(forKey: succ.oldMessageId)
+        }
+
+        updateChatLastFromLocalTimeline(chatId: chatId)
+    }
+
+    private func handleSendFailed(_ fail: SendFailed) {
+        let chatId = fail.message.chatId
+
+        // Replace old temp message with failed snapshot (same id semantics)
+        replaceMessage(chatId: chatId, oldId: fail.oldMessageId, newMessage: fail.message)
+
+        // Cleanup temp-id map (keep others so Retry can work)
+        if let localId = localIdByTempMessageId[fail.oldMessageId] {
+            // We keep pendingByLocalId entry around only if you want "resend as pending placeholder".
+            // For now: drop it, message is now real TDLib failed message.
+            pendingByLocalId.removeValue(forKey: localId)
+            localIdBySendingId = localIdBySendingId.filter { $0.value != localId }
+            localIdByTempMessageId.removeValue(forKey: fail.oldMessageId)
+        }
+
+        updateChatLastFromLocalTimeline(chatId: chatId)
+    }
+
+    private func tryReconcileOutgoingPendingMessage(_ msg: TGMessage) -> Bool {
+        // Only useful for outgoing messages that are pending (or failed) with a known sendingId.
+        guard msg.isOutgoing else { return false }
+        guard let sid = msg.sendingId else { return false }
+        guard let localId = localIdBySendingId[sid] else { return false }
+        guard var link = pendingByLocalId[localId] else { return false }
+
+        // Replace placeholder with TDLib-provided temp message (so future sendSucceeded can use old_message_id).
+        let chatId = link.chatId
+        let placeholderId = link.placeholderId
+
+        var merged = msg
+        merged.localId = localId
+        merged.sendingId = sid
+
+        replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: merged)
+
+        // Update link placeholderId to the actual TDLib temp message id
+        link.placeholderId = merged.id
+        pendingByLocalId[localId] = link
+
+        // Map TDLib temp id -> localId for sendSucceeded cleanup
+        localIdByTempMessageId[merged.id] = localId
+
+        // If the msg already failed (TDLib can return failed state), make sure chat preview reflects.
+        keepOptimisticChatPreviewIfNeeded(chatId: chatId)
+        return true
+    }
+
+    // MARK: - Edit / content updates
+
+    private struct UpdateMessageEditedParsed {
+        let chatId: Int64
+        let messageId: Int64
+        let editDate: Int
+    }
+
+    private func parseUpdateMessageEdited(_ upd: String) -> UpdateMessageEditedParsed? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateMessageEdited" else { return nil }
+        guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
+        guard let messageId = (obj["message_id"] as? NSNumber)?.int64Value else { return nil }
+        let editDate = (obj["edit_date"] as? NSNumber)?.intValue ?? 0
+        return UpdateMessageEditedParsed(chatId: chatId, messageId: messageId, editDate: editDate)
+    }
+
+    private func applyMessageEdited(chatId: Int64, messageId: Int64, editDate: Int) {
+        guard var arr = messagesByChatId[chatId] else { return }
+        guard let idx = arr.firstIndex(where: { $0.id == messageId }) else { return }
+        var m = arr[idx]
+        m.editedAt = editDate
+        arr[idx] = m
+        messagesByChatId[chatId] = sortChronological(arr)
+    }
+
+    private struct UpdateMessageContentParsed {
+        let chatId: Int64
+        let messageId: Int64
+        let newContent: [String: Any]
+    }
+
+    private func parseUpdateMessageContent(_ upd: String) -> UpdateMessageContentParsed? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateMessageContent" else { return nil }
+        guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
+        guard let messageId = (obj["message_id"] as? NSNumber)?.int64Value else { return nil }
+        guard let newContent = obj["new_content"] as? [String: Any] else { return nil }
+        return UpdateMessageContentParsed(chatId: chatId, messageId: messageId, newContent: newContent)
+    }
+
+    private func applyMessageContentChanged(chatId: Int64, messageId: Int64, newContent: [String: Any]) {
+        guard var arr = messagesByChatId[chatId] else { return }
+        guard let idx = arr.firstIndex(where: { $0.id == messageId }) else { return }
+
+        let newText = renderPreviewTextFromContent(newContent)
+        let old = arr[idx]
+
+        // Preserve local/send metadata
+        let updated = TGMessage(
+            id: old.id,
+            chatId: old.chatId,
+            date: old.date,
+            isOutgoing: old.isOutgoing,
+            senderUserId: old.senderUserId,
+            text: newText,
+            sendState: old.sendState,
+            localId: old.localId,
+            sendingId: old.sendingId,
+            editedAt: old.editedAt,
+            canRetry: old.canRetry
+        )
+
+        arr[idx] = updated
+        messagesByChatId[chatId] = sortChronological(arr)
+
+        // If it was the last message, keep chat preview in sync
+        updateChatLastFromLocalTimeline(chatId: chatId)
+    }
+
+    // MARK: - Delete updates
+
+    private struct UpdateDeleteMessagesParsed {
+        let chatId: Int64
+        let messageIds: [Int64]
+    }
+
+    private func parseUpdateDeleteMessages(_ upd: String) -> UpdateDeleteMessagesParsed? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateDeleteMessages" else { return nil }
+        guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
+        let ids = (obj["message_ids"] as? [NSNumber])?.map { $0.int64Value } ?? []
+        guard !ids.isEmpty else { return nil }
+        return UpdateDeleteMessagesParsed(chatId: chatId, messageIds: ids)
+    }
+
+    private func applyMessagesDeleted(chatId: Int64, messageIds: [Int64]) {
+        if var arr = messagesByChatId[chatId], !arr.isEmpty {
+            let s = Set(messageIds)
+            arr.removeAll { s.contains($0.id) }
+            messagesByChatId[chatId] = arr
+        }
+
+        // Cleanup temp-id maps if a pending message got irrecoverably deleted instead of updateMessageSendFailed.
+        for id in messageIds {
+            if let localId = localIdByTempMessageId[id] {
+                pendingByLocalId.removeValue(forKey: localId)
+                localIdBySendingId = localIdBySendingId.filter { $0.value != localId }
+                localIdByTempMessageId.removeValue(forKey: id)
+            }
+        }
+
+        updateChatLastFromLocalTimeline(chatId: chatId)
+    }
+
+    // MARK: - Parsing helpers (content -> preview text)
+
+    private func renderPreviewTextFromContent(_ content: [String: Any]) -> String {
+        guard let ctype = content["@type"] as? String else { return "(unsupported)" }
+        switch ctype {
+        case "messageText":
+            if let t = content["text"] as? [String: Any],
+               let s = t["text"] as? String { return s }
+            return ""
+        case "messageSticker":
+            if let sticker = content["sticker"] as? [String: Any],
+               let emoji = sticker["emoji"] as? String { return emoji }
+            return "🧩 Sticker"
+        case "messagePhoto": return "🖼 Photo"
+        case "messageVideo": return "🎬 Video"
+        case "messageVoiceNote": return "🎤 Voice"
+        case "messageDocument": return "📎 File"
+        default:
+            return "(\(ctype))"
+        }
     }
 
     // MARK: - JSON helpers
@@ -252,7 +1314,7 @@ final class TelegramStore: ObservableObject {
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 
-    // MARK: - Parsing
+    // MARK: - Parsing (auth/chats/users/messages)
 
     private func parseAuthState(from upd: String) -> String? {
         guard let obj = parseJSON(upd) else { return nil }
@@ -268,7 +1330,7 @@ final class TelegramStore: ObservableObject {
         return ids.map { $0.int64Value }
     }
 
-    private func parseChatObject(_ upd: String) -> TGChat? {
+    private func parseChatObject(_ upd: String) -> (TGChat, Int32?, String?)? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "chat" else { return nil }
 
@@ -276,16 +1338,61 @@ final class TelegramStore: ObservableObject {
         let title = (obj["title"] as? String) ?? "(no title)"
         let kind = parseChatKind(obj)
         let order = parseChatOrder(obj)
+        let unreadCount = (obj["unread_count"] as? NSNumber)?.int32Value ?? 0
+        let lastReadInboxMessageId = (obj["last_read_inbox_message_id"] as? NSNumber)?.int64Value ?? 0
 
         var preview = ""
         var lastDate = 0
+        var lastMessageId: Int64 = 0
         if let last = obj["last_message"] as? [String: Any],
            let msg = parseMessageObject(last) {
             preview = msg.previewText
             lastDate = msg.date
+            lastMessageId = msg.id
         }
 
-        return TGChat(id: id, title: title, kind: kind, order: order, lastMessagePreview: preview, lastMessageDate: lastDate)
+        var avatarFileId: Int32? = nil
+        var avatarPath: String? = nil
+
+        if let photo = obj["photo"] as? [String: Any] {
+            if let big = photo["big"] as? [String: Any] {
+                if let idNum = big["id"] as? NSNumber { avatarFileId = idNum.int32Value }
+                if let local = big["local"] as? [String: Any],
+                   let p = local["path"] as? String,
+                   !p.isEmpty,
+                   FileManager.default.fileExists(atPath: p) {
+                    avatarPath = p
+                }
+            }
+
+            if avatarFileId == nil || avatarPath == nil {
+                if let small = photo["small"] as? [String: Any] {
+                    if avatarFileId == nil, let idNum = small["id"] as? NSNumber { avatarFileId = idNum.int32Value }
+                    if avatarPath == nil,
+                       let local = small["local"] as? [String: Any],
+                       let p = local["path"] as? String,
+                       !p.isEmpty,
+                       FileManager.default.fileExists(atPath: p) {
+                        avatarPath = p
+                    }
+                }
+            }
+        }
+
+        var chat = TGChat(
+            id: id,
+            title: title,
+            kind: kind,
+            order: order,
+            lastMessagePreview: preview,
+            lastMessageDate: lastDate
+        )
+
+        chat.unreadCount = unreadCount
+        chat.lastReadInboxMessageId = lastReadInboxMessageId
+        chat.lastMessageId = lastMessageId
+
+        return (chat, avatarFileId, avatarPath)
     }
 
     private func parseChatKind(_ obj: [String: Any]) -> TGChatKind {
@@ -331,13 +1438,13 @@ final class TelegramStore: ObservableObject {
         return (chatId, order)
     }
 
-    private func parseUpdateChatLastMessage(_ upd: String) -> (Int64, String, Int)? {
+    private func parseUpdateChatLastMessage(_ upd: String) -> (Int64, Int64, String, Int)? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "updateChatLastMessage" else { return nil }
         guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
         guard let last = obj["last_message"] as? [String: Any] else { return nil }
         guard let msg = parseMessageObject(last) else { return nil }
-        return (chatId, msg.previewText, msg.date)
+        return (chatId, msg.id, msg.previewText, msg.date)
     }
 
     private func parseUserObject(_ upd: String) -> TGUser? {
@@ -349,6 +1456,134 @@ final class TelegramStore: ObservableObject {
         let last = (obj["last_name"] as? String) ?? ""
         let username = (obj["username"] as? String) ?? ""
         return TGUser(id: id, firstName: first, lastName: last, username: username)
+    }
+
+    // MARK: - Current user (me) + profile photo (TDLib)
+
+    private func parseMeUserResponse(_ upd: String) -> (TGUser, Int32?, String?)? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "user" else { return nil }
+        guard (obj["@extra"] as? String) == "getMe" else { return nil }
+
+        let id = (obj["id"] as? NSNumber)?.int64Value ?? 0
+        let first = (obj["first_name"] as? String) ?? ""
+        let last = (obj["last_name"] as? String) ?? ""
+        let username = (obj["username"] as? String) ?? ""
+
+        let user = TGUser(id: id, firstName: first, lastName: last, username: username)
+
+        var photoFileId: Int32? = nil
+        var photoPath: String? = nil
+
+        if let pp = obj["profile_photo"] as? [String: Any] {
+            let extracted = extractPhotoFileIdAndPath(pp)
+            photoFileId = extracted.fileId
+            photoPath = extracted.path
+        }
+
+        return (user, photoFileId, photoPath)
+    }
+
+    private struct PhotoExtract {
+        let fileId: Int32?
+        let path: String?
+    }
+
+    private func extractPhotoFileIdAndPath(_ photo: [String: Any]) -> PhotoExtract {
+        func pick(from entry: [String: Any]) -> (Int32?, String?) {
+            let id = (entry["id"] as? NSNumber)?.int32Value
+            guard let local = entry["local"] as? [String: Any] else { return (id, nil) }
+
+            let done = (local["is_downloading_completed"] as? Bool) ?? false
+            let p = (local["path"] as? String) ?? ""
+            guard !p.isEmpty else { return (id, nil) }
+
+            if done || FileManager.default.fileExists(atPath: p) {
+                return (id, p)
+            }
+            return (id, nil)
+        }
+
+        var fileId: Int32? = nil
+        var path: String? = nil
+
+        if let big = photo["big"] as? [String: Any] {
+            let (id, p) = pick(from: big)
+            if let id { fileId = id }
+            if let p { path = p }
+        }
+
+        if fileId == nil || path == nil {
+            if let small = photo["small"] as? [String: Any] {
+                let (id, p) = pick(from: small)
+                if fileId == nil, let id { fileId = id }
+                if path == nil, let p { path = p }
+            }
+        }
+
+        return PhotoExtract(fileId: fileId, path: path)
+    }
+
+    private func parseUpdateUser(upt upd: String) -> (TGUser, Int32?, String?)? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateUser" else { return nil }
+        guard let uo = obj["user"] as? [String: Any] else { return nil }
+
+        let id = (uo["id"] as? NSNumber)?.int64Value ?? 0
+        let first = (uo["first_name"] as? String) ?? ""
+        let last = (uo["last_name"] as? String) ?? ""
+        let username = (uo["username"] as? String) ?? ""
+
+        let user = TGUser(id: id, firstName: first, lastName: last, username: username)
+
+        var photoFileId: Int32? = nil
+        var photoPath: String? = nil
+        if let pp = uo["profile_photo"] as? [String: Any] {
+            let extracted = extractPhotoFileIdAndPath(pp)
+            photoFileId = extracted.fileId
+            photoPath = extracted.path
+        }
+
+        return (user, photoFileId, photoPath)
+    }
+
+    private func downloadMyPhotoIfNeeded(fileId: Int32) {
+        if let p = myProfilePhotoPath,
+           !p.isEmpty,
+           FileManager.default.fileExists(atPath: p) {
+            return
+        }
+
+        let req: [String: Any] = [
+            "@type": "downloadFile",
+            "@extra": "downloadMePhoto",
+            "file_id": fileId,
+            "priority": 32,
+            "offset": 0,
+            "limit": 0,
+            "synchronous": false
+        ]
+        sendJSON(req)
+    }
+
+    private func parseUpdateFilePathIfMyPhoto(_ upd: String) -> String? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateFile" else { return nil }
+        guard let file = obj["file"] as? [String: Any] else { return nil }
+        guard let idNum = file["id"] as? NSNumber else { return nil }
+
+        let fid = idNum.int32Value
+        guard let target = myPhotoFileId, fid == target else { return nil }
+
+        guard let local = file["local"] as? [String: Any] else { return nil }
+        let done = (local["is_downloading_completed"] as? Bool) ?? false
+        let path = (local["path"] as? String) ?? ""
+
+        guard !path.isEmpty else { return nil }
+
+        if done { return path }
+        if FileManager.default.fileExists(atPath: path) { return path }
+        return nil
     }
 
     private struct MessagesResponse { let extra: String; let messages: [TGMessage] }
@@ -381,6 +1616,7 @@ final class TelegramStore: ObservableObject {
         let id = (obj["id"] as? NSNumber)?.int64Value ?? 0
         let chatId = (obj["chat_id"] as? NSNumber)?.int64Value ?? 0
         let date = (obj["date"] as? NSNumber)?.intValue ?? 0
+        let editDate = (obj["edit_date"] as? NSNumber)?.intValue ?? 0
         let isOutgoing = (obj["is_outgoing"] as? Bool) ?? false
 
         var senderUserId: Int64? = nil
@@ -391,24 +1627,56 @@ final class TelegramStore: ObservableObject {
         }
 
         var text = "(unsupported)"
-        if let content = obj["content"] as? [String: Any],
-           let ctype = content["@type"] as? String {
-            switch ctype {
-            case "messageText":
-                if let t = content["text"] as? [String: Any],
-                   let s = t["text"] as? String { text = s } else { text = "" }
-            case "messageSticker":
-                if let sticker = content["sticker"] as? [String: Any],
-                   let emoji = sticker["emoji"] as? String { text = emoji } else { text = "🧩 Sticker" }
-            case "messagePhoto": text = "🖼 Photo"
-            case "messageVideo": text = "🎬 Video"
-            case "messageVoiceNote": text = "🎤 Voice"
-            case "messageDocument": text = "📎 File"
-            default: text = "(\(ctype))"
+        if let content = obj["content"] as? [String: Any] {
+            text = renderPreviewTextFromContent(content)
+        }
+
+        var sendState: TGMessageSendState = .sent
+        var sendingId: Int32? = nil
+        var canRetry: Bool = false
+
+        if let sending = obj["sending_state"] as? [String: Any],
+           let st = sending["@type"] as? String {
+            switch st {
+            case "messageSendingStatePending":
+                sendState = .pending
+                if let sidNum = sending["sending_id"] as? NSNumber {
+                    sendingId = sidNum.int32Value
+                }
+            case "messageSendingStateFailed":
+                canRetry = (sending["can_retry"] as? Bool) ?? false
+                if let err = sending["error"] as? [String: Any],
+                   let em = err["message"] as? String,
+                   !em.isEmpty {
+                    sendState = .failed(errorText: em)
+                } else {
+                    sendState = .failed(errorText: "Failed to send")
+                }
+            default:
+                break
             }
         }
 
-        return TGMessage(id: id, chatId: chatId, date: date, isOutgoing: isOutgoing, senderUserId: senderUserId, text: text)
+        var m = TGMessage(
+            id: id,
+            chatId: chatId,
+            date: date,
+            isOutgoing: isOutgoing,
+            senderUserId: senderUserId,
+            text: text,
+            sendState: sendState,
+            localId: nil,
+            sendingId: sendingId,
+            editedAt: (editDate > 0 ? editDate : nil),
+            canRetry: canRetry
+        )
+
+        // If TDLib says edited via edit_date, reflect it.
+        if editDate > 0 {
+            m.editedAt = editDate
+        }
+
+        return m
     }
 
     // MARK: - Logging
@@ -416,5 +1684,105 @@ final class TelegramStore: ObservableObject {
     private func pushLog(_ s: String) {
         logs.append(s)
         if logs.count > 250 { logs.removeFirst(logs.count - 250) }
+    }
+}
+
+extension TelegramStore {
+
+    // MARK: - Chat avatars (TDLib)
+
+    private func registerChatAvatar(chatId: Int64, fileId: Int32) {
+        chatAvatarFileIdByChatId[chatId] = fileId
+        chatIdByAvatarFileId[fileId] = chatId
+
+        if let existingPath = chatAvatarPathByChatId[chatId],
+           !existingPath.isEmpty,
+           FileManager.default.fileExists(atPath: existingPath) {
+            return
+        }
+
+        if requestedAvatarFileIds.contains(fileId) { return }
+        requestedAvatarFileIds.insert(fileId)
+
+        let req: [String: Any] = [
+            "@type": "downloadFile",
+            "file_id": fileId,
+            "priority": 16,
+            "offset": 0,
+            "limit": 0,
+            "synchronous": false
+        ]
+        sendJSON(req)
+    }
+
+    private func parseUpdateChatPhoto(_ upd: String) -> (Int64, Int32?, String?)? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateChatPhoto" else { return nil }
+        guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
+
+        guard let photo = obj["photo"] as? [String: Any] else {
+            return (chatId, nil, nil)
+        }
+
+        var avatarFileId: Int32? = nil
+        var avatarPath: String? = nil
+
+        if let big = photo["big"] as? [String: Any] {
+            if let idNum = big["id"] as? NSNumber { avatarFileId = idNum.int32Value }
+            if let local = big["local"] as? [String: Any],
+               let p = local["path"] as? String,
+               !p.isEmpty,
+               FileManager.default.fileExists(atPath: p) {
+                avatarPath = p
+            }
+        }
+
+        if avatarFileId == nil || avatarPath == nil {
+            if let small = photo["small"] as? [String: Any] {
+                if avatarFileId == nil, let idNum = small["id"] as? NSNumber { avatarFileId = idNum.int32Value }
+                if avatarPath == nil,
+                   let local = small["local"] as? [String: Any],
+                   let p = local["path"] as? String,
+                   !p.isEmpty,
+                   FileManager.default.fileExists(atPath: p) {
+                    avatarPath = p
+                }
+            }
+        }
+
+        return (chatId, avatarFileId, avatarPath)
+    }
+
+    private func parseUpdateFilePathIfChatAvatar(_ upd: String) -> (Int64, String)? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateFile" else { return nil }
+        guard let file = obj["file"] as? [String: Any] else { return nil }
+        guard let idNum = file["id"] as? NSNumber else { return nil }
+
+        let fid = idNum.int32Value
+        guard let chatId = chatIdByAvatarFileId[fid] else { return nil }
+
+        guard let local = file["local"] as? [String: Any] else { return nil }
+        let done = (local["is_downloading_completed"] as? Bool) ?? false
+        let path = (local["path"] as? String) ?? ""
+
+        if !path.isEmpty, FileManager.default.fileExists(atPath: path) {
+            return (chatId, path)
+        }
+
+        guard done, !path.isEmpty else { return nil }
+        return (chatId, path)
+    }
+
+    // MARK: - Chat read inbox update parser
+
+    private func parseUpdateChatReadInbox(_ upd: String) -> (Int64, Int64, Int32)? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateChatReadInbox" else { return nil }
+        guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
+
+        let lastRead = (obj["last_read_inbox_message_id"] as? NSNumber)?.int64Value ?? 0
+        let unread = (obj["unread_count"] as? NSNumber)?.int32Value ?? 0
+        return (chatId, lastRead, unread)
     }
 }

@@ -38,18 +38,37 @@ struct TGChat: Identifiable, Hashable {
     var lastMessagePreview: String
     var lastMessageDate: Int
 
+    /// Number of unread messages in this chat.
+    var unreadCount: Int32
+
+    /// The last read inbox message id (TDLib: last_read_inbox_message_id).
+    var lastReadInboxMessageId: Int64
+
+    /// Last known inbox message id (from TDLib last_message.id when available).
+    var lastMessageId: Int64
+
     init(id: Int64,
          title: String,
          kind: TGChatKind = .unknown,
          order: Int64 = 0,
          lastMessagePreview: String = "",
-         lastMessageDate: Int = 0) {
+         lastMessageDate: Int = 0,
+         unreadCount: Int32 = 0,
+         lastReadInboxMessageId: Int64 = 0,
+         lastMessageId: Int64 = 0) {
         self.id = id
         self.title = title
         self.kind = kind
         self.order = order
         self.lastMessagePreview = lastMessagePreview
         self.lastMessageDate = lastMessageDate
+        self.unreadCount = unreadCount
+        self.lastReadInboxMessageId = lastReadInboxMessageId
+        self.lastMessageId = lastMessageId
+    }
+
+    var hasUnread: Bool {
+        unreadCount > 0
     }
 }
 
@@ -67,6 +86,12 @@ struct TGUser: Identifiable, Hashable {
     }
 }
 
+enum TGMessageSendState: Hashable {
+    case sent
+    case pending
+    case failed(errorText: String)
+}
+
 struct TGMessage: Identifiable, Hashable {
     let id: Int64
     let chatId: Int64
@@ -75,5 +100,37 @@ struct TGMessage: Identifiable, Hashable {
     let senderUserId: Int64?
     let text: String
 
+    // Optimistic / sending state
+    var sendState: TGMessageSendState = .sent
+
+    /// Local identity for UI bookkeeping (optimistic placeholder ↔ TDLib message).
+    var localId: UUID? = nil
+
+    /// TDLib sending_id (goes into messageSendOptions.sending_id, then echoes back in messageSendingStatePending.sending_id).
+    var sendingId: Int32? = nil
+
+    /// From TDLib updateMessageEdited.edit_date (Unix time). Content changes come via updateMessageContent.
+    var editedAt: Int? = nil
+
+    /// From TDLib messageSendingStateFailed.can_retry (and/or sending_state.failed.can_retry).
+    var canRetry: Bool = false
+
+    var isEdited: Bool {
+        if let t = editedAt { return t > 0 }
+        return false
+    }
+
+    var errorText: String? {
+        if case let .failed(err) = sendState { return err }
+        return nil
+    }
+
     var previewText: String { text }
+
+    func withLocal(localId: UUID?, sendingId: Int32?) -> TGMessage {
+        var m = self
+        m.localId = localId
+        m.sendingId = sendingId
+        return m
+    }
 }
