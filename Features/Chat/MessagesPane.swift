@@ -23,6 +23,15 @@ struct MessagesPane: View {
     @State private var newIncomingCount: Int = 0
     @State private var lastKnownMessageCount: Int = 0
 
+    // Cache rows so scroll-driven state updates don't force regrouping work.
+    @State private var cachedRows: [Row] = []
+
+    // Initial positioning: open chat at the newest message.
+    @State private var didInitialScrollToBottom: Bool = false
+
+    // Hide the list until we've jumped to bottom (prevents “show middle then jump” flash).
+    @State private var showAfterInitialJump: Bool = false
+
     // Jelly / springy scrolling (macOS-safe)
     @State private var jellyScrollImpulse: CGFloat = 0
     @State private var jellyContainerHeight: CGFloat = 0
@@ -97,6 +106,20 @@ struct MessagesPane: View {
         }
     }
 
+    private func scrollToBottomSentinel(_ proxy: ScrollViewProxy, animated: Bool) {
+        if animated {
+            withAnimation(.easeOut(duration: 0.18)) {
+                proxy.scrollTo(bottomSentinelId, anchor: .bottom)
+            }
+        } else {
+            var t = Transaction()
+            t.animation = nil
+            withTransaction(t) {
+                proxy.scrollTo(bottomSentinelId, anchor: .bottom)
+            }
+        }
+    }
+
     private func scrollToAnchorTop(_ proxy: ScrollViewProxy, anchorId: String) {
         var t = Transaction()
         t.animation = nil
@@ -154,7 +177,7 @@ struct MessagesPane: View {
     // MARK: - Row rendering (helps compiler + performance)
 
     @ViewBuilder
-    private func rowView(_ row: Row) -> some View {
+    private func rowView(_ row: Row, firstGroupId: String?) -> some View {
         switch row {
         case .dayHeader(let day):
             DayHeaderView(day: day)
@@ -173,30 +196,23 @@ struct MessagesPane: View {
             )
             .id(g.id)
             .onAppear {
-                // Smart paging trigger: when one of the very first groups appears, fetch older.
-                // This is more reliable than a top sentinel with LazyVStack rebuilds.
-                if shouldTriggerPaging(for: g.id) {
-                    requestOlderHistory(anchorGroupId: g.id)
-                }
+                // Trigger paging only when we actually reach the top of what's loaded.
+                guard pagingEnabled, !pagingInFlight, !store.isLoadingHistory else { return }
+                guard let firstGroupId, g.id == firstGroupId else { return }
+                // Don't page while user is already at the bottom (initial open / reading newest).
+                guard !isAtBottom else { return }
+                requestOlderHistory(anchorGroupId: g.id)
             }
         }
     }
 
-    private func shouldTriggerPaging(for groupId: String) -> Bool {
-        // Trigger only while paging is enabled and we're not already in flight.
-        guard pagingEnabled, !pagingInFlight, !store.isLoadingHistory else { return false }
 
-        // Approx: trigger only when this group is among the first ~2 visible groups.
-        // We'll use restoreAnchorGroupId/lastPagingAnchor to prevent repeats.
-        if lastPagingAnchor == groupId { return false }
-        return true
-    }
 
     // MARK: - Body
 
     var body: some View {
         let messages = store.messagesByChatId[chat.id] ?? []
-        let rows = buildRows(messages)
+        let rows = cachedRows.isEmpty ? buildRows(messages) : cachedRows
 
         let groupIds: [String] = rows.compactMap {
             if case .group(let g) = $0 { return g.id }
@@ -214,7 +230,7 @@ struct MessagesPane: View {
                             .frame(height: 0)
 
                         ForEach(rows) { row in
-                            rowView(row)
+                            rowView(row, firstGroupId: firstGroupId)
                         }
 
                         if store.showLogs {
@@ -238,6 +254,9 @@ struct MessagesPane: View {
                     .padding(.horizontal, 18)
                     .padding(.vertical, 14)
                 }
+                .opacity(showAfterInitialJump ? 1 : 0)
+                .allowsHitTesting(showAfterInitialJump)
+                .animation(nil, value: showAfterInitialJump)
                 .coordinateSpace(name: Self.scrollSpaceName)
                 .simultaneousGesture(revealGesture)
                 .onPreferenceChange(ScrollOffsetKey.self) { minY in
@@ -248,11 +267,6 @@ struct MessagesPane: View {
                 }
                 .onAppear {
                     jellyContainerHeight = containerGeo.size.height
-
-                    // Enable paging after first stable layout, otherwise initial load may “fight”.
-                    if !pagingEnabled, firstGroupId != nil {
-                        pagingEnabled = true
-                    }
                 }
                 .onChange(of: containerGeo.size.height) { _, newH in
                     jellyContainerHeight = newH
@@ -260,7 +274,7 @@ struct MessagesPane: View {
                 .overlay(alignment: .bottomTrailing) {
                     if newIncomingCount > 0 && !isAtBottom {
                         Button {
-                            scrollToBottom(proxy, lastGroupId: lastGroupId, animated: true)
+                            scrollToBottomSentinel(proxy, animated: true)
                             newIncomingCount = 0
                             isAtBottom = true
                         } label: {
@@ -284,10 +298,16 @@ struct MessagesPane: View {
                     }
                 }
                 .onAppear {
+                    // Build once; after that, scrolling should not re-run grouping.
+                    cachedRows = buildRows(messages)
+
                     lastKnownMessageCount = messages.count
                     newIncomingCount = 0
 
-                    // Reset paging anchor for this chat
+                    // Reset paging state for this chat. We enable paging only after we jump to bottom.
+                    pagingEnabled = false
+                    didInitialScrollToBottom = false
+                    showAfterInitialJump = false
                     lastPagingAnchor = nil
                     restoreAnchorGroupId = nil
                     pagingInFlight = false
@@ -297,6 +317,9 @@ struct MessagesPane: View {
                     pagingInFlight = false
                     restoreAnchorGroupId = nil
                     lastPagingAnchor = nil
+                    didInitialScrollToBottom = false
+                    showAfterInitialJump = false
+                    cachedRows = []
 
                     isAtBottom = true
                     newIncomingCount = 0
@@ -306,6 +329,7 @@ struct MessagesPane: View {
                     revealGestureEngaged = false
                 }
                 .onChange(of: messages.count) { _, newCount in
+                    cachedRows = buildRows(messages)
                     if newCount < lastKnownMessageCount {
                         lastKnownMessageCount = newCount
                         newIncomingCount = 0
@@ -328,9 +352,16 @@ struct MessagesPane: View {
                     let shouldAutoScroll = (!pagingEnabled) || isAtBottom || lastIsOutgoing
 
                     if shouldAutoScroll {
-                        scrollToBottom(proxy, lastGroupId: lastGroupId, animated: pagingEnabled)
+                        scrollToBottomSentinel(proxy, animated: pagingEnabled)
                         newIncomingCount = 0
-                        if !pagingEnabled { pagingEnabled = true }
+                        if !pagingEnabled {
+                            pagingEnabled = true
+                            didInitialScrollToBottom = true
+                        }
+                        // If we got here during initial load, ensure the list becomes visible.
+                        if !showAfterInitialJump {
+                            showAfterInitialJump = true
+                        }
                     } else {
                         if !lastIsOutgoing {
                             newIncomingCount += delta
@@ -338,12 +369,27 @@ struct MessagesPane: View {
                     }
                 }
 
-                // Fallback: if user lands at top immediately after restore, request older once.
-                .task(id: firstGroupId) {
-                    if let firstGroupId, pagingEnabled {
-                        // Do nothing by default — but you can un-comment if you want auto-preload older:
-                        // requestOlderHistory(anchorGroupId: firstGroupId)
-                        _ = firstGroupId
+                // Initial open: don’t show mid-chat. Wait for layout, jump to bottom sentinel, then reveal.
+                .task(id: chat.id) {
+                    guard !didInitialScrollToBottom else { return }
+                    showAfterInitialJump = false
+
+                    // Let SwiftUI finish initial layout passes.
+                    await Task.yield()
+                    await Task.yield()
+
+                    await MainActor.run {
+                        scrollToBottomSentinel(proxy, animated: false)
+                    }
+
+                    // One more yield + re-scroll makes this robust when rows/height change right after first render.
+                    await Task.yield()
+                    await MainActor.run {
+                        scrollToBottomSentinel(proxy, animated: false)
+                        didInitialScrollToBottom = true
+                        isAtBottom = true
+                        pagingEnabled = true
+                        showAfterInitialJump = true
                     }
                 }
             }
