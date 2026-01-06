@@ -57,6 +57,11 @@ final class TelegramStore: ObservableObject {
 
     var myPhotoFileId: Int32?
 
+    // MARK: - JSON parsing cache
+
+    fileprivate var lastParsedUpdate: String?
+    fileprivate var lastParsedObject: [String: Any]?
+
     // MARK: - Thumbnail cache
 
     let imageMemCache = NSCache<NSString, NSImage>()
