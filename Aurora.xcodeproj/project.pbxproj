@@ -38,6 +38,9 @@
 		84EE1A132F0D36B900890773 /* TelegramStore+EditsAndDeletes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84EE1A122F0D36B600890773 /* TelegramStore+EditsAndDeletes.swift */; };
 		84EE1A152F0D36CD00890773 /* TelegramStore+Parsing.swift.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84EE1A142F0D36CC00890773 /* TelegramStore+Parsing.swift.swift */; };
 		84EE1A172F0D36EE00890773 /* ThumbHash.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84EE1A162F0D36EA00890773 /* ThumbHash.swift */; };
+		8B72B6AA53C443D89B0DD4B4 /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = 923A7F1AB007467EA875CDD1 /* GRDB */; };
+		BC57861F25EA4C37AEF186D0 /* AppDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC245C0F580D4ADBAD98EDCA /* AppDatabase.swift */; };
+		4BAF66654B604D97B1825501 /* AppDatabaseRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E6E622924B142AC9E7EC3AF /* AppDatabaseRepository.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -87,6 +90,8 @@
 		84EE1A142F0D36CC00890773 /* TelegramStore+Parsing.swift.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TelegramStore+Parsing.swift.swift"; sourceTree = "<group>"; };
 		84EE1A162F0D36EA00890773 /* ThumbHash.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThumbHash.swift; sourceTree = "<group>"; };
 		84EE1A182F0D47D600890773 /* Aurora_Project_Documentation.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = Aurora_Project_Documentation.md; sourceTree = "<group>"; };
+		8E6E622924B142AC9E7EC3AF /* AppDatabaseRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDatabaseRepository.swift; sourceTree = "<group>"; };
+		CC245C0F580D4ADBAD98EDCA /* AppDatabase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDatabase.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -94,6 +99,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				8B72B6AA53C443D89B0DD4B4 /* GRDB in Frameworks */,
 				84D085062F094CED00C35112 /* libtdjson.1.8.59.dylib in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -153,6 +159,7 @@
 		84D084F72F09490B00C35112 /* Core */ = {
 			isa = PBXGroup;
 			children = (
+				6A5925C8F6A84E5DADAD5ADA /* Database */,
 				84D084F92F09492200C35112 /* Config */,
 				84D084F82F09491600C35112 /* TDLib */,
 				84D084F52F0948D700C35112 /* UI */,
@@ -260,6 +267,15 @@
 			path = ExtensionsTGS;
 			sourceTree = "<group>";
 		};
+		6A5925C8F6A84E5DADAD5ADA /* Database */ = {
+			isa = PBXGroup;
+			children = (
+				CC245C0F580D4ADBAD98EDCA /* AppDatabase.swift */,
+				8E6E622924B142AC9E7EC3AF /* AppDatabaseRepository.swift */,
+			);
+			path = Database;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -278,6 +294,7 @@
 			);
 			name = Aurora;
 			packageProductDependencies = (
+				923A7F1AB007467EA875CDD1 /* GRDB */,
 			);
 			productName = Aurora;
 			productReference = 84D084E32F09476900C35112 /* Aurora.app */;
@@ -307,6 +324,9 @@
 			);
 			mainGroup = 84D084DA2F09476900C35112;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				8A9D23F0EBE74D8997CA8789 /* XCRemoteSwiftPackageReference "GRDB.swift" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 84D084E42F09476900C35112 /* Products */;
 			projectDirPath = "";
@@ -350,6 +370,7 @@
 				84E6878B2F09869100C89BE7 /* BottomScrim.swift in Sources */,
 				84EE1A072F0D361900890773 /* TelegramStore+History.swift in Sources */,
 				84D0850A2F094EE800C35112 /* TDLibClient.swift in Sources */,
+				BC57861F25EA4C37AEF186D0 /* AppDatabase.swift in Sources */,
 				84D0850C2F094FC700C35112 /* Config.swift in Sources */,
 				84E6878E2F09BFB600C89BE7 /* SettingsRootView.swift in Sources */,
 				84EE1A022F0D359500890773 /* TelegramStore+UpdateHandling.swift in Sources */,
@@ -357,6 +378,7 @@
 				84EE1A132F0D36B900890773 /* TelegramStore+EditsAndDeletes.swift in Sources */,
 				84D085012F094A5A00C35112 /* ContentView.swift in Sources */,
 				84E687922F0AA52F00C89BE7 /* CoreImage.swift in Sources */,
+				4BAF66654B604D97B1825501 /* AppDatabaseRepository.swift in Sources */,
 				84EE1A112F0D369F00890773 /* TelegramStore+OptimisticSending.swift in Sources */,
 				84D085022F094A5A00C35112 /* AuroraApp.swift in Sources */,
 				84E687892F097FF400C89BE7 /* ChatTitleButton.swift in Sources */,
@@ -365,6 +387,25 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		8A9D23F0EBE74D8997CA8789 /* XCRemoteSwiftPackageReference "GRDB.swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/groue/GRDB.swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 6.29.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		923A7F1AB007467EA875CDD1 /* GRDB */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 8A9D23F0EBE74D8997CA8789 /* XCRemoteSwiftPackageReference "GRDB.swift" */;
+			productName = GRDB;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin XCBuildConfiguration section */
 		84D084EC2F09476B00C35112 /* Debug */ = {

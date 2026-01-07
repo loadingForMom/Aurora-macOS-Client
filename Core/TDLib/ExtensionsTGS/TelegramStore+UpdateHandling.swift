@@ -16,13 +16,18 @@ extension TelegramStore {
             } else if previous == "authorizationStateReady", st != "authorizationStateReady" {
                 resetSessionState()
             }
+            if let st = parseAuthState(from: upd) {
+                print("[AUTH] state =", st)
+            }
         }
 
-        if let (chatId, lastMessageId, preview, date) = parseUpdateChatLastMessage(upd) {
+        if let (chatId, lastMessage) = parseUpdateChatLastMessage(upd) {
 #if DEBUG
-            debugLogMessageEvent(label: "updateChatLastMessage", chatId: chatId, messageId: lastMessageId)
+            debugLogMessageEvent(label: "updateChatLastMessage", chatId: chatId, messageId: lastMessage.id)
 #endif
-            applyChatLastMessageUpdate(chatId: chatId, lastMessageId: lastMessageId, preview: preview, date: date)
+            applyChatLastMessageUpdate(chatId: chatId, lastMessageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
+            persistMessage(lastMessage)
+            persistChatLastMessage(chatId: chatId, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
             keepOptimisticChatPreviewIfNeeded(chatId: chatId)
         }
 
@@ -46,17 +51,30 @@ extension TelegramStore {
             didRequestInitialStorageStats = true
             refreshStorageStatistics()
         }
+        
+        if authState == "authorizationStateWaitEncryptionKey" {
+            td.send(#"{"@type":"checkDatabaseEncryptionKey","encryption_key":""}"#)
+        }
 
         if let (id, title) = parseUpdateChatTitle(upd) {
-            if var c = chatsById[id] { c.title = title; chatsById[id] = c }
+            if var c = chatsById[id] {
+                c.title = title
+                chatsById[id] = c
+                persistChat(c)
+            }
         }
 
         if let (chatId, order) = parseUpdateChatPosition(upd) {
-            if var c = chatsById[chatId] { c.order = order; chatsById[chatId] = c }
+            if var c = chatsById[chatId] {
+                c.order = order
+                chatsById[chatId] = c
+                persistChat(c)
+            }
         }
 
         if let (u, photoFileId, photoPath) = parseUpdateUser(upt: upd) {
             usersById[u.id] = u
+            persistUser(u)
 
             if let meId = myUserId, meId == u.id {
                 if let p = photoPath {
@@ -87,6 +105,7 @@ extension TelegramStore {
 
         if let user = parseUserObject(upd) {
             usersById[user.id] = user
+            persistUser(user)
         }
 
         // Sending lifecycle updates
@@ -151,8 +170,13 @@ extension TelegramStore {
             }
         }
 
-        if let (chat, smallId, bigId, bestPath) = parseChatObject(resp) {
+        if let (chat, lastMessage, smallId, bigId, bestPath) = parseChatObject(resp) {
             chatsById[chat.id] = chat
+            persistChat(chat)
+            if let lastMessage {
+                persistMessage(lastMessage)
+                persistChatLastMessage(chatId: chat.id, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
+            }
 
             if let p = bestPath {
                 chatAvatarPathByChatId[chat.id] = p
@@ -171,6 +195,7 @@ extension TelegramStore {
         if let (me, photoFileId, photoPath) = parseMeUserResponse(resp) {
             myUserId = me.id
             usersById[me.id] = me
+            persistUser(me)
 
             if let p = photoPath {
                 myProfilePhotoPath = p
@@ -184,6 +209,7 @@ extension TelegramStore {
 
         if let user = parseUserObject(resp) {
             usersById[user.id] = user
+            persistUser(user)
         }
 
         if let storage = parseStorageStatisticsAny(resp) {
@@ -203,6 +229,7 @@ extension TelegramStore {
                 assert(m.chatId == job.chatId, "TDLib history message chatId mismatch: expected \(job.chatId) got \(m.chatId)")
 #endif
                 job.accById[m.id] = m
+                persistMessage(m)
                 requestUserIfNeeded(m.senderUserId)
             }
 

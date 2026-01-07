@@ -17,8 +17,8 @@ final class TDLibClient {
     private var isRunning = false
 
     init() {
-        td_set_log_verbosity_level(2)
         client = td_json_client_create()
+        send(#"{"@type":"setLogVerbosityLevel","new_verbosity_level":2}"#)
     }
 
     deinit {
