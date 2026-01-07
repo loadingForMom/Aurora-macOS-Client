@@ -64,7 +64,7 @@ extension TelegramStore {
         var lastDate = 0
         var lastMessageId: Int64 = 0
         if let last = obj["last_message"] as? [String: Any],
-           let msg = parseMessageObject(last) {
+           let msg = parseMessageObject(last, expectedChatId: id) {
             preview = msg.previewText
             lastDate = msg.date
             lastMessageId = msg.id
@@ -145,7 +145,7 @@ extension TelegramStore {
         guard (obj["@type"] as? String) == "updateChatLastMessage" else { return nil }
         guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
         guard let last = obj["last_message"] as? [String: Any] else { return nil }
-        guard let msg = parseMessageObject(last) else { return nil }
+        guard let msg = parseMessageObject(last, expectedChatId: chatId) else { return nil }
         return (chatId, msg.id, msg.previewText, msg.date)
     }
 
@@ -384,7 +384,9 @@ extension TelegramStore {
             return MessagesResponse(extra: extra, messages: [])
         }
 
-        let msgs = anyArr.compactMap { $0 as? [String: Any] }.compactMap(parseMessageObject(_:))
+        let msgs = anyArr
+            .compactMap { $0 as? [String: Any] }
+            .compactMap { parseMessageObject($0) }
         return MessagesResponse(extra: extra, messages: msgs)
     }
 
@@ -393,11 +395,11 @@ extension TelegramStore {
         guard (obj["@type"] as? String) == "updateNewMessage" else { return nil }
         guard let msgObj = obj["message"] as? [String: Any] else { return nil }
         guard let chatId = (msgObj["chat_id"] as? NSNumber)?.int64Value else { return nil }
-        guard let msg = parseMessageObject(msgObj) else { return nil }
+        guard let msg = parseMessageObject(msgObj, expectedChatId: chatId) else { return nil }
         return (chatId, msg)
     }
 
-    func parseMessageObject(_ obj: [String: Any]) -> TGMessage? {
+    func parseMessageObject(_ obj: [String: Any], expectedChatId: Int64? = nil) -> TGMessage? {
         guard (obj["@type"] as? String) == "message" else { return nil }
 
         let id = (obj["id"] as? NSNumber)?.int64Value ?? 0
@@ -461,6 +463,12 @@ extension TelegramStore {
         if editDate > 0 {
             m.editedAt = editDate
         }
+
+#if DEBUG
+        if let expectedChatId {
+            assert(m.chatId == expectedChatId, "TDLib message chatId mismatch: expected \(expectedChatId) got \(m.chatId)")
+        }
+#endif
 
         return m
     }
