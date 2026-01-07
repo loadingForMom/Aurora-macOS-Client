@@ -6,6 +6,7 @@
 import SwiftUI
 import AppKit
 
+@MainActor
 struct ChatTimelineContainer: View {
     @ObservedObject var store: TelegramStore
     let chat: TGChat
@@ -109,7 +110,6 @@ final class ChatTimelineNSView: NSView {
 
         let layout = NSCollectionViewFlowLayout()
         layout.estimatedItemSize = NSSize(width: 480, height: 48)
-        layout.itemSize = NSCollectionViewFlowLayout.automaticSize
         layout.minimumLineSpacing = 8
         layout.sectionInset = NSEdgeInsets(top: 14, left: 0, bottom: 14, right: 0)
 
@@ -236,7 +236,10 @@ final class ChatTimelineNSView: NSView {
     }
 }
 
-extension ChatTimelineNSView: NSCollectionViewDelegateFlowLayout, NSCollectionViewDataSourcePrefetching {
+extension ChatTimelineNSView: NSCollectionViewDelegateFlowLayout {
+}
+
+extension ChatTimelineNSView: NSCollectionViewPrefetching {
     func collectionView(_ collectionView: NSCollectionView, prefetchItemsAt indexPaths: Set<IndexPath>) {
         let indices = indexPaths.map { $0.item }
         viewModel?.prefetch(indices: indices)

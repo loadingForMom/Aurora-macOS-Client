@@ -102,7 +102,7 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
         onDelete = nil
     }
 
-    override func menu(for event: NSEvent) -> NSMenu? {
+    func menu(for event: NSEvent) -> NSMenu? {
         guard let message = representedObject as? TGMessage else { return nil }
         guard message.isOutgoing else { return nil }
 
