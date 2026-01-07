@@ -438,8 +438,15 @@ extension TelegramStore {
         }
 
         var text = "(unsupported)"
+        var contentType = "unknown"
+        var rawText: String? = nil
+        var entities: [TGTextEntity] = []
         if let content = obj["content"] as? [String: Any] {
             text = renderPreviewTextFromContent(content)
+            let parsed = parseMessageTextPayload(content)
+            contentType = parsed.contentType
+            rawText = parsed.rawText
+            entities = parsed.entities
         }
 
         var sendState: TGMessageSendState = .sent
@@ -475,6 +482,9 @@ extension TelegramStore {
             isOutgoing: isOutgoing,
             senderUserId: senderUserId,
             text: text,
+            contentType: contentType,
+            rawText: rawText,
+            entities: entities,
             sendState: sendState,
             localId: nil,
             sendingId: sendingId,
@@ -493,6 +503,57 @@ extension TelegramStore {
 #endif
 
         return m
+    }
+
+    func parseMessageTextPayload(_ content: [String: Any]) -> (contentType: String, rawText: String?, entities: [TGTextEntity]) {
+        guard let ctype = content["@type"] as? String else {
+            return ("unknown", nil, [])
+        }
+        guard ctype == "messageText" else {
+            return (ctype, nil, [])
+        }
+        guard let textObj = content["text"] as? [String: Any] else {
+            return (ctype, nil, [])
+        }
+        let rawText = textObj["text"] as? String
+        let entities = parseTextEntities(textObj)
+        return (ctype, rawText, entities)
+    }
+
+    func parseTextEntities(_ textObj: [String: Any]) -> [TGTextEntity] {
+        guard let entities = textObj["entities"] as? [[String: Any]] else { return [] }
+        return entities.compactMap { entity in
+            guard let offset = (entity["offset"] as? NSNumber)?.intValue,
+                  let length = (entity["length"] as? NSNumber)?.intValue
+            else { return nil }
+
+            let typeObj = entity["type"] as? [String: Any]
+            let typeName = typeObj?["@type"] as? String ?? ""
+
+            let type: TGTextEntityType
+            switch typeName {
+            case "textEntityTypeBold":
+                type = .bold
+            case "textEntityTypeItalic":
+                type = .italic
+            case "textEntityTypeUnderline":
+                type = .underline
+            case "textEntityTypeStrikethrough":
+                type = .strikethrough
+            case "textEntityTypeCode":
+                type = .code
+            case "textEntityTypePre":
+                type = .pre
+            case "textEntityTypePreCode":
+                type = .preCode(language: typeObj?["language"] as? String)
+            case "textEntityTypeTextUrl":
+                type = .textUrl(url: typeObj?["url"] as? String ?? "")
+            default:
+                type = .unknown(typeName)
+            }
+
+            return TGTextEntity(type: type, offset: offset, length: length)
+        }
     }
 
     // MARK: - Read inbox

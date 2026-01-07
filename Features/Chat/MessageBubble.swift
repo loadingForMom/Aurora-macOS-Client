@@ -45,34 +45,46 @@ struct MessageBubble: View {
         let reveal = min(max(0, revealTimeX), maxReveal)
         let isRevealingTime = reveal > 0.5
 
-        ZStack(alignment: .trailing) {
-            HStack {
-                if msg.isOutgoing { Spacer(minLength: 40) }
-
-                content(isRevealingTime: isRevealingTime)
-                    .offset(x: -reveal)
-
-                if !msg.isOutgoing { Spacer(minLength: 40) }
-            }
-
-            if isRevealingTime {
-                Text(exactTime(msg.date))
+        return Group {
+            if msg.chatId != currentChatId {
+#if DEBUG
+                Text("[debug] message/chat mismatch")
                     .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .opacity(min(1, reveal / 16))
-                    .offset(x: (maxReveal - reveal))
-                    .padding(.trailing, 2)
-                    .allowsHitTesting(false)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: msg.isOutgoing ? .trailing : .leading)
-        .offset(y: jellyOffsetY)
-        .contextMenu {
-            if msg.isOutgoing {
-                if case .failed = msg.sendState, msg.canRetry {
-                    Button("Retry") { onRetry() }
+                    .foregroundStyle(.red)
+#else
+                EmptyView()
+#endif
+            } else {
+                ZStack(alignment: .trailing) {
+                    HStack {
+                        if msg.isOutgoing { Spacer(minLength: 40) }
+
+                        content(isRevealingTime: isRevealingTime)
+                            .offset(x: -reveal)
+
+                        if !msg.isOutgoing { Spacer(minLength: 40) }
+                    }
+
+                    if isRevealingTime {
+                        Text(exactTime(msg.date))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .opacity(min(1, reveal / 16))
+                            .offset(x: (maxReveal - reveal))
+                            .padding(.trailing, 2)
+                            .allowsHitTesting(false)
+                    }
                 }
-                Button("Delete") { onDelete() }
+                .frame(maxWidth: .infinity, alignment: msg.isOutgoing ? .trailing : .leading)
+                .offset(y: jellyOffsetY)
+                .contextMenu {
+                    if msg.isOutgoing {
+                        if case .failed = msg.sendState, msg.canRetry {
+                            Button("Retry") { onRetry() }
+                        }
+                        Button("Delete") { onDelete() }
+                    }
+                }
             }
         }
     }
@@ -80,9 +92,17 @@ struct MessageBubble: View {
     @ViewBuilder
     private func content(isRevealingTime: Bool) -> some View {
         VStack(alignment: msg.isOutgoing ? .trailing : .leading, spacing: 4) {
-            Text(msg.text)
+            let attributed = MessageTextPipeline.render(
+                chatId: msg.chatId,
+                messageId: msg.id,
+                rawText: msg.textForRendering,
+                entities: msg.entities,
+                style: .bubbleBody
+            )
+            Text(attributed)
                 .foregroundStyle(msg.isOutgoing ? .white : .primary)
                 .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.vertical, 8)
                 .padding(.horizontal, 12)
                 .background(bubbleBackground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))

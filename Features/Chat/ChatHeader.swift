@@ -11,6 +11,7 @@ import AppKit
 struct ChatHeader: View {
     let title: String
     let isGroup: Bool
+    let chatId: Int64
 
     /// NOTE:
     /// Это поле оставлено строкой для совместимости с твоими вызовами.
@@ -39,9 +40,17 @@ struct ChatHeader: View {
                 HStack(spacing: 10) {
                     AvatarCircle(
                         title: title,
-                        path: avatarPath,
+                        identityKey: AvatarCacheKey(
+                            kind: .chat,
+                            id: chatId,
+                            size: 28,
+                            scale: NSScreen.main?.backingScaleFactor ?? 2.0
+                        ),
                         size: 28,
-                        font: .system(size: 11, weight: .semibold, design: .rounded)
+                        font: .system(size: 11, weight: .semibold, design: .rounded),
+                        imageProvider: {
+                            avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
+                        }
                     )
                     .overlay(Circle().strokeBorder(.white.opacity(0.14), lineWidth: 1))
 

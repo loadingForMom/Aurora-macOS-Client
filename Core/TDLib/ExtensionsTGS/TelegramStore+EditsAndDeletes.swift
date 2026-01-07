@@ -51,6 +51,7 @@ extension TelegramStore {
         guard let idx = arr.firstIndex(where: { $0.id == messageId }) else { return }
 
         let newText = renderPreviewTextFromContent(newContent)
+        let parsed = parseMessageTextPayload(newContent)
         let old = arr[idx]
 
         let updated = TGMessage(
@@ -60,6 +61,9 @@ extension TelegramStore {
             isOutgoing: old.isOutgoing,
             senderUserId: old.senderUserId,
             text: newText,
+            contentType: parsed.contentType,
+            rawText: parsed.rawText,
+            entities: parsed.entities,
             sendState: old.sendState,
             localId: old.localId,
             sendingId: old.sendingId,
