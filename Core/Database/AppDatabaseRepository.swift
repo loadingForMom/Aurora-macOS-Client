@@ -170,11 +170,14 @@ final class AppDatabaseRepository {
                     SELECT chat_id, message_id, date, sender_user_id, is_outgoing, text,
                            send_state, send_state_error, can_retry, edited_at, sending_id
                     FROM messages
-                    WHERE chat_id = ?
+                    WHERE chat_id = :chatId
                     ORDER BY message_id DESC
-                    LIMIT ?
+                    LIMIT :limit
                     """,
-                    arguments: StatementArguments([chatId, limit])
+                    arguments: StatementArguments([
+                        "chatId": chatId,
+                        "limit": limit
+                    ])
                 )
                 let messages = rows.map(mapMessageRow)
 #if DEBUG
@@ -212,11 +215,15 @@ final class AppDatabaseRepository {
                     SELECT chat_id, message_id, date, sender_user_id, is_outgoing, text,
                            send_state, send_state_error, can_retry, edited_at, sending_id
                     FROM messages
-                    WHERE chat_id = ? AND message_id < ?
+                    WHERE chat_id = :chatId AND message_id < :before
                     ORDER BY message_id DESC
-                    LIMIT ?
+                    LIMIT :limit
                     """,
-                    arguments: StatementArguments([chatId, beforeMessageId, limit])
+                    arguments: StatementArguments([
+                        "chatId": chatId,
+                        "before": beforeMessageId,
+                        "limit": limit
+                    ])
                 )
                 let messages = rows.map(mapMessageRow)
 #if DEBUG
