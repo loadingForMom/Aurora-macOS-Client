@@ -49,20 +49,37 @@ struct ChatTimelineContainer: View {
         }
         .background(Color(nsColor: .textBackgroundColor))
         .id(chat.id)
+        .onChange(of: chat.id) { _ in
+            viewModel.updateChat(chat)
+        }
     }
 }
 
 struct ChatTimelineRepresentable: NSViewRepresentable {
     @ObservedObject var viewModel: ChatTimelineViewModel
 
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeNSView(context: Context) -> ChatTimelineNSView {
         let view = ChatTimelineNSView()
         view.bind(viewModel)
+        context.coordinator.boundViewModel = viewModel
         return view
     }
 
     func updateNSView(_ nsView: ChatTimelineNSView, context: Context) {
-        nsView.bind(viewModel)
+        if context.coordinator.boundViewModel !== viewModel {
+            context.coordinator.boundViewModel = viewModel
+            DispatchQueue.main.async {
+                nsView.bind(viewModel)
+            }
+        }
+    }
+
+    final class Coordinator {
+        var boundViewModel: ChatTimelineViewModel?
     }
 }
 
@@ -95,7 +112,9 @@ final class ChatTimelineNSView: NSView {
         guard self.viewModel !== viewModel else { return }
         self.viewModel = viewModel
         viewModel.onWindowUpdate = { [weak self] update in
-            self?.apply(update)
+            DispatchQueue.main.async {
+                self?.apply(update)
+            }
         }
         DispatchQueue.main.async { [weak viewModel] in
             viewModel?.emitCurrentWindow()
@@ -174,7 +193,10 @@ final class ChatTimelineNSView: NSView {
             guard let cell = collectionView.makeItem(withIdentifier: MessageCollectionViewItem.identifier, for: indexPath) as? MessageCollectionViewItem else {
                 return nil
             }
-            guard let viewModel = self?.viewModel, let message = viewModel.messageById(item.id) else { return cell }
+            guard let viewModel = self?.viewModel, let message = viewModel.messageById(item) else { return cell }
+            #if DEBUG
+            assert(message.chatId == viewModel.chat.id, "Rendered message from wrong chat: \(message.chatId) != \(viewModel.chat.id)")
+            #endif
             let senderName = self?.senderName(for: message)
             cell.representedObject = message
             cell.configure(with: message, senderName: senderName, renderer: viewModel.renderer)
@@ -198,12 +220,16 @@ final class ChatTimelineNSView: NSView {
     }
 
     private func apply(_ update: ChatTimelineViewModel.WindowUpdate) {
+        #if DEBUG
+        let uniqueCount = Set(update.items).count
+        assert(uniqueCount == update.items.count, "Duplicate chat message identifiers in snapshot: \(update.items.count - uniqueCount)")
+        #endif
         var snapshot = NSDiffableDataSourceSnapshot<Section, ChatMessageItem>()
         snapshot.appendSections([.main])
         snapshot.appendItems(update.items, toSection: .main)
 
         if !update.reloadIds.isEmpty {
-            let reloadItems = update.items.filter { update.reloadIds.contains($0.id) }
+            let reloadItems = update.items.filter { update.reloadIds.contains($0.messageId) }
             snapshot.reloadItems(reloadItems)
         }
 
@@ -231,7 +257,7 @@ final class ChatTimelineNSView: NSView {
 
     private func scrollToMessage(id: Int64, position: NSCollectionView.ScrollPosition) {
         guard let items = dataSource?.snapshot().itemIdentifiers else { return }
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        guard let index = items.firstIndex(where: { $0.messageId == id }) else { return }
         scrollToItem(IndexPath(item: index, section: 0), position: position, animated: false)
     }
 

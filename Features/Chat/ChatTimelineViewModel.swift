@@ -44,7 +44,7 @@ final class ChatTimelineViewModel: ObservableObject {
     private var messages: [TGMessage] = []
     private var windowRange: Range<Int> = 0..<0
     private var windowMessages: [TGMessage] = []
-    private var windowMessageIds: [Int64] = []
+    private var windowMessageIds: [ChatMessageItem] = []
 
     private let initialWindowSize = 120
     private let maxWindowSize = 360
@@ -77,6 +77,9 @@ final class ChatTimelineViewModel: ObservableObject {
 
     func updateChat(_ chat: TGChat) {
         guard self.chat.id != chat.id else { return }
+        #if DEBUG
+        log.debug("Chat switch \(self.chat.id, privacy: .public) -> \(chat.id, privacy: .public)")
+        #endif
         saveScrollPosition()
         self.chat = chat
         resetState()
@@ -97,7 +100,13 @@ final class ChatTimelineViewModel: ObservableObject {
     }
 
     func messageById(_ id: Int64) -> TGMessage? {
-        guard let idx = windowMessageIds.firstIndex(of: id) else { return nil }
+        guard let idx = windowMessageIds.firstIndex(where: { $0.messageId == id }) else { return nil }
+        return windowMessages[idx]
+    }
+
+    func messageById(_ item: ChatMessageItem) -> TGMessage? {
+        guard item.chatId == chat.id else { return nil }
+        guard let idx = windowMessageIds.firstIndex(of: item) else { return nil }
         return windowMessages[idx]
     }
 
@@ -117,7 +126,7 @@ final class ChatTimelineViewModel: ObservableObject {
             }
 
             if shouldPageOlder(firstVisibleIndex: firstVisibleIndex) {
-                requestOlderHistory(anchorId: message(at: firstVisibleIndex)?.id)
+                requestOlderHistory(firstVisibleIndex: firstVisibleIndex, anchorId: message(at: firstVisibleIndex)?.id)
             }
         }
 
@@ -206,7 +215,12 @@ final class ChatTimelineViewModel: ObservableObject {
         let lower = max(0, min(clamped.lowerBound, upper))
         windowRange = lower..<upper
         windowMessages = Array(messages[windowRange])
-        windowMessageIds = windowMessages.map { $0.id }
+        #if DEBUG
+        for message in windowMessages {
+            assert(message.chatId == chat.id, "Message chatId \(message.chatId) does not match current chat \(chat.id)")
+        }
+        #endif
+        windowMessageIds = windowMessages.map { ChatMessageItem(chatId: chat.id, messageId: $0.id) }
         metrics.windowCount = windowMessages.count
 
         if !didInitialScroll {
@@ -220,7 +234,7 @@ final class ChatTimelineViewModel: ObservableObject {
     }
 
     private func windowItems() -> [ChatMessageItem] {
-        windowMessageIds.map { ChatMessageItem(id: $0) }
+        windowMessageIds
     }
 
     private func updatedMessageIds(previous: [TGMessage], current: [TGMessage]) -> Set<Int64> {
@@ -273,13 +287,16 @@ final class ChatTimelineViewModel: ObservableObject {
         return true
     }
 
-    private func requestOlderHistory(anchorId: Int64?) {
+    private func requestOlderHistory(firstVisibleIndex: Int, anchorId: Int64?) {
         guard !isPagingInFlight else { return }
         guard let anchorId else { return }
         guard !store.isLoadingHistory else { return }
 
         pendingAnchorId = anchorId
         isPagingInFlight = true
+        #if DEBUG
+        log.debug("Paging older chatId=\(chat.id, privacy: .public) firstVisible=\(firstVisibleIndex, privacy: .public) anchorId=\(anchorId, privacy: .public) window=\(windowRange.lowerBound, privacy: .public)-\(windowRange.upperBound, privacy: .public)")
+        #endif
         store.loadMoreHistory(chatId: chat.id)
     }
 
@@ -310,7 +327,7 @@ final class ChatTimelineViewModel: ObservableObject {
     }
 
     private func saveScrollPosition() {
-        if let id = windowMessageIds.first {
+        if let id = windowMessageIds.first?.messageId {
             Self.scrollMemory[chat.id] = id
         }
     }
@@ -338,5 +355,6 @@ final class ChatTimelineViewModel: ObservableObject {
 }
 
 struct ChatMessageItem: Hashable {
-    let id: Int64
+    let chatId: Int64
+    let messageId: Int64
 }
