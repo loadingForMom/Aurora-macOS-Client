@@ -10,12 +10,14 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
 
     private let senderLabel = NSTextField(labelWithString: "")
     private let bubbleView = BubbleBackgroundView()
-    private let textView = NSTextView()
+    private let textView = IntrinsicTextView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let stack = NSStackView()
 
     private var leadingConstraint: NSLayoutConstraint?
     private var trailingConstraint: NSLayoutConstraint?
+
+    private var currentMessageId: Int64?
 
     var onRetry: (() -> Void)?
     var onDelete: (() -> Void)?
@@ -39,6 +41,8 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
         textView.textContainer?.lineFragmentPadding = 0
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.heightTracksTextView = false
+        textView.setContentHuggingPriority(.required, for: .vertical)
+        textView.setContentCompressionResistancePriority(.required, for: .vertical)
 
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
@@ -75,6 +79,7 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
     }
 
     func configure(with message: TGMessage, senderName: String?, renderer: MessageTextRenderer) {
+        currentMessageId = message.id
         senderLabel.stringValue = senderName ?? ""
         senderLabel.isHidden = senderName == nil
 
@@ -93,7 +98,8 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
 
         let style = MessageTextStyle(fontSize: 14, isOutgoing: isOutgoing)
         renderer.render(message: message, style: style) { [weak self] attributed in
-            self?.textView.textStorage?.setAttributedString(attributed)
+            guard let self, self.currentMessageId == message.id else { return }
+            self.textView.textStorage?.setAttributedString(attributed)
         }
 
         statusLabel.attributedStringValue = statusAttributedString(for: message)
@@ -180,5 +186,22 @@ private final class BubbleBackgroundView: NSView {
         layer?.backgroundColor = (isOutgoing ? NSColor.systemBlue : NSColor.windowBackgroundColor.withAlphaComponent(0.9)).cgColor
         layer?.borderColor = NSColor.black.withAlphaComponent(0.06).cgColor
         layer?.borderWidth = 1
+    }
+}
+
+private final class IntrinsicTextView: NSTextView {
+    override var intrinsicContentSize: NSSize {
+        guard let layoutManager, let textContainer else {
+            return NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+        }
+        layoutManager.ensureLayout(for: textContainer)
+        let usedRect = layoutManager.usedRect(for: textContainer)
+        let height = usedRect.height + textContainerInset.height * 2
+        return NSSize(width: NSView.noIntrinsicMetric, height: ceil(height))
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        invalidateIntrinsicContentSize()
     }
 }

@@ -109,10 +109,23 @@ final class ChatTimelineNSView: NSView {
         scrollView.horizontalScrollElasticity = .none
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
-        let layout = NSCollectionViewFlowLayout()
-        layout.estimatedItemSize = NSSize(width: 480, height: 48)
-        layout.minimumLineSpacing = 8
-        layout.sectionInset = NSEdgeInsets(top: 14, left: 0, bottom: 14, right: 0)
+        let layout = NSCollectionViewCompositionalLayout { _, _ in
+            let itemSize = NSCollectionLayoutSize(
+                widthDimension: .fractionalWidth(1.0),
+                heightDimension: .estimated(48)
+            )
+            let item = NSCollectionLayoutItem(layoutSize: itemSize)
+
+            let groupSize = NSCollectionLayoutSize(
+                widthDimension: .fractionalWidth(1.0),
+                heightDimension: .estimated(48)
+            )
+            let group = NSCollectionLayoutGroup.vertical(layoutSize: groupSize, subitems: [item])
+            let section = NSCollectionLayoutSection(group: group)
+            section.interGroupSpacing = 8
+            section.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 0, bottom: 14, trailing: 0)
+            return section
+        }
 
         collectionView.collectionViewLayout = layout
         collectionView.isSelectable = false
@@ -177,10 +190,9 @@ final class ChatTimelineNSView: NSView {
             snapshot.reloadItems(reloadItems)
         }
 
-        dataSource?.apply(snapshot, animatingDifferences: update.animated)
-
-        if let command = update.scrollCommand {
-            perform(command)
+        dataSource?.apply(snapshot, animatingDifferences: update.animated) { [weak self] in
+            guard let command = update.scrollCommand else { return }
+            self?.perform(command)
         }
     }
 
@@ -237,7 +249,7 @@ final class ChatTimelineNSView: NSView {
     }
 }
 
-extension ChatTimelineNSView: NSCollectionViewDelegateFlowLayout {
+extension ChatTimelineNSView: NSCollectionViewDelegate {
 }
 
 extension ChatTimelineNSView: NSCollectionViewPrefetching {
