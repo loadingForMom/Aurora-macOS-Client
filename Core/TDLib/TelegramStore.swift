@@ -125,10 +125,6 @@ final class TelegramStore: ObservableObject {
 
         imageMemCache.countLimit = 256
 
-        if let n = UserDefaults.standard.object(forKey: cacheLimitBytesKey) as? NSNumber {
-            cacheLimitBytes = n.int64Value
-        }
-
         // ✅ СНАЧАЛА DB (до любых замыканий, где мелькает self)
         do {
             let db = try AppDatabase()
@@ -154,6 +150,10 @@ final class TelegramStore: ObservableObject {
         })
 
         td.send(#"{"@type":"getOption","name":"version"}"#)
+
+        if let n = UserDefaults.standard.object(forKey: cacheLimitBytesKey) as? NSNumber {
+            cacheLimitBytes = n.int64Value
+        }
     }
     // MARK: - Computed
 
@@ -297,6 +297,7 @@ final class TelegramStore: ObservableObject {
             "@type": "checkAuthenticationCode",
             "code": code
         ]
+        print("[UI] submitAuthCode \(code)")
         sendJSON(req)
     }
 
