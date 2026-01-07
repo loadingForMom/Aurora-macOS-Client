@@ -384,7 +384,9 @@ extension TelegramStore {
             return MessagesResponse(extra: extra, messages: [])
         }
 
-        let msgs = anyArr.compactMap { $0 as? [String: Any] }.compactMap(parseMessageObject(_:))
+        let msgs = anyArr
+            .compactMap { $0 as? [String: Any] }
+            .compactMap { parseMessageObject($0) }
         return MessagesResponse(extra: extra, messages: msgs)
     }
 
