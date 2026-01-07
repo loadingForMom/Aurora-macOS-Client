@@ -134,3 +134,8 @@ struct TGMessage: Identifiable, Hashable {
         return m
     }
 }
+
+struct MessageKey: Hashable {
+    let chatId: Int64
+    let messageId: Int64
+}
