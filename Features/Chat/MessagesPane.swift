@@ -228,7 +228,7 @@ struct MessagesPane: View {
         let snapshotIds = groupMessageIds
         pendingGroupFrameUpdate = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 16_000_000) // coalesce per-frame updates
-            await updateVisibleGroups(
+                updateVisibleGroups(
                 frames: snapshotFrames,
                 groupMessageBounds: snapshotBounds,
                 groupMessageIds: snapshotIds
@@ -386,7 +386,7 @@ struct MessagesPane: View {
             : []
 
 #if DEBUG
-        debugAssertUniqueMessageKeys(messages)
+        let _ = debugAssertUniqueMessageKeys(messages)
 #endif
 
         let groupIds: [String] = rows.compactMap {
