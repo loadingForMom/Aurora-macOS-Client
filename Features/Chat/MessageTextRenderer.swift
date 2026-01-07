@@ -48,7 +48,9 @@ final class MessageTextRenderer {
     func render(message: TGMessage, style: MessageTextStyle, completion: @escaping (NSAttributedString) -> Void) {
         let key = CacheKey(messageId: message.id, style: style)
         if let cached = cache.object(forKey: key) {
-            log.debug("Text cache hit for message \\(message.id)")
+            #if DEBUG
+            log.debug("Text cache hit for message \(message.id)")
+            #endif
             completion(cached)
             return
         }

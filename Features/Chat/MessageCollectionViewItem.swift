@@ -10,7 +10,7 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
 
     private let senderLabel = NSTextField(labelWithString: "")
     private let bubbleView = BubbleBackgroundView()
-    private let textView = IntrinsicTextView()
+    private let textLabel = NSTextField(labelWithAttributedString: NSAttributedString(string: ""))
     private let statusLabel = NSTextField(labelWithString: "")
     private let stack = NSStackView()
 
@@ -34,22 +34,20 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
         senderLabel.textColor = .secondaryLabelColor
         senderLabel.isHidden = true
 
-        textView.drawsBackground = false
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.textContainerInset = NSSize(width: 12, height: 8)
-        textView.textContainer?.lineFragmentPadding = 0
-        textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.heightTracksTextView = false
-        textView.setContentHuggingPriority(.required, for: .vertical)
-        textView.setContentCompressionResistancePriority(.required, for: .vertical)
+        textLabel.drawsBackground = false
+        textLabel.isEditable = false
+        textLabel.isSelectable = true
+        textLabel.maximumNumberOfLines = 0
+        textLabel.lineBreakMode = .byWordWrapping
+        textLabel.setContentHuggingPriority(.required, for: .vertical)
+        textLabel.setContentCompressionResistancePriority(.required, for: .vertical)
 
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
 
         bubbleView.translatesAutoresizingMaskIntoConstraints = false
-        bubbleView.addSubview(textView)
-        textView.translatesAutoresizingMaskIntoConstraints = false
+        bubbleView.addSubview(textLabel)
+        textLabel.translatesAutoresizingMaskIntoConstraints = false
 
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -71,11 +69,17 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
 
             bubbleView.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.72),
 
-            textView.leadingAnchor.constraint(equalTo: bubbleView.leadingAnchor),
-            textView.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor),
-            textView.topAnchor.constraint(equalTo: bubbleView.topAnchor),
-            textView.bottomAnchor.constraint(equalTo: bubbleView.bottomAnchor)
+            textLabel.leadingAnchor.constraint(equalTo: bubbleView.leadingAnchor, constant: 12),
+            textLabel.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor, constant: -12),
+            textLabel.topAnchor.constraint(equalTo: bubbleView.topAnchor, constant: 8),
+            textLabel.bottomAnchor.constraint(equalTo: bubbleView.bottomAnchor, constant: -8)
         ])
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        currentMessageId = nil
+        textLabel.attributedStringValue = NSAttributedString(string: "")
     }
 
     func configure(with message: TGMessage, senderName: String?, renderer: MessageTextRenderer) {
@@ -99,7 +103,7 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
         let style = MessageTextStyle(fontSize: 14, isOutgoing: isOutgoing)
         renderer.render(message: message, style: style) { [weak self] attributed in
             guard let self, self.currentMessageId == message.id else { return }
-            self.textView.textStorage?.setAttributedString(attributed)
+            self.textLabel.attributedStringValue = attributed
         }
 
         statusLabel.attributedStringValue = statusAttributedString(for: message)
@@ -186,22 +190,5 @@ private final class BubbleBackgroundView: NSView {
         layer?.backgroundColor = (isOutgoing ? NSColor.systemBlue : NSColor.windowBackgroundColor.withAlphaComponent(0.9)).cgColor
         layer?.borderColor = NSColor.black.withAlphaComponent(0.06).cgColor
         layer?.borderWidth = 1
-    }
-}
-
-private final class IntrinsicTextView: NSTextView {
-    override var intrinsicContentSize: NSSize {
-        guard let layoutManager, let textContainer else {
-            return NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
-        }
-        layoutManager.ensureLayout(for: textContainer)
-        let usedRect = layoutManager.usedRect(for: textContainer)
-        let height = usedRect.height + textContainerInset.height * 2
-        return NSSize(width: NSView.noIntrinsicMetric, height: ceil(height))
-    }
-
-    override func didChangeText() {
-        super.didChangeText()
-        invalidateIntrinsicContentSize()
     }
 }

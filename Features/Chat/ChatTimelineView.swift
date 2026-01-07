@@ -72,6 +72,7 @@ final class ChatTimelineNSView: NSView {
     }
 
     private let scrollView = NSScrollView()
+    private let documentContainer = NSView()
     private let collectionView = NSCollectionView()
     private var dataSource: NSCollectionViewDiffableDataSource<Section, ChatMessageItem>?
 
@@ -96,7 +97,9 @@ final class ChatTimelineNSView: NSView {
         viewModel.onWindowUpdate = { [weak self] update in
             self?.apply(update)
         }
-        viewModel.emitCurrentWindow()
+        DispatchQueue.main.async { [weak viewModel] in
+            viewModel?.emitCurrentWindow()
+        }
         isBound = true
     }
 
@@ -135,14 +138,28 @@ final class ChatTimelineNSView: NSView {
         collectionView.prefetchDataSource = self
         collectionView.translatesAutoresizingMaskIntoConstraints = false
 
-        scrollView.documentView = collectionView
+        documentContainer.translatesAutoresizingMaskIntoConstraints = false
+        documentContainer.addSubview(collectionView)
+
+        scrollView.documentView = documentContainer
         addSubview(scrollView)
 
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor)
+            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            documentContainer.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            documentContainer.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
+            documentContainer.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            documentContainer.bottomAnchor.constraint(equalTo: scrollView.contentView.bottomAnchor),
+            documentContainer.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+
+            collectionView.leadingAnchor.constraint(equalTo: documentContainer.leadingAnchor),
+            collectionView.trailingAnchor.constraint(equalTo: documentContainer.trailingAnchor),
+            collectionView.topAnchor.constraint(equalTo: documentContainer.topAnchor),
+            collectionView.bottomAnchor.constraint(equalTo: documentContainer.bottomAnchor)
         ])
 
         scrollView.contentView.postsBoundsChangedNotifications = true
