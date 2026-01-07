@@ -70,13 +70,6 @@ struct ChatMessageGroupView: View {
                 }
             }
         }
-    .onAppear {
-        guard !group.isOutgoing else { return }
-        let ids = group.messages.map { $0.id }
-        DispatchQueue.main.async {
-            store.viewMessages(chatId: chat.id, messageIds: ids, forceRead: false)
-        }
-    }
         .frame(maxWidth: .infinity, alignment: group.isOutgoing ? .trailing : .leading)
         .padding(.vertical, 2)
     }

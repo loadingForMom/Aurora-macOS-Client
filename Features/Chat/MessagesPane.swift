@@ -28,6 +28,9 @@ struct MessagesPane: View {
     @State private var cachedRows: [Row] = []
     @State private var windowMessages: [TGMessage] = []
     @State private var windowApplyToken = UUID()
+    @State private var viewedMessageIds = Set<Int64>()
+    @State private var lastVisibleGroupIds = Set<String>()
+    @StateObject private var viewMessagesDebouncer = ViewMessagesDebouncer()
 
     @State private var topVisibleGroupId: String? = nil
     @State private var topVisibleMessageId: Int64? = nil
@@ -60,22 +63,16 @@ struct MessagesPane: View {
     // MARK: - Rows
 
     private enum Row: Identifiable, Hashable {
-        case dayHeader(Date)
-        case timeSeparator(Date)
+        case dayHeader(id: String, date: Date)
+        case timeSeparator(id: String, date: Date)
         case group(MessageGroup)
 
         var id: String {
             switch self {
-            case .dayHeader(let d): return "day:\(Self.dayKey(d))"
-            case .timeSeparator(let d): return "time:\(Int(d.timeIntervalSince1970))"
+            case .dayHeader(let id, _): return id
+            case .timeSeparator(let id, _): return id
             case .group(let g): return g.id
             }
-        }
-
-        private static func dayKey(_ d: Date) -> String {
-            let cal = Calendar.current
-            let c = cal.dateComponents([.year, .month, .day], from: d)
-            return "\(c.year ?? 0)-\(c.month ?? 0)-\(c.day ?? 0)"
         }
     }
 
@@ -133,6 +130,15 @@ struct MessagesPane: View {
             }
             windowMessages = filtered
             cachedRows = buildRows(filtered)
+        }
+    }
+
+    private func scheduleViewMessages(_ messageIds: Set<Int64>) {
+        let unseen = messageIds.subtracting(viewedMessageIds)
+        guard !unseen.isEmpty else { return }
+        viewMessagesDebouncer.schedule(delay: 0.2) { [chatId = chat.id, unseen] in
+            store.viewMessages(chatId: chatId, messageIds: Array(unseen), forceRead: false)
+            viewedMessageIds.formUnion(unseen)
         }
     }
 
@@ -237,10 +243,10 @@ struct MessagesPane: View {
     @ViewBuilder
     private func rowView(_ row: Row, firstGroupId: String?) -> some View {
         switch row {
-        case .dayHeader(let day):
+        case .dayHeader(_, let day):
             DayHeaderView(day: day)
 
-        case .timeSeparator(let t):
+        case .timeSeparator(_, let t):
             TimeSeparatorView(date: t)
 
         case .group(let g):
@@ -297,6 +303,12 @@ struct MessagesPane: View {
                 return (g.id, (minId, maxId))
             }
         )
+        let groupMessageIds: [String: [Int64]] = Dictionary(
+            uniqueKeysWithValues: rows.compactMap { row in
+                guard case let .group(g) = row else { return nil }
+                return (g.id, g.messages.map { $0.id })
+            }
+        )
 
         ScrollViewReader { proxy in
             GeometryReader { containerGeo in
@@ -343,19 +355,29 @@ struct MessagesPane: View {
                     pushJellyImpulse(delta: delta)
                 }
                 .onPreferenceChange(GroupFrameKey.self) { frames in
-                    DispatchQueue.main.async {
-                        let visibleGroups = frames.filter { $0.value.maxY >= 0 && $0.value.minY <= jellyContainerHeight }
-                        let visibleBounds = visibleGroups.compactMap { groupMessageBounds[$0.key] }
+                    let visibleGroups = frames.filter { $0.value.maxY >= 0 && $0.value.minY <= jellyContainerHeight }
+                    let visibleGroupIds = Set(visibleGroups.keys)
+                    let visibleBounds = visibleGroups.compactMap { groupMessageBounds[$0.key] }
 
-                        visibleMinMessageId = visibleBounds.map(\.min).min()
-                        visibleMaxMessageId = visibleBounds.map(\.max).max()
+                    let newMin = visibleBounds.map(\.min).min()
+                    let newMax = visibleBounds.map(\.max).max()
+                    let newTopGroup = visibleGroups.min(by: { $0.value.minY < $1.value.minY })?.key
+                    let newTopMessageId = newTopGroup.flatMap { groupMessageBounds[$0]?.min }
 
-                        if let topVisible = visibleGroups.min(by: { $0.value.minY < $1.value.minY }),
-                           let bounds = groupMessageBounds[topVisible.key] {
-                            topVisibleGroupId = topVisible.key
-                            topVisibleMessageId = bounds.min
-                        }
-                    }
+                    let visibilityChanged = visibleGroupIds != lastVisibleGroupIds
+                    let boundsChanged = newMin != visibleMinMessageId || newMax != visibleMaxMessageId
+                    let anchorChanged = newTopGroup != topVisibleGroupId || newTopMessageId != topVisibleMessageId
+
+                    guard visibilityChanged || boundsChanged || anchorChanged else { return }
+
+                    lastVisibleGroupIds = visibleGroupIds
+                    visibleMinMessageId = newMin
+                    visibleMaxMessageId = newMax
+                    topVisibleGroupId = newTopGroup
+                    topVisibleMessageId = newTopMessageId
+
+                    let visibleMessageIds = Set(visibleGroupIds.flatMap { groupMessageIds[$0] ?? [] })
+                    scheduleViewMessages(visibleMessageIds)
                 }
                 .onAppear {
                     jellyContainerHeight = containerGeo.size.height
@@ -440,6 +462,9 @@ struct MessagesPane: View {
                     cachedRows = []
                     windowMessages = []
                     windowApplyToken = UUID()
+                    viewMessagesDebouncer.cancel()
+                    viewedMessageIds = []
+                    lastVisibleGroupIds = []
 
                     isAtBottom = true
                     newIncomingCount = 0
@@ -542,7 +567,7 @@ struct MessagesPane: View {
         func flushBucket() {
             guard let first = bucket.first else { return }
             let group = MessageGroup(
-                id: "g:\(first.chatId):\(first.id)",
+                id: "\(chat.id):g:\(first.id)",
                 isOutgoing: curOutgoing,
                 senderUserId: curSender,
                 messages: bucket
@@ -557,7 +582,8 @@ struct MessagesPane: View {
             if currentDay == nil || currentDay != day {
                 flushBucket()
                 currentDay = day
-                rows.append(.dayHeader(day))
+                let key = dayKey(day)
+                rows.append(.dayHeader(id: "\(chat.id):day:\(key)", date: day))
                 lastUnix = nil
             }
         }
@@ -565,7 +591,7 @@ struct MessagesPane: View {
         func maybeInsertMajorGap(prev: Int, next: Int) {
             let gap = abs(next - prev)
             guard gap >= majorGap else { return }
-            rows.append(.timeSeparator(Date(timeIntervalSince1970: TimeInterval(next))))
+            rows.append(.timeSeparator(id: "\(chat.id):time:\(next)", date: Date(timeIntervalSince1970: TimeInterval(next))))
         }
 
         for m in msgs {
@@ -601,6 +627,28 @@ struct MessagesPane: View {
 
         flushBucket()
         return rows
+    }
+
+    private func dayKey(_ d: Date) -> String {
+        let cal = Calendar.current
+        let c = cal.dateComponents([.year, .month, .day], from: d)
+        return "\(c.year ?? 0)-\(c.month ?? 0)-\(c.day ?? 0)"
+    }
+}
+
+private final class ViewMessagesDebouncer: ObservableObject {
+    private var workItem: DispatchWorkItem?
+
+    func schedule(delay: TimeInterval, action: @escaping () -> Void) {
+        workItem?.cancel()
+        let item = DispatchWorkItem(block: action)
+        workItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    func cancel() {
+        workItem?.cancel()
+        workItem = nil
     }
 }
 
