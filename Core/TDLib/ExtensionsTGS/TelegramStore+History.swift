@@ -6,55 +6,73 @@ import Foundation
 
 extension TelegramStore {
 
-    func loadLatestHistory(chatId: Int64) {
+    private var initialHistoryWindowLimit: Int { 160 }
+    private var maxHistoryWindowLimit: Int { 800 }
+
+    func loadInitialHistory(chatId: Int64) {
         isLoadingHistory = (selectedChatId == chatId)
         reachedHistoryStart.remove(chatId)
 
-        messagesByChatId[chatId] = []
+        historyWindowLimitByChatId[chatId] = initialHistoryWindowLimit
+        if let cached = databaseRepository?.fetchLatestMessages(chatId: chatId, limit: initialHistoryWindowLimit) {
+            messagesByChatId[chatId] = sortChronological(cached)
+        } else {
+            messagesByChatId[chatId] = []
+        }
         cancelHistoryJobs(for: chatId)
 
-        let extra = "history:\(chatId):latest:\(UUID().uuidString)"
+        let extra = "history:\(chatId):initial:local:\(UUID().uuidString)"
+        let windowLimit = historyWindowLimitByChatId[chatId] ?? initialHistoryWindowLimit
         historyJobs[extra] = HistoryJob(
             chatId: chatId,
-            targetCount: 160,
-            nextFromMessageId: 0,
-            accById: [:],
-            kind: .latest
+            kind: .initialLocal,
+            anchorMessageId: 0,
+            requestedLimit: min(100, windowLimit),
+            windowLimit: windowLimit,
+            onlyLocal: true
         )
-        sendChatHistory(chatId: chatId, fromMessageId: 0, offset: 0, limit: 100, extra: extra)
+        sendChatHistory(
+            chatId: chatId,
+            fromMessageId: 0,
+            offset: 0,
+            limit: min(100, windowLimit),
+            onlyLocal: true,
+            extra: extra
+        )
     }
 
-    func _loadMoreHistory_impl(chatId: Int64, pageSize: Int) {
+    func _loadMoreHistory_impl(chatId: Int64, anchorMessageId: Int64, pageSize: Int) {
         if isLoadingHistory { return }
         if reachedHistoryStart.contains(chatId) { return }
+        if anchorMessageId <= 0 { return }
 
-        guard let current = messagesByChatId[chatId], !current.isEmpty else {
-            loadLatestHistory(chatId: chatId)
-            return
-        }
-
-        if current.count >= 800 { return }
+        let currentLimit = historyWindowLimitByChatId[chatId] ?? initialHistoryWindowLimit
+        if currentLimit >= maxHistoryWindowLimit { return }
 
         isLoadingHistory = (selectedChatId == chatId)
+        let target = min(maxHistoryWindowLimit, currentLimit + pageSize)
+        historyWindowLimitByChatId[chatId] = target
 
-        let serverMsgs = current.filter { $0.id > 0 }
-        guard let oldestServerId = serverMsgs.min(by: { $0.id < $1.id })?.id else {
-            isLoadingHistory = false
-            return
-        }
-
-        let target = min(800, current.count + pageSize)
         let extra = "history:\(chatId):older:\(UUID().uuidString)"
-
         historyJobs[extra] = HistoryJob(
             chatId: chatId,
-            targetCount: target,
-            nextFromMessageId: oldestServerId,
-            accById: Dictionary(uniqueKeysWithValues: current.map { ($0.id, $0) }),
-            kind: .older
+            kind: .older,
+            anchorMessageId: anchorMessageId,
+            requestedLimit: pageSize,
+            windowLimit: target,
+            onlyLocal: false
         )
 
-        sendChatHistory(chatId: chatId, fromMessageId: oldestServerId, offset: 0, limit: pageSize, extra: extra)
+        // TDLib getChatHistory(chat_id, from_message_id, offset, limit, only_local).
+        // We use offset = -1 so the result is strictly older than the anchor message.
+        sendChatHistory(
+            chatId: chatId,
+            fromMessageId: anchorMessageId,
+            offset: -1,
+            limit: pageSize,
+            onlyLocal: false,
+            extra: extra
+        )
     }
 
     func cancelHistoryJobs(for chatId: Int64) {
@@ -62,7 +80,7 @@ extension TelegramStore {
         for k in keys { historyJobs.removeValue(forKey: k) }
     }
 
-    func sendChatHistory(chatId: Int64, fromMessageId: Int64, offset: Int, limit: Int, extra: String) {
+    func sendChatHistory(chatId: Int64, fromMessageId: Int64, offset: Int, limit: Int, onlyLocal: Bool, extra: String) {
         let req: [String: Any] = [
             "@type": "getChatHistory",
             "@extra": extra,
@@ -70,8 +88,15 @@ extension TelegramStore {
             "from_message_id": fromMessageId,
             "offset": offset,
             "limit": limit,
-            "only_local": false
+            "only_local": onlyLocal
         ]
         sendJSON(req)
+    }
+
+    func refreshMessagesWindow(chatId: Int64) {
+        guard let windowLimit = historyWindowLimitByChatId[chatId] else { return }
+        guard let databaseRepository else { return }
+        let latest = databaseRepository.fetchLatestMessages(chatId: chatId, limit: windowLimit)
+        messagesByChatId[chatId] = sortChronological(latest)
     }
 }

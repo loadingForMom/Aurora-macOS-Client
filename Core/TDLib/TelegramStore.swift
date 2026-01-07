@@ -101,18 +101,20 @@ final class TelegramStore: ObservableObject {
 
     // MARK: - History jobs
 
-    enum HistoryJobKind { case latest, older }
+    enum HistoryJobKind { case initialLocal, initialRemote, older }
 
     struct HistoryJob {
         let chatId: Int64
-        let targetCount: Int
-        var nextFromMessageId: Int64
-        var accById: [Int64: TGMessage]
         let kind: HistoryJobKind
+        let anchorMessageId: Int64
+        let requestedLimit: Int
+        let windowLimit: Int
+        let onlyLocal: Bool
     }
 
     var historyJobs: [String: HistoryJob] = [:]
     var reachedHistoryStart: Set<Int64> = []
+    var historyWindowLimitByChatId: [Int64: Int] = [:]
 
     // MARK: - Init
 
@@ -183,7 +185,7 @@ final class TelegramStore: ObservableObject {
         if !forceReload, let existing = messagesByChatId[chatId], !existing.isEmpty {
             return
         }
-        loadLatestHistory(chatId: chatId)
+        loadInitialHistory(chatId: chatId)
     }
 
     func userDisplayName(_ userId: Int64?) -> String {
@@ -249,7 +251,9 @@ final class TelegramStore: ObservableObject {
     func editMessageText(chatId: Int64, messageId: Int64, newText: String) { _editMessageText_impl(chatId: chatId, messageId: messageId, newText: newText) }
 
     // History paging (implemented in +History)
-    func loadMoreHistory(chatId: Int64, pageSize: Int = 80) { _loadMoreHistory_impl(chatId: chatId, pageSize: pageSize) }
+    func loadMoreHistory(chatId: Int64, anchorMessageId: Int64, pageSize: Int = 80) {
+        _loadMoreHistory_impl(chatId: chatId, anchorMessageId: anchorMessageId, pageSize: pageSize)
+    }
 
     // Storage (implemented in +Storage)
     func refreshStorageStatistics() { _refreshStorageStatistics_impl() }
@@ -347,6 +351,7 @@ final class TelegramStore: ObservableObject {
 
         historyJobs = [:]
         reachedHistoryStart = []
+        historyWindowLimitByChatId = [:]
 
         didLoadInitialData = false
         didSendTdlibParameters = false

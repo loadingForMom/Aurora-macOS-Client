@@ -191,7 +191,7 @@ extension TelegramStore {
 
             if selectedChatId == nil {
                 selectedChatId = chat.id
-                loadLatestHistory(chatId: chat.id)
+                loadInitialHistory(chatId: chat.id)
             }
         }
 
@@ -227,48 +227,50 @@ extension TelegramStore {
         }
 
         // History responses
-        if let res = parseMessagesResponse(resp), var job = historyJobs[res.extra] {
+        if let res = parseMessagesResponse(resp), let job = historyJobs[res.extra] {
+#if DEBUG
+            let minId = res.messages.min(by: { $0.id < $1.id })?.id
+            let maxId = res.messages.max(by: { $0.id < $1.id })?.id
+            print("[TDLib] getChatHistory chatId=\(job.chatId) anchorMessageId=\(job.anchorMessageId) limit=\(job.requestedLimit) returned=\(res.messages.count) minId=\(minId ?? 0) maxId=\(maxId ?? 0)")
+#endif
             for m in res.messages {
 #if DEBUG
                 debugLogMessageEvent(label: "getChatHistory", chatId: job.chatId, messageId: m.id)
                 assert(m.chatId == job.chatId, "TDLib history message chatId mismatch: expected \(job.chatId) got \(m.chatId)")
 #endif
-                job.accById[m.id] = m
                 persistMessage(m)
                 requestUserIfNeeded(m.senderUserId)
             }
 
-            if let oldest = res.messages.min(by: { $0.id < $1.id })?.id {
-                job.nextFromMessageId = oldest
+            if job.kind == .older && res.messages.isEmpty {
+                reachedHistoryStart.insert(job.chatId)
             }
 
-            let currentCount = job.accById.count
-            let remaining = max(0, job.targetCount - currentCount)
+            historyJobs.removeValue(forKey: res.extra)
+            refreshMessagesWindow(chatId: job.chatId)
 
-            if remaining == 0 || res.messages.isEmpty {
-                if job.kind == .older && res.messages.isEmpty {
-                    reachedHistoryStart.insert(job.chatId)
-                }
+            if job.kind == .initialLocal {
+                let extra = "history:\(job.chatId):initial:remote:\(UUID().uuidString)"
+                historyJobs[extra] = HistoryJob(
+                    chatId: job.chatId,
+                    kind: .initialRemote,
+                    anchorMessageId: 0,
+                    requestedLimit: job.requestedLimit,
+                    windowLimit: job.windowLimit,
+                    onlyLocal: false
+                )
+                sendChatHistory(
+                    chatId: job.chatId,
+                    fromMessageId: 0,
+                    offset: 0,
+                    limit: job.requestedLimit,
+                    onlyLocal: false,
+                    extra: extra
+                )
+            }
 
-                let ordered = sortChronological(Array(job.accById.values))
-                messagesByChatId[job.chatId] = Array(ordered.suffix(job.targetCount))
-
-                historyJobs.removeValue(forKey: res.extra)
-                if selectedChatId == job.chatId {
-                    isLoadingHistory = historyJobs.values.contains(where: { $0.chatId == job.chatId })
-                }
-            } else {
-                historyJobs[res.extra] = job
-                if selectedChatId == job.chatId {
-                    let ordered = sortChronological(Array(job.accById.values))
-                    let cap = min(job.targetCount, ordered.count)
-                    messagesByChatId[job.chatId] = Array(ordered.suffix(cap))
-                }
-                sendChatHistory(chatId: job.chatId,
-                                fromMessageId: job.nextFromMessageId,
-                                offset: 0,
-                                limit: min(remaining, 100),
-                                extra: res.extra)
+            if selectedChatId == job.chatId {
+                isLoadingHistory = historyJobs.values.contains(where: { $0.chatId == job.chatId })
             }
         }
     }
