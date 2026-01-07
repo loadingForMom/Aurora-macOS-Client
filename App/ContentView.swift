@@ -93,12 +93,16 @@ struct ContentView: View {
             }
             .task {
                 if let id = store.selectedChatId {
-                    store.selectChat(id, forceReload: false)
+                    await MainActor.run {
+                        store.selectChat(id, forceReload: false)
+                    }
                 }
             }
             .onChange(of: store.selectedChatId) { _, newChatId in
                 guard let id = newChatId else { return }
-                store.selectChat(id)
+                DispatchQueue.main.async {
+                    store.selectChat(id)
+                }
             }
 
             if !store.isAuthorized {

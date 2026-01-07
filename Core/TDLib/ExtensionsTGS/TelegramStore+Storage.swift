@@ -45,7 +45,6 @@ extension TelegramStore {
             ["@type": "fileTypeWallpaper"],
             ["@type": "fileTypeProfilePhoto"],
             ["@type": "fileTypeThumbnail"],
-            ["@type": "fileTypeTemp"],
             ["@type": "fileTypeUnknown"]
         ]
 

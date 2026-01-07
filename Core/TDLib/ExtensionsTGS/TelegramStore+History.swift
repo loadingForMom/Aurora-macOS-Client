@@ -13,9 +13,17 @@ extension TelegramStore {
         isLoadingHistory = (selectedChatId == chatId)
         reachedHistoryStart.remove(chatId)
 
+        // Bump generation so stale history responses can't overwrite a newer timeline.
+        let generation = (historyGenerationByChatId[chatId] ?? 0) + 1
+        historyGenerationByChatId[chatId] = generation
+
         historyWindowLimitByChatId[chatId] = initialHistoryWindowLimit
         if let cached = databaseRepository?.fetchLatestMessages(chatId: chatId, limit: initialHistoryWindowLimit) {
-            messagesByChatId[chatId] = sortChronological(cached)
+            if cached.isEmpty {
+                messagesByChatId[chatId] = []
+            } else {
+                mergeMessages(chatId: chatId, incoming: cached, windowLimit: initialHistoryWindowLimit, reason: "initial-local")
+            }
         } else {
             messagesByChatId[chatId] = []
         }
@@ -29,7 +37,8 @@ extension TelegramStore {
             anchorMessageId: 0,
             requestedLimit: min(100, windowLimit),
             windowLimit: windowLimit,
-            onlyLocal: true
+            onlyLocal: true,
+            generation: generation
         )
         sendChatHistory(
             chatId: chatId,
@@ -60,7 +69,8 @@ extension TelegramStore {
             anchorMessageId: anchorMessageId,
             requestedLimit: pageSize,
             windowLimit: target,
-            onlyLocal: false
+            onlyLocal: false,
+            generation: historyGenerationByChatId[chatId] ?? 0
         )
 
         // TDLib getChatHistory(chat_id, from_message_id, offset, limit, only_local).
@@ -97,6 +107,6 @@ extension TelegramStore {
         guard let windowLimit = historyWindowLimitByChatId[chatId] else { return }
         guard let databaseRepository else { return }
         let latest = databaseRepository.fetchLatestMessages(chatId: chatId, limit: windowLimit)
-        messagesByChatId[chatId] = sortChronological(latest)
+        mergeMessages(chatId: chatId, incoming: latest, windowLimit: windowLimit, reason: "db-window")
     }
 }

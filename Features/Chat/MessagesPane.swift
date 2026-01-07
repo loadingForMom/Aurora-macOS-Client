@@ -34,6 +34,7 @@ struct MessagesPane: View {
     @State private var viewedMessageIds = Set<Int64>()
     @State private var lastVisibleGroupIds = Set<String>()
     @State private var viewMessagesDebouncer = ViewMessagesDebouncer()
+    @State private var pendingGroupFrameUpdate: Task<Void, Never>? = nil
 
     @State private var topVisibleGroupId: String? = nil
     @State private var topVisibleMessageId: Int64? = nil
@@ -95,7 +96,9 @@ struct MessagesPane: View {
         pagingInFlight = true
 
         fetchOlderMessages(beforeMessageId: anchorMessageId, anchorGroupId: anchorGroupId)
-        store.loadMoreHistory(chatId: chat.id, anchorMessageId: anchorMessageId)
+        DispatchQueue.main.async {
+            store.loadMoreHistory(chatId: chat.id, anchorMessageId: anchorMessageId)
+        }
     }
 
     private func fetchLatestMessages() {
@@ -211,6 +214,26 @@ struct MessagesPane: View {
 
         let visibleMessageIds = Set(visibleGroupIds.flatMap { groupMessageIds[$0] ?? [] })
         scheduleViewMessages(visibleMessageIds)
+    }
+
+    private func scheduleVisibleGroupsUpdate(
+        frames: [String: CGRect],
+        groupMessageBounds: [String: (min: Int64, max: Int64)],
+        groupMessageIds: [String: [Int64]]
+    ) {
+        // Coalesce preference updates off the render pass to avoid SwiftUI "publishing during update" warnings.
+        pendingGroupFrameUpdate?.cancel()
+        let snapshotFrames = frames
+        let snapshotBounds = groupMessageBounds
+        let snapshotIds = groupMessageIds
+        pendingGroupFrameUpdate = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 16_000_000) // coalesce per-frame updates
+            await updateVisibleGroups(
+                frames: snapshotFrames,
+                groupMessageBounds: snapshotBounds,
+                groupMessageIds: snapshotIds
+            )
+        }
     }
 
     private var pagingStateLabel: String {
@@ -362,6 +385,10 @@ struct MessagesPane: View {
             ? (cachedRows.isEmpty ? buildRows(messages) : cachedRows)
             : []
 
+#if DEBUG
+        debugAssertUniqueMessageKeys(messages)
+#endif
+
         let groupIds: [String] = rows.compactMap {
             if case .group(let g) = $0 { return g.id }
             return nil
@@ -428,14 +455,11 @@ struct MessagesPane: View {
                     pushJellyImpulse(delta: delta)
                 }
                 .onPreferenceChange(GroupFrameKey.self) { frames in
-                    Task {
-                        await Task.yield()
-                        await updateVisibleGroups(
-                            frames: frames,
-                            groupMessageBounds: groupMessageBounds,
-                            groupMessageIds: groupMessageIds
-                        )
-                    }
+                    scheduleVisibleGroupsUpdate(
+                        frames: frames,
+                        groupMessageBounds: groupMessageBounds,
+                        groupMessageIds: groupMessageIds
+                    )
                 }
                 .onAppear {
                     jellyContainerHeight = containerGeo.size.height
@@ -620,6 +644,14 @@ struct MessagesPane: View {
         .id(chat.id)
         .background(Color(nsColor: .textBackgroundColor))
     }
+
+#if DEBUG
+    private func debugAssertUniqueMessageKeys(_ messages: [TGMessage]) {
+        let keys = messages.map(\.messageKey)
+        let unique = Set(keys)
+        assert(unique.count == keys.count, "[MessagesPane] duplicate message keys in chat \(chat.id)")
+    }
+#endif
 
     // MARK: - Grouping into rows (day headers + time separators + bubble groups)
 

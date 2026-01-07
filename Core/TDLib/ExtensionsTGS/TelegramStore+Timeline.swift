@@ -15,7 +15,7 @@ extension TelegramStore {
 
     func appendMessage(_ msg: TGMessage, chatId: Int64) {
         var arr = messagesByChatId[chatId] ?? []
-        if arr.contains(where: { $0.id == msg.id }) { return }
+        if arr.contains(where: { $0.messageKey == msg.messageKey }) { return }
         arr.append(msg)
         arr = sortChronological(arr)
         if arr.count > 800 { arr.removeFirst(arr.count - 800) }
@@ -34,6 +34,61 @@ extension TelegramStore {
         if arr.count > 800 { arr.removeFirst(arr.count - 800) }
         messagesByChatId[chatId] = arr
         persistMessage(newMessage)
+    }
+
+    // Merge (do not replace) to avoid dropping newer tail/optimistic rows when history windows arrive.
+    func mergeMessages(chatId: Int64, incoming: [TGMessage], windowLimit: Int?, reason: String) {
+        guard !incoming.isEmpty else { return }
+
+        let existing = messagesByChatId[chatId] ?? []
+        let beforeCount = existing.count
+        let beforeMax = existing.map(\.id).max() ?? 0
+
+        var byKey: [MessageKey: TGMessage] = [:]
+        var keyByLocalId: [UUID: MessageKey] = [:]
+
+        for msg in existing where msg.chatId == chatId {
+            let key = msg.messageKey
+            byKey[key] = msg
+            if let localId = msg.localId {
+                keyByLocalId[localId] = key
+            }
+        }
+
+        func merge(existing: TGMessage, incoming: TGMessage) -> TGMessage {
+            var merged = incoming
+            if merged.localId == nil { merged.localId = existing.localId }
+            if merged.sendingId == nil { merged.sendingId = existing.sendingId }
+            return merged
+        }
+
+        for var msg in incoming where msg.chatId == chatId {
+            if let localId = localIdByTempMessageId[msg.id] ?? serverMessageIdByLocalId.first(where: { $0.value == msg.id })?.key {
+                if msg.localId == nil { msg.localId = localId }
+                if let existingKey = keyByLocalId[localId], existingKey != msg.messageKey {
+                    byKey.removeValue(forKey: existingKey)
+                }
+            }
+
+            let key = msg.messageKey
+            if let existing = byKey[key] {
+                byKey[key] = merge(existing: existing, incoming: msg)
+            } else {
+                byKey[key] = msg
+            }
+        }
+
+        var merged = Array(byKey.values)
+        merged = sortChronological(merged)
+        if let windowLimit, merged.count > windowLimit {
+            merged.removeFirst(merged.count - windowLimit)
+        }
+        messagesByChatId[chatId] = merged
+
+#if DEBUG
+        let afterMax = merged.map(\.id).max() ?? 0
+        print("[HistoryMerge] chatId=\(chatId) reason=\(reason) count \(beforeCount)->\(merged.count) maxId \(beforeMax)->\(afterMax)")
+#endif
     }
 
     func keepOptimisticChatPreviewIfNeeded(chatId: Int64) {
