@@ -24,6 +24,12 @@ final class TelegramStore: ObservableObject {
     @Published var logs: [String] = []
     @Published var showLogs: Bool = false
 
+    // MARK: - App DB
+
+    let database: AppDatabase?
+    let databaseRepository: AppDatabaseRepository?
+    @Published var lastDatabaseStats: DatabaseStats?
+
     // MARK: - Storage / Cache (Settings)
 
     @Published var storageByFileType: [StorageFileTypeStat] = []
@@ -136,6 +142,16 @@ final class TelegramStore: ObservableObject {
         if let n = UserDefaults.standard.object(forKey: cacheLimitBytesKey) as? NSNumber {
             cacheLimitBytes = n.int64Value
         }
+
+        do {
+            let db = try AppDatabase()
+            database = db
+            databaseRepository = AppDatabaseRepository(dbWriter: db.dbWriter)
+        } catch {
+            database = nil
+            databaseRepository = nil
+            print("[DB] Failed to initialize app database: \(error)")
+        }
     }
 
     // MARK: - Computed
@@ -191,6 +207,38 @@ final class TelegramStore: ObservableObject {
         if c.unreadCount <= 0 { return }
         if c.lastMessageId == 0 { return }
         viewMessages(chatId: chatId, messageIds: [c.lastMessageId], forceRead: true)
+    }
+
+    func printDatabaseStats() {
+        guard let databaseRepository else {
+            print("[DB] Database not initialized")
+            return
+        }
+        let stats = databaseRepository.fetchStats()
+        lastDatabaseStats = stats
+        print("[DB] Stats chats=\(stats.chats) messages=\(stats.messages) users=\(stats.users)")
+    }
+
+    // MARK: - App DB helpers
+
+    func persistChat(_ chat: TGChat) {
+        databaseRepository?.upsertChat(chat)
+    }
+
+    func persistChatLastMessage(chatId: Int64, messageId: Int64, preview: String, date: Int) {
+        databaseRepository?.upsertChatLastMessage(chatId: chatId, messageId: messageId, preview: preview, date: date)
+    }
+
+    func persistUser(_ user: TGUser) {
+        databaseRepository?.upsertUser(user)
+    }
+
+    func persistMessage(_ message: TGMessage) {
+        databaseRepository?.upsertMessage(message)
+    }
+
+    func deleteMessages(chatId: Int64, messageIds: [Int64]) {
+        databaseRepository?.deleteMessages(chatId: chatId, messageIds: messageIds)
     }
 
     // Messages actions (implemented in +OptimisticSending)

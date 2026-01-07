@@ -48,8 +48,8 @@ extension TelegramStore {
         return ids.map { $0.int64Value }
     }
 
-    /// Returns (chat, smallFileId, bigFileId, bestExistingPath)
-    func parseChatObject(_ upd: String) -> (TGChat, Int32?, Int32?, String?)? {
+    /// Returns (chat, lastMessage, smallFileId, bigFileId, bestExistingPath)
+    func parseChatObject(_ upd: String) -> (TGChat, TGMessage?, Int32?, Int32?, String?)? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "chat" else { return nil }
 
@@ -63,11 +63,13 @@ extension TelegramStore {
         var preview = ""
         var lastDate = 0
         var lastMessageId: Int64 = 0
+        var lastMessage: TGMessage? = nil
         if let last = obj["last_message"] as? [String: Any],
            let msg = parseMessageObject(last, expectedChatId: id) {
             preview = msg.previewText
             lastDate = msg.date
             lastMessageId = msg.id
+            lastMessage = msg
         }
 
         var smallId: Int32? = nil
@@ -94,7 +96,7 @@ extension TelegramStore {
         chat.lastReadInboxMessageId = lastReadInboxMessageId
         chat.lastMessageId = lastMessageId
 
-        return (chat, smallId, bigId, bestPath)
+        return (chat, lastMessage, smallId, bigId, bestPath)
     }
 
     func parseChatKind(_ obj: [String: Any]) -> TGChatKind {
@@ -140,13 +142,13 @@ extension TelegramStore {
         return (chatId, order)
     }
 
-    func parseUpdateChatLastMessage(_ upd: String) -> (Int64, Int64, String, Int)? {
+    func parseUpdateChatLastMessage(_ upd: String) -> (Int64, TGMessage)? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "updateChatLastMessage" else { return nil }
         guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
         guard let last = obj["last_message"] as? [String: Any] else { return nil }
         guard let msg = parseMessageObject(last, expectedChatId: chatId) else { return nil }
-        return (chatId, msg.id, msg.previewText, msg.date)
+        return (chatId, msg)
     }
 
     // MARK: - User objects

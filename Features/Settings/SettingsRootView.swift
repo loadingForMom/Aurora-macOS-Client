@@ -421,6 +421,33 @@ private struct DataAndStorageSettingsView: View {
             Section("Автоудаление закэшированных медиа") {
                 Button("Настроить автоудаление (заглушка)") { }
             }
+
+#if DEBUG
+            Section("App DB (debug)") {
+                Button("Print DB stats") {
+                    store.printDatabaseStats()
+                }
+
+                if let stats = store.lastDatabaseStats {
+                    LabeledContent("Chats") {
+                        Text("\(stats.chats)")
+                            .foregroundStyle(.secondary)
+                    }
+                    LabeledContent("Messages") {
+                        Text("\(stats.messages)")
+                            .foregroundStyle(.secondary)
+                    }
+                    LabeledContent("Users") {
+                        Text("\(stats.users)")
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("No stats yet. Tap the button to print counts to console.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+#endif
         }
         .task {
             guard !didRequestInitialStats else { return }

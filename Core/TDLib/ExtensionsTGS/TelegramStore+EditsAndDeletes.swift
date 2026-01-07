@@ -28,6 +28,7 @@ extension TelegramStore {
         m.editedAt = editDate
         arr[idx] = m
         messagesByChatId[chatId] = sortChronological(arr)
+        persistMessage(m)
     }
 
     struct UpdateMessageContentParsed {
@@ -69,6 +70,7 @@ extension TelegramStore {
         arr[idx] = updated
         messagesByChatId[chatId] = sortChronological(arr)
         updateChatLastFromLocalTimeline(chatId: chatId)
+        persistMessage(updated)
     }
 
     struct UpdateDeleteMessagesParsed {
@@ -101,6 +103,7 @@ extension TelegramStore {
         }
 
         updateChatLastFromLocalTimeline(chatId: chatId)
+        deleteMessages(chatId: chatId, messageIds: messageIds)
     }
 
     func renderPreviewTextFromContent(_ content: [String: Any]) -> String {

@@ -12,6 +12,7 @@ extension TelegramStore {
         c.lastMessagePreview = preview
         c.lastMessageDate = date
         chatsById[chatId] = c
+        persistChat(c)
     }
 
     func applyChatReadInboxUpdate(chatId: Int64, lastReadInboxMessageId: Int64, unreadCount: Int32) {
@@ -19,6 +20,7 @@ extension TelegramStore {
         c.lastReadInboxMessageId = lastReadInboxMessageId
         c.unreadCount = unreadCount
         chatsById[chatId] = c
+        persistChat(c)
     }
 
     func requestUserIfNeeded(_ userId: Int64?) {

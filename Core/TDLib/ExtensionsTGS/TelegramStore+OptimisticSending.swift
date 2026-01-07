@@ -147,6 +147,7 @@ extension TelegramStore {
         arr = sortChronological(arr)
         if arr.count > 800 { arr.removeFirst(arr.count - 800) }
         messagesByChatId[msg.chatId] = arr
+        persistMessage(msg)
 
         if var c = chatsById[msg.chatId] {
             c.lastMessageId = msg.id
@@ -160,6 +161,8 @@ extension TelegramStore {
                 c.lastMessagePreview = msg.previewText
             }
             chatsById[msg.chatId] = c
+            persistChat(c)
+            persistChatLastMessage(chatId: msg.chatId, messageId: msg.id, preview: c.lastMessagePreview, date: msg.date)
         }
     }
 
@@ -172,6 +175,7 @@ extension TelegramStore {
         arr[idx] = m
         messagesByChatId[chatId] = sortChronological(arr)
         keepOptimisticChatPreviewIfNeeded(chatId: chatId)
+        persistMessage(m)
     }
 
     // MARK: - Reconciliation with TDLib

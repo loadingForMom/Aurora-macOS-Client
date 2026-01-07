@@ -20,6 +20,7 @@ extension TelegramStore {
         arr = sortChronological(arr)
         if arr.count > 800 { arr.removeFirst(arr.count - 800) }
         messagesByChatId[chatId] = arr
+        persistMessage(msg)
     }
 
     func replaceMessage(chatId: Int64, oldId: Int64, newMessage: TGMessage) {
@@ -32,6 +33,7 @@ extension TelegramStore {
         arr = sortChronological(arr)
         if arr.count > 800 { arr.removeFirst(arr.count - 800) }
         messagesByChatId[chatId] = arr
+        persistMessage(newMessage)
     }
 
     func keepOptimisticChatPreviewIfNeeded(chatId: Int64) {
@@ -53,6 +55,8 @@ extension TelegramStore {
         c.lastMessageDate = localLast.date
         c.lastMessageId = localLast.id
         chatsById[chatId] = c
+        persistChat(c)
+        persistChatLastMessage(chatId: chatId, messageId: localLast.id, preview: c.lastMessagePreview, date: localLast.date)
     }
 
     func updateChatLastFromLocalTimeline(chatId: Int64) {
@@ -69,6 +73,8 @@ extension TelegramStore {
                 c.lastMessagePreview = last.previewText
             }
             chatsById[chatId] = c
+            persistChat(c)
+            persistChatLastMessage(chatId: chatId, messageId: last.id, preview: c.lastMessagePreview, date: last.date)
         }
     }
 }
