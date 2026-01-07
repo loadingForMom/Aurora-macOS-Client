@@ -27,6 +27,7 @@ struct MessagesPane: View {
     // Cache rows so scroll-driven state updates don't force regrouping work.
     @State private var cachedRows: [Row] = []
     @State private var windowMessages: [TGMessage] = []
+    @State private var windowApplyToken = UUID()
 
     @State private var topVisibleGroupId: String? = nil
     @State private var topVisibleMessageId: Int64? = nil
@@ -116,12 +117,18 @@ struct MessagesPane: View {
     }
 
     private func applyWindowMessages(_ messages: [TGMessage], anchorGroupId: String?) {
-        DispatchQueue.main.async {
+        let expectedChatId = chat.id
+        let token = windowApplyToken
+        let filtered = messages.filter { $0.chatId == expectedChatId }
+
+        DispatchQueue.main.async { [token, expectedChatId, filtered] in
+            guard windowApplyToken == token else { return }
+            guard chat.id == expectedChatId else { return }
             if let anchorGroupId {
                 restoreAnchorGroupId = anchorGroupId
             }
-            windowMessages = messages
-            cachedRows = buildRows(messages)
+            windowMessages = filtered
+            cachedRows = buildRows(filtered)
         }
     }
 
@@ -428,6 +435,7 @@ struct MessagesPane: View {
                     showAfterInitialJump = false
                     cachedRows = []
                     windowMessages = []
+                    windowApplyToken = UUID()
 
                     isAtBottom = true
                     newIncomingCount = 0
