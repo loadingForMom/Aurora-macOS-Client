@@ -10,12 +10,14 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
 
     private let senderLabel = NSTextField(labelWithString: "")
     private let bubbleView = BubbleBackgroundView()
-    private let textView = NSTextView()
+    private let textLabel = NSTextField(labelWithAttributedString: NSAttributedString(string: ""))
     private let statusLabel = NSTextField(labelWithString: "")
     private let stack = NSStackView()
 
     private var leadingConstraint: NSLayoutConstraint?
     private var trailingConstraint: NSLayoutConstraint?
+
+    private var currentMessageId: Int64?
 
     var onRetry: (() -> Void)?
     var onDelete: (() -> Void)?
@@ -32,20 +34,20 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
         senderLabel.textColor = .secondaryLabelColor
         senderLabel.isHidden = true
 
-        textView.drawsBackground = false
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.textContainerInset = NSSize(width: 12, height: 8)
-        textView.textContainer?.lineFragmentPadding = 0
-        textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.heightTracksTextView = false
+        textLabel.drawsBackground = false
+        textLabel.isEditable = false
+        textLabel.isSelectable = true
+        textLabel.maximumNumberOfLines = 0
+        textLabel.lineBreakMode = .byWordWrapping
+        textLabel.setContentHuggingPriority(.required, for: .vertical)
+        textLabel.setContentCompressionResistancePriority(.required, for: .vertical)
 
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
 
         bubbleView.translatesAutoresizingMaskIntoConstraints = false
-        bubbleView.addSubview(textView)
-        textView.translatesAutoresizingMaskIntoConstraints = false
+        bubbleView.addSubview(textLabel)
+        textLabel.translatesAutoresizingMaskIntoConstraints = false
 
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -67,14 +69,21 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
 
             bubbleView.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.72),
 
-            textView.leadingAnchor.constraint(equalTo: bubbleView.leadingAnchor),
-            textView.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor),
-            textView.topAnchor.constraint(equalTo: bubbleView.topAnchor),
-            textView.bottomAnchor.constraint(equalTo: bubbleView.bottomAnchor)
+            textLabel.leadingAnchor.constraint(equalTo: bubbleView.leadingAnchor, constant: 12),
+            textLabel.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor, constant: -12),
+            textLabel.topAnchor.constraint(equalTo: bubbleView.topAnchor, constant: 8),
+            textLabel.bottomAnchor.constraint(equalTo: bubbleView.bottomAnchor, constant: -8)
         ])
     }
 
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        currentMessageId = nil
+        textLabel.attributedStringValue = NSAttributedString(string: "")
+    }
+
     func configure(with message: TGMessage, senderName: String?, renderer: MessageTextRenderer) {
+        currentMessageId = message.id
         senderLabel.stringValue = senderName ?? ""
         senderLabel.isHidden = senderName == nil
 
@@ -93,7 +102,8 @@ final class MessageCollectionViewItem: NSCollectionViewItem {
 
         let style = MessageTextStyle(fontSize: 14, isOutgoing: isOutgoing)
         renderer.render(message: message, style: style) { [weak self] attributed in
-            self?.textView.textStorage?.setAttributedString(attributed)
+            guard let self, self.currentMessageId == message.id else { return }
+            self.textLabel.attributedStringValue = attributed
         }
 
         statusLabel.attributedStringValue = statusAttributedString(for: message)
@@ -177,8 +187,9 @@ private final class BubbleBackgroundView: NSView {
     }
 
     private func updateAppearance() {
-        layer?.backgroundColor = (isOutgoing ? NSColor.systemBlue : NSColor.windowBackgroundColor.withAlphaComponent(0.9)).cgColor
-        layer?.borderColor = NSColor.black.withAlphaComponent(0.06).cgColor
+        let incomingColor = NSColor.controlBackgroundColor.withAlphaComponent(0.96)
+        layer?.backgroundColor = (isOutgoing ? NSColor.systemBlue : incomingColor).cgColor
+        layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
         layer?.borderWidth = 1
     }
 }

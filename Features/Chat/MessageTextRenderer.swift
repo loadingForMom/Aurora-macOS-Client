@@ -17,16 +17,19 @@ struct MessageTextStyle: Hashable {
 
 final class MessageTextRenderer {
     private final class CacheKey: NSObject {
+        let chatId: Int64
         let messageId: Int64
         let style: MessageTextStyle
 
-        init(messageId: Int64, style: MessageTextStyle) {
+        init(chatId: Int64, messageId: Int64, style: MessageTextStyle) {
+            self.chatId = chatId
             self.messageId = messageId
             self.style = style
         }
 
         override var hash: Int {
             var hasher = Hasher()
+            hasher.combine(chatId)
             hasher.combine(messageId)
             hasher.combine(style)
             return hasher.finalize()
@@ -34,7 +37,7 @@ final class MessageTextRenderer {
 
         override func isEqual(_ object: Any?) -> Bool {
             guard let other = object as? CacheKey else { return false }
-            return messageId == other.messageId && style == other.style
+            return chatId == other.chatId && messageId == other.messageId && style == other.style
         }
     }
 
@@ -46,9 +49,11 @@ final class MessageTextRenderer {
     private let signposter = OSSignposter(subsystem: "Aurora.Chat", category: "TextRender")
 
     func render(message: TGMessage, style: MessageTextStyle, completion: @escaping (NSAttributedString) -> Void) {
-        let key = CacheKey(messageId: message.id, style: style)
+        let key = CacheKey(chatId: message.chatId, messageId: message.id, style: style)
         if let cached = cache.object(forKey: key) {
-            log.debug("Text cache hit for message \\(message.id)")
+            #if DEBUG
+            log.debug("Text cache hit for message \(message.id)")
+            #endif
             completion(cached)
             return
         }
