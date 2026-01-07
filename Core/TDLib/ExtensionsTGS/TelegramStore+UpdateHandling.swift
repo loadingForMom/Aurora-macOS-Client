@@ -19,6 +19,9 @@ extension TelegramStore {
         }
 
         if let (chatId, lastMessageId, preview, date) = parseUpdateChatLastMessage(upd) {
+#if DEBUG
+            debugLogMessageEvent(label: "updateChatLastMessage", chatId: chatId, messageId: lastMessageId)
+#endif
             applyChatLastMessageUpdate(chatId: chatId, lastMessageId: lastMessageId, preview: preview, date: date)
             keepOptimisticChatPreviewIfNeeded(chatId: chatId)
         }
@@ -44,49 +47,12 @@ extension TelegramStore {
             refreshStorageStatistics()
         }
 
-        if let ids = parseChatsResponse(upd) {
-            for id in ids {
-                td.send(#"{"@type":"getChat","chat_id":\#(id)}"#)
-            }
-        }
-
-        if let (chat, smallId, bigId, bestPath) = parseChatObject(upd) {
-            chatsById[chat.id] = chat
-
-            if let p = bestPath {
-                chatAvatarPathByChatId[chat.id] = p
-            }
-
-            registerChatAvatar(chatId: chat.id, smallFileId: smallId, bigFileId: bigId, initialBestPath: bestPath)
-
-            if selectedChatId == nil {
-                selectedChatId = chat.id
-                loadLatestHistory(chatId: chat.id)
-            }
-        }
-
         if let (id, title) = parseUpdateChatTitle(upd) {
             if var c = chatsById[id] { c.title = title; chatsById[id] = c }
         }
 
         if let (chatId, order) = parseUpdateChatPosition(upd) {
             if var c = chatsById[chatId] { c.order = order; chatsById[chatId] = c }
-        }
-
-        // MARK: - Current user (me) + profile photo
-
-        if let (me, photoFileId, photoPath) = parseMeUserResponse(upd) {
-            myUserId = me.id
-            usersById[me.id] = me
-
-            if let p = photoPath {
-                myProfilePhotoPath = p
-            }
-
-            if let fid = photoFileId {
-                myPhotoFileId = fid
-                downloadMyPhotoIfNeeded(fileId: fid)
-            }
         }
 
         if let (u, photoFileId, photoPath) = parseUpdateUser(upt: upd) {
@@ -123,41 +89,119 @@ extension TelegramStore {
             usersById[user.id] = user
         }
 
-        if let storage = parseStorageStatisticsAny(upd) {
-            applyStorageStatistics(storage)
-        }
-
-        // Response message with @extra
-        if let msgResponse = parseMessageFunctionResponse(upd) {
-            handleFunctionResponseMessage(msgResponse)
-        }
-
         // Sending lifecycle updates
         if let succ = parseUpdateMessageSendSucceeded(upd) {
+#if DEBUG
+            debugLogMessageEvent(label: "updateMessageSendSucceeded", chatId: succ.message.chatId, messageId: succ.message.id)
+#endif
             handleSendSucceeded(succ)
         }
 
         if let fail = parseUpdateMessageSendFailed(upd) {
+#if DEBUG
+            debugLogMessageEvent(label: "updateMessageSendFailed", chatId: fail.message.chatId, messageId: fail.message.id)
+#endif
             handleSendFailed(fail)
         }
 
         // Edit / content changes
         if let edited = parseUpdateMessageEdited(upd) {
+#if DEBUG
+            debugLogMessageEvent(label: "updateMessageEdited", chatId: edited.chatId, messageId: edited.messageId)
+#endif
             applyMessageEdited(chatId: edited.chatId, messageId: edited.messageId, editDate: edited.editDate)
         }
 
         if let content = parseUpdateMessageContent(upd) {
+#if DEBUG
+            debugLogMessageEvent(label: "updateMessageContent", chatId: content.chatId, messageId: content.messageId)
+#endif
             applyMessageContentChanged(chatId: content.chatId, messageId: content.messageId, newContent: content.newContent)
         }
 
         // Deletions
         if let del = parseUpdateDeleteMessages(upd) {
+#if DEBUG
+            del.messageIds.forEach { debugLogMessageEvent(label: "updateDeleteMessages", chatId: del.chatId, messageId: $0) }
+#endif
             applyMessagesDeleted(chatId: del.chatId, messageIds: del.messageIds)
         }
 
+        // New messages
+        if let (chatId, msg) = parseUpdateNewMessage(upd) {
+#if DEBUG
+            debugLogMessageEvent(label: "updateNewMessage", chatId: chatId, messageId: msg.id)
+#endif
+            requestUserIfNeeded(msg.senderUserId)
+
+            if tryReconcileOutgoingPendingMessage(msg) {
+                // reconciled
+            } else {
+                appendMessage(msg, chatId: chatId)
+            }
+
+            updateChatLastFromLocalTimeline(chatId: chatId)
+        }
+    }
+
+    func handleResponse(_ resp: String) {
+        if let ids = parseChatsResponse(resp) {
+            for id in ids {
+                td.send(#"{"@type":"getChat","chat_id":\#(id)}"#)
+            }
+        }
+
+        if let (chat, smallId, bigId, bestPath) = parseChatObject(resp) {
+            chatsById[chat.id] = chat
+
+            if let p = bestPath {
+                chatAvatarPathByChatId[chat.id] = p
+            }
+
+            registerChatAvatar(chatId: chat.id, smallFileId: smallId, bigFileId: bigId, initialBestPath: bestPath)
+
+            if selectedChatId == nil {
+                selectedChatId = chat.id
+                loadLatestHistory(chatId: chat.id)
+            }
+        }
+
+        // MARK: - Current user (me) + profile photo
+
+        if let (me, photoFileId, photoPath) = parseMeUserResponse(resp) {
+            myUserId = me.id
+            usersById[me.id] = me
+
+            if let p = photoPath {
+                myProfilePhotoPath = p
+            }
+
+            if let fid = photoFileId {
+                myPhotoFileId = fid
+                downloadMyPhotoIfNeeded(fileId: fid)
+            }
+        }
+
+        if let user = parseUserObject(resp) {
+            usersById[user.id] = user
+        }
+
+        if let storage = parseStorageStatisticsAny(resp) {
+            applyStorageStatistics(storage)
+        }
+
+        // Response message with @extra
+        if let msgResponse = parseMessageFunctionResponse(resp) {
+            handleFunctionResponseMessage(msgResponse)
+        }
+
         // History responses
-        if let res = parseMessagesResponse(upd), var job = historyJobs[res.extra] {
+        if let res = parseMessagesResponse(resp), var job = historyJobs[res.extra] {
             for m in res.messages {
+#if DEBUG
+                debugLogMessageEvent(label: "getChatHistory", chatId: job.chatId, messageId: m.id)
+                assert(m.chatId == job.chatId, "TDLib history message chatId mismatch: expected \(job.chatId) got \(m.chatId)")
+#endif
                 job.accById[m.id] = m
                 requestUserIfNeeded(m.senderUserId)
             }
@@ -195,18 +239,11 @@ extension TelegramStore {
                                 extra: res.extra)
             }
         }
-
-        // New messages
-        if let (chatId, msg) = parseUpdateNewMessage(upd) {
-            requestUserIfNeeded(msg.senderUserId)
-
-            if tryReconcileOutgoingPendingMessage(msg) {
-                // reconciled
-            } else {
-                appendMessage(msg, chatId: chatId)
-            }
-
-            updateChatLastFromLocalTimeline(chatId: chatId)
-        }
     }
+
+#if DEBUG
+    private func debugLogMessageEvent(label: String, chatId: Int64, messageId: Int64) {
+        print("[TDLib] \(label) chatId=\(chatId) messageId=\(messageId)")
+    }
+#endif
 }
