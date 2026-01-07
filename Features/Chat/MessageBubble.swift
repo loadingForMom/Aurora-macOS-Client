@@ -40,7 +40,9 @@ struct MessageBubble: View {
 
     var body: some View {
 #if DEBUG
-        assert(msg.chatId == currentChatId, "Message chatId mismatch: expected \(currentChatId) got \(msg.chatId)")
+        let _ = { () -> Void in
+            assert(msg.chatId == currentChatId, "Message chatId mismatch: expected \(currentChatId) got \(msg.chatId)")
+        }()
 #endif
         let reveal = min(max(0, revealTimeX), maxReveal)
         let isRevealingTime = reveal > 0.5
