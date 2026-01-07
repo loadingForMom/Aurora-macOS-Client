@@ -172,13 +172,13 @@ final class ChatTimelineNSView: NSView {
             documentContainer.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
             documentContainer.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
             documentContainer.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
-            documentContainer.bottomAnchor.constraint(equalTo: scrollView.contentView.bottomAnchor),
+            documentContainer.bottomAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.bottomAnchor),
             documentContainer.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
 
             collectionView.leadingAnchor.constraint(equalTo: documentContainer.leadingAnchor),
             collectionView.trailingAnchor.constraint(equalTo: documentContainer.trailingAnchor),
             collectionView.topAnchor.constraint(equalTo: documentContainer.topAnchor),
-            collectionView.bottomAnchor.constraint(equalTo: documentContainer.bottomAnchor)
+            documentContainer.bottomAnchor.constraint(equalTo: collectionView.bottomAnchor)
         ])
 
         scrollView.contentView.postsBoundsChangedNotifications = true
@@ -282,11 +282,17 @@ final class ChatTimelineNSView: NSView {
         let firstVisibleIndex = indices.min()
         let lastVisibleIndex = indices.max()
 
-        let contentHeight = collectionView.bounds.height
+        let contentHeight = collectionView.collectionViewLayout?.collectionViewContentSize.height ?? collectionView.frame.height
         let offsetY = scrollView.contentView.bounds.origin.y
         let viewportHeight = scrollView.contentView.bounds.height
         let distanceToBottom = contentHeight - (offsetY + viewportHeight)
         let isAtBottom = distanceToBottom <= bottomThreshold
+
+        #if DEBUG
+        if let firstVisibleIndex, let lastVisibleIndex {
+            print("ChatTimeline scroll chatId=\(viewModel.chat.id) first=\(firstVisibleIndex) last=\(lastVisibleIndex) offsetY=\(offsetY) viewport=\(viewportHeight) content=\(contentHeight) distance=\(distanceToBottom)")
+        }
+        #endif
 
         viewModel.handleScroll(firstVisibleIndex: firstVisibleIndex, lastVisibleIndex: lastVisibleIndex, isAtBottom: isAtBottom)
     }

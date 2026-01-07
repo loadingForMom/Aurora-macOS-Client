@@ -187,8 +187,9 @@ private final class BubbleBackgroundView: NSView {
     }
 
     private func updateAppearance() {
-        layer?.backgroundColor = (isOutgoing ? NSColor.systemBlue : NSColor.windowBackgroundColor.withAlphaComponent(0.9)).cgColor
-        layer?.borderColor = NSColor.black.withAlphaComponent(0.06).cgColor
+        let incomingColor = NSColor.controlBackgroundColor.withAlphaComponent(0.96)
+        layer?.backgroundColor = (isOutgoing ? NSColor.systemBlue : incomingColor).cgColor
+        layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
         layer?.borderWidth = 1
     }
 }
