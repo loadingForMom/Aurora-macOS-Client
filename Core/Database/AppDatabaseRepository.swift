@@ -170,17 +170,35 @@ final class AppDatabaseRepository {
                     SELECT chat_id, message_id, date, sender_user_id, is_outgoing, text,
                            send_state, send_state_error, can_retry, edited_at, sending_id
                     FROM messages
-                    WHERE chat_id = ?
+                    WHERE chat_id = :chatId
                     ORDER BY message_id DESC
-                    LIMIT ?
+                    LIMIT :limit
                     """,
-                    arguments: [chatId, limit]
+                    arguments: StatementArguments([
+                        "chatId": chatId,
+                        "limit": limit
+                    ])
                 )
                 let messages = rows.map(mapMessageRow)
 #if DEBUG
-                assert(messages.allSatisfy { $0.chatId == chatId }, "DB invariant failed: mismatched chat_id in fetchLatestMessages")
+                if let bad = messages.first(where: { $0.chatId != chatId }) {
+                    assertionFailure("DB returned wrong chatId: expected \(chatId), got \(bad.chatId)")
+                }
 #endif
-                return messages
+                let filtered = messages.filter { $0.chatId == chatId }
+#if !DEBUG
+                if filtered.count != messages.count {
+                    struct LogOnce { static var didLog = false }
+                    if !LogOnce.didLog {
+                        LogOnce.didLog = true
+                        print("[DB] fetchLatestMessages dropped \(messages.count - filtered.count) rows for chatId=\(chatId)")
+                    }
+                }
+#endif
+#if DEBUG
+                assert(filtered.allSatisfy { $0.chatId == chatId }, "DB invariant failed: mismatched chat_id in fetchLatestMessages")
+#endif
+                return filtered
             }
         } catch {
             print("[DB] fetchLatestMessages failed: \(error)")
@@ -197,17 +215,36 @@ final class AppDatabaseRepository {
                     SELECT chat_id, message_id, date, sender_user_id, is_outgoing, text,
                            send_state, send_state_error, can_retry, edited_at, sending_id
                     FROM messages
-                    WHERE chat_id = ? AND message_id < ?
+                    WHERE chat_id = :chatId AND message_id < :before
                     ORDER BY message_id DESC
-                    LIMIT ?
+                    LIMIT :limit
                     """,
-                    arguments: [chatId, beforeMessageId, limit]
+                    arguments: StatementArguments([
+                        "chatId": chatId,
+                        "before": beforeMessageId,
+                        "limit": limit
+                    ])
                 )
                 let messages = rows.map(mapMessageRow)
 #if DEBUG
-                assert(messages.allSatisfy { $0.chatId == chatId }, "DB invariant failed: mismatched chat_id in fetchOlderMessages")
+                if let bad = messages.first(where: { $0.chatId != chatId }) {
+                    assertionFailure("DB returned wrong chatId: expected \(chatId), got \(bad.chatId)")
+                }
 #endif
-                return messages
+                let filtered = messages.filter { $0.chatId == chatId }
+#if !DEBUG
+                if filtered.count != messages.count {
+                    struct LogOnce { static var didLog = false }
+                    if !LogOnce.didLog {
+                        LogOnce.didLog = true
+                        print("[DB] fetchOlderMessages dropped \(messages.count - filtered.count) rows for chatId=\(chatId)")
+                    }
+                }
+#endif
+#if DEBUG
+                assert(filtered.allSatisfy { $0.chatId == chatId }, "DB invariant failed: mismatched chat_id in fetchOlderMessages")
+#endif
+                return filtered
             }
         } catch {
             print("[DB] fetchOlderMessages failed: \(error)")
