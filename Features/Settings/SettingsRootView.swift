@@ -66,7 +66,7 @@ struct SettingsRootView: View {
                 Group {
                     switch selection {
                     case .general:
-                        GeneralSettingsView()
+                        GeneralSettingsView(store: store)
                     case .notifications:
                         NotificationsSettingsView()
                     case .privacy:
@@ -172,12 +172,67 @@ private struct SidebarProfileHeader: View {
 // MARK: - Panes
 
 private struct GeneralSettingsView: View {
+    @ObservedObject var store: TelegramStore
     @AppStorage("general_energy_saving") private var energySaving = false
     @AppStorage("general_spellcheck") private var spellcheck = true
     @AppStorage("general_interface_style") private var interfaceStyle = 0
 
+    @State private var accountAction: AccountAction?
+
+    private enum AccountAction: Identifiable {
+        case logout
+        case switchAccount
+
+        var id: String {
+            switch self {
+            case .logout: return "logout"
+            case .switchAccount: return "switchAccount"
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .logout: return "Выйти из аккаунта"
+            case .switchAccount: return "Сменить аккаунт"
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .logout:
+                return "Вы выйдете из текущего аккаунта Telegram на этом устройстве."
+            case .switchAccount:
+                return "Вы выйдете из текущего аккаунта, чтобы войти в другой."
+            }
+        }
+
+        var confirmTitle: String {
+            switch self {
+            case .logout: return "Выйти"
+            case .switchAccount: return "Сменить аккаунт"
+            }
+        }
+    }
+
     var body: some View {
         Form {
+            Section("Аккаунт") {
+                LabeledContent("Текущий пользователь") {
+                    Text(store.myDisplayName.isEmpty ? "—" : store.myDisplayName)
+                        .foregroundStyle(.secondary)
+                }
+
+                Button("Сменить аккаунт") {
+                    accountAction = .switchAccount
+                }
+                .disabled(!store.isAuthorized)
+
+                Button("Выйти из аккаунта") {
+                    accountAction = .logout
+                }
+                .disabled(!store.isAuthorized)
+            }
+
             Section("Общие") {
                 Toggle("Энергосбережение", isOn: $energySaving)
                 Toggle("Грамматика и орфография", isOn: $spellcheck)
@@ -207,6 +262,30 @@ private struct GeneralSettingsView: View {
                 Button("Вывод (заглушка)") { }
             }
         }
+        .alert("Аккаунт Telegram", isPresented: accountActionBinding) {
+            if let action = accountAction {
+                Button(action.confirmTitle, role: .destructive) {
+                    store.logOut()
+                    accountAction = nil
+                }
+            }
+            Button("Отмена", role: .cancel) {
+                accountAction = nil
+            }
+        } message: {
+            if let action = accountAction {
+                Text(action.message)
+            }
+        }
+    }
+
+    private var accountActionBinding: Binding<Bool> {
+        Binding(
+            get: { accountAction != nil },
+            set: { newValue in
+                if !newValue { accountAction = nil }
+            }
+        )
     }
 }
 

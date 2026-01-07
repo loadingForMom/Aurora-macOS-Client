@@ -44,59 +44,65 @@ struct ContentView: View {
         let baseChats = store.sortedChats
         let chats = filteredChats(baseChats, query: searchText)
 
-        NavigationSplitView {
-            List(selection: $store.selectedChatId) {
-                ForEach(chats) { chat in
-                    ChatRow(
-                        chat: chat,
-                        previewText: sidebarPreview(for: chat),
-                        avatarPath: avatarPath(for: chat.id)
-                    )
-                    .tag(chat.id as Int64?)
+        ZStack {
+            NavigationSplitView {
+                List(selection: $store.selectedChatId) {
+                    ForEach(chats) { chat in
+                        ChatRow(
+                            chat: chat,
+                            previewText: sidebarPreview(for: chat),
+                            avatarPath: avatarPath(for: chat.id)
+                        )
+                        .tag(chat.id as Int64?)
+                    }
                 }
-            }
-            .listStyle(.sidebar)
-            .searchable(text: $searchText, placement: .sidebar)
-        } detail: {
-            Group {
-                if let chat = selectedChat {
-                    ChatScreen(store: store, chat: chat)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .toolbar {
-                            ToolbarItem(placement: .principal) {
-                                ChatTitleButtonInline(
-                                    title: chat.title,
-                                    avatarPath: avatarPath(for: chat.id)
-                                )
-                                .onTapGesture {
-                                    inspectorShown.toggle()
+                .listStyle(.sidebar)
+                .searchable(text: $searchText, placement: .sidebar)
+            } detail: {
+                Group {
+                    if let chat = selectedChat {
+                        ChatScreen(store: store, chat: chat)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .toolbar {
+                                ToolbarItem(placement: .principal) {
+                                    ChatTitleButtonInline(
+                                        title: chat.title,
+                                        avatarPath: avatarPath(for: chat.id)
+                                    )
+                                    .onTapGesture {
+                                        inspectorShown.toggle()
+                                    }
                                 }
                             }
-                        }
-                } else {
-                    ContentUnavailableView("Select a chat", systemImage: "bubble.left.and.bubble.right")
-                        .foregroundStyle(.secondary)
+                    } else {
+                        ContentUnavailableView("Select a chat", systemImage: "bubble.left.and.bubble.right")
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
-        }
-        .inspector(isPresented: $inspectorShown) {
-            if let chat = selectedChat {
-                ChatInspectorView(chat: chat)
-                    .inspectorColumnWidth(min: 320, ideal: 360, max: 420)
-            } else {
-                ContentUnavailableView("No chat selected", systemImage: "sidebar.right")
-                    .padding(16)
-                    .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
+            .inspector(isPresented: $inspectorShown) {
+                if let chat = selectedChat {
+                    ChatInspectorView(chat: chat)
+                        .inspectorColumnWidth(min: 320, ideal: 360, max: 420)
+                } else {
+                    ContentUnavailableView("No chat selected", systemImage: "sidebar.right")
+                        .padding(16)
+                        .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
+                }
             }
-        }
-        .task {
-            if let id = store.selectedChatId {
-                store.selectChat(id, forceReload: false)
+            .task {
+                if let id = store.selectedChatId {
+                    store.selectChat(id, forceReload: false)
+                }
             }
-        }
-        .onChange(of: store.selectedChatId) { _, newChatId in
-            guard let id = newChatId else { return }
-            store.selectChat(id)
+            .onChange(of: store.selectedChatId) { _, newChatId in
+                guard let id = newChatId else { return }
+                store.selectChat(id)
+            }
+
+            if !store.isAuthorized {
+                TelegramLoginView(store: store)
+            }
         }
     }
 }
@@ -122,5 +128,175 @@ struct ChatTitleButtonInline: View {
         .contentShape(Rectangle())
         .padding(.vertical, 2)
         .padding(.horizontal, 6)
+    }
+}
+
+private struct TelegramLoginView: View {
+    @ObservedObject var store: TelegramStore
+
+    @State private var phoneNumber: String = ""
+    @State private var authCode: String = ""
+    @State private var password: String = ""
+
+    @FocusState private var focusedField: Field?
+
+    private enum Field {
+        case phone
+        case code
+        case password
+    }
+
+    private enum AuthStep {
+        case phone
+        case code
+        case password
+        case other(title: String, message: String)
+        case pending(message: String)
+    }
+
+    private var authStep: AuthStep {
+        switch store.authState {
+        case "authorizationStateWaitPhoneNumber":
+            return .phone
+        case "authorizationStateWaitCode":
+            return .code
+        case "authorizationStateWaitPassword":
+            return .password
+        case "authorizationStateWaitOtherDeviceConfirmation":
+            return .other(
+                title: "Подтверждение входа",
+                message: "Подтвердите вход на другом устройстве в Telegram."
+            )
+        case "authorizationStateWaitTdlibParameters":
+            return .pending(message: "Подготавливаем вход в Telegram…")
+        case "authorizationStateLoggingOut":
+            return .pending(message: "Выходим из аккаунта…")
+        default:
+            return .pending(message: "Подключаемся к Telegram…")
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            Color(nsColor: .windowBackgroundColor)
+                .ignoresSafeArea()
+
+            VStack(spacing: 20) {
+                VStack(spacing: 6) {
+                    Text("Telegram")
+                        .font(.system(size: 24, weight: .semibold))
+                    Text("Вход в аккаунт")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+
+                loginContent
+            }
+            .padding(32)
+            .frame(maxWidth: 420)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+            )
+            .padding(24)
+        }
+    }
+
+    @ViewBuilder
+    private var loginContent: some View {
+        switch authStep {
+        case .phone:
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Введите номер телефона в международном формате.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+
+                TextField("+7 999 123-45-67", text: $phoneNumber)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .phone)
+                    .onSubmit {
+                        submitPhoneIfPossible()
+                    }
+
+                Button("Отправить код") {
+                    submitPhoneIfPossible()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(phoneNumber.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        case .code:
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Введите код подтверждения из Telegram.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+
+                TextField("Код подтверждения", text: $authCode)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .code)
+                    .onSubmit {
+                        submitCodeIfPossible()
+                    }
+
+                Button("Подтвердить код") {
+                    submitCodeIfPossible()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(authCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        case .password:
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Введите пароль двухэтапной аутентификации.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+
+                SecureField("Пароль", text: $password)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .password)
+                    .onSubmit {
+                        submitPasswordIfPossible()
+                    }
+
+                Button("Войти") {
+                    submitPasswordIfPossible()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        case let .other(title, message):
+            VStack(spacing: 8) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(message)
+                    .font(.system(size: 12))
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+            }
+        case let .pending(message):
+            VStack(spacing: 10) {
+                ProgressView()
+                Text(message)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func submitPhoneIfPossible() {
+        let trimmed = phoneNumber.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        store.submitPhoneNumber(trimmed)
+    }
+
+    private func submitCodeIfPossible() {
+        let trimmed = authCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        store.submitAuthCode(trimmed)
+    }
+
+    private func submitPasswordIfPossible() {
+        let trimmed = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        store.submitAuthPassword(trimmed)
     }
 }

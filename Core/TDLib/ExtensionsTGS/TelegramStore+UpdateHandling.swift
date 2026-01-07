@@ -8,7 +8,14 @@ extension TelegramStore {
 
     func handleUpdate(_ upd: String) {
         if let st = parseAuthState(from: upd) {
+            let previous = authState
             authState = st
+
+            if st == "authorizationStateClosed" {
+                resetSessionState()
+            } else if previous == "authorizationStateReady", st != "authorizationStateReady" {
+                resetSessionState()
+            }
         }
 
         if let (chatId, lastMessageId, preview, date) = parseUpdateChatLastMessage(upd) {
@@ -203,4 +210,3 @@ extension TelegramStore {
         }
     }
 }
-

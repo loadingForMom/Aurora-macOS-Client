@@ -148,6 +148,10 @@ final class TelegramStore: ObservableObject {
         return usersById[id]?.displayName ?? ""
     }
 
+    var isAuthorized: Bool {
+        authState == "authorizationStateReady"
+    }
+
     // MARK: - Public API (UI calls)
 
     func selectChat(_ chatId: Int64, forceReload: Bool = false) {
@@ -222,5 +226,75 @@ final class TelegramStore: ObservableObject {
     func pushLog(_ s: String) {
         logs.append(s)
         if logs.count > 250 { logs.removeFirst(logs.count - 250) }
+    }
+
+    // MARK: - Authorization
+
+    func submitPhoneNumber(_ phoneNumber: String) {
+        let req: [String: Any] = [
+            "@type": "setAuthenticationPhoneNumber",
+            "phone_number": phoneNumber
+        ]
+        sendJSON(req)
+    }
+
+    func submitAuthCode(_ code: String) {
+        let req: [String: Any] = [
+            "@type": "checkAuthenticationCode",
+            "code": code
+        ]
+        sendJSON(req)
+    }
+
+    func submitAuthPassword(_ password: String) {
+        let req: [String: Any] = [
+            "@type": "checkAuthenticationPassword",
+            "password": password
+        ]
+        sendJSON(req)
+    }
+
+    func logOut() {
+        authState = "authorizationStateLoggingOut"
+        resetSessionState()
+        sendJSON(["@type": "logOut"])
+    }
+
+    func resetSessionState() {
+        chatsById = [:]
+        usersById = [:]
+        messagesByChatId = [:]
+        selectedChatId = nil
+        isLoadingHistory = false
+
+        storageByFileType = []
+        storageTotalBytes = 0
+        storageLastRefreshedAt = nil
+        storageExtrasInFlight = []
+        didRequestInitialStorageStats = false
+
+        myUserId = nil
+        myProfilePhotoPath = nil
+
+        chatAvatarPathByChatId = [:]
+        chatAvatarMetaByChatId = [:]
+        chatIdByAvatarFileId = [:]
+        requestedAvatarFileIds = []
+        myPhotoFileId = nil
+
+        lastParsedUpdate = nil
+        lastParsedObject = nil
+
+        pendingByLocalId = [:]
+        localIdBySendingId = [:]
+        localIdByTempMessageId = [:]
+        nextLocalTempId = -1
+
+        historyJobs = [:]
+        reachedHistoryStart = []
+
+        didLoadInitialData = false
+        didSendTdlibParameters = false
+        didRequestInitialStorageStats = false
     }
 }
