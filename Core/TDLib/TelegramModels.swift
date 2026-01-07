@@ -98,25 +98,61 @@ struct TGMessage: Identifiable, Hashable {
     let date: Int
     let isOutgoing: Bool
     let senderUserId: Int64?
+
+    /// Preview / fallback text (what you already used everywhere).
     let text: String
-    let contentType: String = "messageText"
-    let rawText: String? = nil
-    let entities: [TGTextEntity] = []
+
+    /// correctness-first rendering payload
+    let contentType: String
+    let rawText: String?
+    let entities: [TGTextEntity]
 
     // Optimistic / sending state
-    var sendState: TGMessageSendState = .sent
+    var sendState: TGMessageSendState
 
     /// Local identity for UI bookkeeping (optimistic placeholder ↔ TDLib message).
-    var localId: UUID? = nil
+    var localId: UUID?
 
     /// TDLib sending_id (goes into messageSendOptions.sending_id, then echoes back in messageSendingStatePending.sending_id).
-    var sendingId: Int32? = nil
+    var sendingId: Int32?
 
     /// From TDLib updateMessageEdited.edit_date (Unix time). Content changes come via updateMessageContent.
-    var editedAt: Int? = nil
+    var editedAt: Int?
 
     /// From TDLib messageSendingStateFailed.can_retry (and/or sending_state.failed.can_retry).
-    var canRetry: Bool = false
+    var canRetry: Bool
+
+    init(
+        id: Int64,
+        chatId: Int64,
+        date: Int,
+        isOutgoing: Bool,
+        senderUserId: Int64?,
+        text: String,
+        contentType: String = "messageText",
+        rawText: String? = nil,
+        entities: [TGTextEntity] = [],
+        sendState: TGMessageSendState = .sent,
+        localId: UUID? = nil,
+        sendingId: Int32? = nil,
+        editedAt: Int? = nil,
+        canRetry: Bool = false
+    ) {
+        self.id = id
+        self.chatId = chatId
+        self.date = date
+        self.isOutgoing = isOutgoing
+        self.senderUserId = senderUserId
+        self.text = text
+        self.contentType = contentType
+        self.rawText = rawText
+        self.entities = entities
+        self.sendState = sendState
+        self.localId = localId
+        self.sendingId = sendingId
+        self.editedAt = editedAt
+        self.canRetry = canRetry
+    }
 
     var isEdited: Bool {
         if let t = editedAt { return t > 0 }
