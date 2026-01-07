@@ -66,13 +66,12 @@ final class MessageTextRenderer {
 
         guard shouldRender else { return }
 
-        let signpostId = signposter.makeSignpostID()
-        signposter.beginInterval("RenderMessage", id: signpostId)
+        let intervalState = signposter.beginInterval("RenderMessage")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let attributed = Self.buildAttributedString(message: message, style: style)
             self?.cache.setObject(attributed, forKey: key)
-            self?.signposter.endInterval("RenderMessage", id: signpostId)
+            self?.signposter.endInterval("RenderMessage", intervalState)
 
             let callbacks = self?.lock.sync { () -> [((NSAttributedString) -> Void)] in
                 let list = self?.inFlight[key] ?? []
