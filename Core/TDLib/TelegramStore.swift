@@ -119,12 +119,17 @@ final class TelegramStore: ObservableObject {
 
         imageMemCache.countLimit = 256
 
-        td.startReceiveLoop { [weak self] upd in
+        td.startEventLoop(onUpdate: { [weak self] upd in
             Task { @MainActor in
                 self?.pushLog(upd)
                 self?.handleUpdate(upd)
             }
-        }
+        }, onResponse: { [weak self] resp in
+            Task { @MainActor in
+                self?.pushLog(resp)
+                self?.handleResponse(resp)
+            }
+        })
 
         td.send(#"{"@type":"getOption","name":"version"}"#)
 

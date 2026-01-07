@@ -28,6 +28,20 @@ final class TDLibClient {
         }
     }
 
+    func send(function: [String: Any]) {
+        guard JSONSerialization.isValidJSONObject(function),
+              let data = try? JSONSerialization.data(withJSONObject: function),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        send(json)
+    }
+
+    func receive(timeout: Double) -> String? {
+        guard let client else { return nil }
+        guard let cstr = td_json_client_receive(client, timeout) else { return nil }
+        return String(cString: cstr)
+    }
+
     func send(_ json: String) {
         sendQueue.async { [weak self] in
             guard let self, let client = self.client else { return }
@@ -35,7 +49,7 @@ final class TDLibClient {
         }
     }
 
-    func startReceiveLoop(onUpdate: @escaping (String) -> Void) {
+    func startEventLoop(onUpdate: @escaping (String) -> Void, onResponse: @escaping (String) -> Void) {
         // Prevent accidental double-start.
         guard !isRunning else { return }
         isRunning = true
@@ -43,9 +57,12 @@ final class TDLibClient {
         receiveQueue.async { [weak self] in
             guard let self else { return }
             while self.isRunning {
-                guard let client = self.client else { return }
-                if let cstr = td_json_client_receive(client, 1.0) {
-                    onUpdate(String(cString: cstr))
+                if let json = self.receive(timeout: 1.0) {
+                    if self.isUpdate(json) {
+                        onUpdate(json)
+                    } else {
+                        onResponse(json)
+                    }
                 }
             }
         }
@@ -53,5 +70,13 @@ final class TDLibClient {
 
     func stop() {
         isRunning = false
+    }
+
+    private func isUpdate(_ json: String) -> Bool {
+        guard let data = json.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let type = obj["@type"] as? String
+        else { return false }
+        return type.hasPrefix("update")
     }
 }

@@ -189,7 +189,8 @@ extension TelegramStore {
         let extra = obj["@extra"] as? String
         guard extra != nil else { return nil }
 
-        guard let msg = parseMessageObject(obj) else { return nil }
+        let expectedChatId = (obj["chat_id"] as? NSNumber)?.int64Value
+        guard let msg = parseMessageObject(obj, expectedChatId: expectedChatId) else { return nil }
         return FunctionResponseMessage(extra: extra, message: msg, raw: obj)
     }
 
@@ -210,7 +211,8 @@ extension TelegramStore {
         guard (obj["@type"] as? String) == "updateMessageSendSucceeded" else { return nil }
         guard let oldNum = obj["old_message_id"] as? NSNumber else { return nil }
         guard let msgObj = obj["message"] as? [String: Any] else { return nil }
-        guard let msg = parseMessageObject(msgObj) else { return nil }
+        let expectedChatId = (msgObj["chat_id"] as? NSNumber)?.int64Value
+        guard let msg = parseMessageObject(msgObj, expectedChatId: expectedChatId) else { return nil }
         return SendSucceeded(message: msg, oldMessageId: oldNum.int64Value)
     }
 
@@ -226,7 +228,8 @@ extension TelegramStore {
         guard (obj["@type"] as? String) == "updateMessageSendFailed" else { return nil }
         guard let oldNum = obj["old_message_id"] as? NSNumber else { return nil }
         guard let msgObj = obj["message"] as? [String: Any] else { return nil }
-        guard var msg = parseMessageObject(msgObj) else { return nil }
+        let expectedChatId = (msgObj["chat_id"] as? NSNumber)?.int64Value
+        guard var msg = parseMessageObject(msgObj, expectedChatId: expectedChatId) else { return nil }
 
         var errText = "Failed to send"
         if let e = obj["error"] as? [String: Any] {
