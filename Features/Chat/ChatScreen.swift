@@ -14,7 +14,7 @@ struct ChatScreen: View {
     @State private var draft: String = ""
 
     var body: some View {
-        MessagesPane(store: store, chat: chat)
+        ChatTimelineContainer(store: store, chat: chat)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 GlassComposerBar(
                     text: $draft,
