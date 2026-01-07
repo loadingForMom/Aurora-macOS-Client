@@ -26,7 +26,7 @@ extension TelegramStore {
         updateChatLastFromLocalTimeline(chatId: chatId)
 
         let elapsed = Date().timeIntervalSince(start)
-        log.info("Stress mode generated \(count) messages in \(elapsed, format: .fixed(3))s")
+        log.info("Stress mode generated \(count) messages in \(elapsed, format: .fixed(precision: 3))s")
     }
 }
 
