@@ -46,9 +46,10 @@ struct ChatMessageGroupView: View {
             }
 
             VStack(alignment: group.isOutgoing ? .trailing : .leading, spacing: 4) {
-                ForEach(group.messages) { msg in
+                ForEach(group.messages, id: \.messageKey) { msg in
                     MessageBubble(
                         msg: msg,
+                        currentChatId: chat.id,
                         revealTimeX: revealTimeX,
                         onRetry: { store.retrySend(message: msg) },
                         onDelete: { store.deleteMessages(chatId: msg.chatId, messageIds: [msg.id], revoke: true) }
@@ -69,11 +70,13 @@ struct ChatMessageGroupView: View {
                 }
             }
         }
-        .onAppear {
-            guard !group.isOutgoing else { return }
-            let ids = group.messages.map { $0.id }
+    .onAppear {
+        guard !group.isOutgoing else { return }
+        let ids = group.messages.map { $0.id }
+        DispatchQueue.main.async {
             store.viewMessages(chatId: chat.id, messageIds: ids, forceRead: false)
         }
+    }
         .frame(maxWidth: .infinity, alignment: group.isOutgoing ? .trailing : .leading)
         .padding(.vertical, 2)
     }
