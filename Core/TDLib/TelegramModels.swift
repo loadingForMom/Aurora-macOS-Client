@@ -127,6 +127,10 @@ struct TGMessage: Identifiable, Hashable {
 
     var previewText: String { text }
 
+    var messageKey: MessageKey {
+        MessageKey(chatId: chatId, messageId: id)
+    }
+
     func withLocal(localId: UUID?, sendingId: Int32?) -> TGMessage {
         var m = self
         m.localId = localId

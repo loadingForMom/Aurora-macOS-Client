@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import Foundation
 
 struct MessagesPane: View {
     static let scrollSpaceName = "Aurora.ChatScrollSpace"
@@ -25,6 +26,12 @@ struct MessagesPane: View {
 
     // Cache rows so scroll-driven state updates don't force regrouping work.
     @State private var cachedRows: [Row] = []
+    @State private var windowMessages: [TGMessage] = []
+
+    @State private var topVisibleGroupId: String? = nil
+    @State private var topVisibleMessageId: Int64? = nil
+    @State private var visibleMinMessageId: Int64? = nil
+    @State private var visibleMaxMessageId: Int64? = nil
 
     // Initial positioning: open chat at the newest message.
     @State private var didInitialScrollToBottom: Bool = false
@@ -85,7 +92,47 @@ struct MessagesPane: View {
 
         restoreAnchorGroupId = anchorGroupId
         pagingInFlight = true
+
+        fetchOlderMessages(beforeMessageId: anchorMessageId, anchorGroupId: anchorGroupId)
         store.loadMoreHistory(chatId: chat.id, anchorMessageId: anchorMessageId)
+    }
+
+    private func fetchLatestMessages() {
+        guard let repo = store.databaseRepository else { return }
+        let limit = store.historyWindowLimitByChatId[chat.id] ?? 160
+        let latest = repo.fetchLatestMessages(chatId: chat.id, limit: limit)
+        applyWindowMessages(store.sortChronological(latest), anchorGroupId: nil)
+    }
+
+    private func fetchOlderMessages(beforeMessageId: Int64, anchorGroupId: String) {
+        guard let repo = store.databaseRepository else { return }
+        let older = repo.fetchOlderMessages(chatId: chat.id, beforeMessageId: beforeMessageId, limit: 80)
+        guard !older.isEmpty else { return }
+        let sortedOlder = store.sortChronological(older)
+        let existingKeys = Set(windowMessages.map { $0.messageKey })
+        let filteredOlder = sortedOlder.filter { !existingKeys.contains($0.messageKey) }
+        guard !filteredOlder.isEmpty else { return }
+        applyWindowMessages(filteredOlder + windowMessages, anchorGroupId: anchorGroupId)
+    }
+
+    private func applyWindowMessages(_ messages: [TGMessage], anchorGroupId: String?) {
+        DispatchQueue.main.async {
+            if let anchorGroupId {
+                restoreAnchorGroupId = anchorGroupId
+            }
+            windowMessages = messages
+            cachedRows = buildRows(messages)
+        }
+    }
+
+    private var pagingStateLabel: String {
+        if pagingInFlight { return "paging=loading" }
+        return pagingEnabled ? "paging=ready" : "paging=disabled"
+    }
+
+    private func debugId(_ value: Int64?) -> String {
+        guard let value else { return "n/a" }
+        return "\(value)"
     }
 
     // MARK: - Scrolling helpers
@@ -195,13 +242,23 @@ struct MessagesPane: View {
                 jellyContainerHeight: jellyContainerHeight
             )
             .id(g.id)
+            .background(
+                GeometryReader { geo in
+                    Color.clear.preference(
+                        key: GroupFrameKey.self,
+                        value: [g.id: geo.frame(in: .named(MessagesPane.scrollSpaceName))]
+                    )
+                }
+            )
             .onAppear {
                 // Trigger paging only when we actually reach the top of what's loaded.
                 guard pagingEnabled, !pagingInFlight, !store.isLoadingHistory else { return }
                 guard let firstGroupId, g.id == firstGroupId else { return }
                 // Don't page while user is already at the bottom (initial open / reading newest).
                 guard !isAtBottom else { return }
-                requestOlderHistory(anchorGroupId: g.id, anchorMessageId: g.messages.first?.id)
+                let anchorGroupId = topVisibleGroupId ?? g.id
+                let anchorMessageId = topVisibleMessageId ?? g.messages.first?.id
+                requestOlderHistory(anchorGroupId: anchorGroupId, anchorMessageId: anchorMessageId)
             }
         }
     }
@@ -211,7 +268,8 @@ struct MessagesPane: View {
     // MARK: - Body
 
     var body: some View {
-        let messages = store.messagesByChatId[chat.id] ?? []
+        let storeMessages = store.messagesByChatId[chat.id] ?? []
+        let messages = windowMessages
         let rows = cachedRows.isEmpty ? buildRows(messages) : cachedRows
 
         let groupIds: [String] = rows.compactMap {
@@ -220,6 +278,14 @@ struct MessagesPane: View {
         }
         let firstGroupId = groupIds.first
         let lastGroupId = groupIds.last
+        let groupMessageBounds: [String: (min: Int64, max: Int64)] = Dictionary(
+            uniqueKeysWithValues: rows.compactMap { row in
+                guard case let .group(g) = row else { return nil }
+                guard let minId = g.messages.min(by: { $0.id < $1.id })?.id else { return nil }
+                guard let maxId = g.messages.max(by: { $0.id < $1.id })?.id else { return nil }
+                return (g.id, (minId, maxId))
+            }
+        )
 
         ScrollViewReader { proxy in
             GeometryReader { containerGeo in
@@ -265,6 +331,21 @@ struct MessagesPane: View {
                     lastScrollOffsetY = offsetY
                     pushJellyImpulse(delta: delta)
                 }
+                .onPreferenceChange(GroupFrameKey.self) { frames in
+                    DispatchQueue.main.async {
+                        let visibleGroups = frames.filter { $0.value.maxY >= 0 && $0.value.minY <= jellyContainerHeight }
+                        let visibleBounds = visibleGroups.compactMap { groupMessageBounds[$0.key] }
+
+                        visibleMinMessageId = visibleBounds.map(\.min).min()
+                        visibleMaxMessageId = visibleBounds.map(\.max).max()
+
+                        if let topVisible = visibleGroups.min(by: { $0.value.minY < $1.value.minY }),
+                           let bounds = groupMessageBounds[topVisible.key] {
+                            topVisibleGroupId = topVisible.key
+                            topVisibleMessageId = bounds.min
+                        }
+                    }
+                }
                 .onAppear {
                     jellyContainerHeight = containerGeo.size.height
                 }
@@ -297,9 +378,30 @@ struct MessagesPane: View {
                         .padding(.bottom, 84)
                     }
                 }
+                .overlay(alignment: .topLeading) {
+#if DEBUG
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("chatId=\(chat.id)")
+                        Text("visible=\(debugId(visibleMinMessageId))…\(debugId(visibleMaxMessageId))")
+                        Text(pagingStateLabel)
+                    }
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .padding(8)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                    )
+                    .padding(.leading, 12)
+                    .padding(.top, 12)
+                    .allowsHitTesting(false)
+#endif
+                }
                 .onAppear {
                     // Build once; after that, scrolling should not re-run grouping.
                     cachedRows = buildRows(messages)
+                    fetchLatestMessages()
 
                     lastKnownMessageCount = messages.count
                     newIncomingCount = 0
@@ -311,6 +413,11 @@ struct MessagesPane: View {
                     lastPagingAnchor = nil
                     restoreAnchorGroupId = nil
                     pagingInFlight = false
+
+                    topVisibleGroupId = nil
+                    topVisibleMessageId = nil
+                    visibleMinMessageId = nil
+                    visibleMaxMessageId = nil
                 }
                 .onChange(of: chat.id) { _, _ in
                     pagingEnabled = false
@@ -320,6 +427,7 @@ struct MessagesPane: View {
                     didInitialScrollToBottom = false
                     showAfterInitialJump = false
                     cachedRows = []
+                    windowMessages = []
 
                     isAtBottom = true
                     newIncomingCount = 0
@@ -327,9 +435,16 @@ struct MessagesPane: View {
 
                     revealTimeX = 0
                     revealGestureEngaged = false
+
+                    topVisibleGroupId = nil
+                    topVisibleMessageId = nil
+                    visibleMinMessageId = nil
+                    visibleMaxMessageId = nil
+                }
+                .onChange(of: storeMessages.count) { _, _ in
+                    fetchLatestMessages()
                 }
                 .onChange(of: messages.count) { _, newCount in
-                    cachedRows = buildRows(messages)
                     if newCount < lastKnownMessageCount {
                         lastKnownMessageCount = newCount
                         newIncomingCount = 0
@@ -483,6 +598,13 @@ private struct ScrollOffsetKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
+    }
+}
+
+private struct GroupFrameKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
     }
 }
 
