@@ -295,7 +295,7 @@ final class ChatTimelineViewModel: ObservableObject {
         pendingAnchorId = anchorId
         isPagingInFlight = true
         #if DEBUG
-        log.debug("Paging older chatId=\(chat.id, privacy: .public) firstVisible=\(firstVisibleIndex, privacy: .public) anchorId=\(anchorId, privacy: .public) window=\(windowRange.lowerBound, privacy: .public)-\(windowRange.upperBound, privacy: .public)")
+        log.debug("Paging older chatId=\(self.chat.id, privacy: .public) firstVisible=\(firstVisibleIndex, privacy: .public) anchorId=\(anchorId, privacy: .public) window=\(self.windowRange.lowerBound, privacy: .public)-\(self.windowRange.upperBound, privacy: .public)")
         #endif
         store.loadMoreHistory(chatId: chat.id)
     }
