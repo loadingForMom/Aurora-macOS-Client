@@ -262,14 +262,30 @@ private struct GeneralSettingsView: View {
                 Button("Вывод (заглушка)") { }
             }
         }
-        .confirmationDialog("Аккаунт Telegram", item: $accountAction) { action in
-            Button(action.confirmTitle, role: .destructive) {
-                store.logOut()
+        .alert("Аккаунт Telegram", isPresented: accountActionBinding) {
+            if let action = accountAction {
+                Button(action.confirmTitle, role: .destructive) {
+                    store.logOut()
+                    accountAction = nil
+                }
             }
-            Button("Отмена", role: .cancel) { }
-        } message: { action in
-            Text(action.message)
+            Button("Отмена", role: .cancel) {
+                accountAction = nil
+            }
+        } message: {
+            if let action = accountAction {
+                Text(action.message)
+            }
         }
+    }
+
+    private var accountActionBinding: Binding<Bool> {
+        Binding(
+            get: { accountAction != nil },
+            set: { newValue in
+                if !newValue { accountAction = nil }
+            }
+        )
     }
 }
 

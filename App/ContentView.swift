@@ -8,20 +8,6 @@
 import SwiftUI
 import AppKit
 
-struct AuthRootView: View {
-    @ObservedObject var store: TelegramStore
-
-    var body: some View {
-        Group {
-            if store.isAuthorized {
-                ContentView(store: store)
-            } else {
-                TelegramLoginView(store: store)
-            }
-        }
-    }
-}
-
 struct ContentView: View {
     @ObservedObject var store: TelegramStore
 
@@ -58,59 +44,65 @@ struct ContentView: View {
         let baseChats = store.sortedChats
         let chats = filteredChats(baseChats, query: searchText)
 
-        NavigationSplitView {
-            List(selection: $store.selectedChatId) {
-                ForEach(chats) { chat in
-                    ChatRow(
-                        chat: chat,
-                        previewText: sidebarPreview(for: chat),
-                        avatarPath: avatarPath(for: chat.id)
-                    )
-                    .tag(chat.id as Int64?)
+        ZStack {
+            NavigationSplitView {
+                List(selection: $store.selectedChatId) {
+                    ForEach(chats) { chat in
+                        ChatRow(
+                            chat: chat,
+                            previewText: sidebarPreview(for: chat),
+                            avatarPath: avatarPath(for: chat.id)
+                        )
+                        .tag(chat.id as Int64?)
+                    }
                 }
-            }
-            .listStyle(.sidebar)
-            .searchable(text: $searchText, placement: .sidebar)
-        } detail: {
-            Group {
-                if let chat = selectedChat {
-                    ChatScreen(store: store, chat: chat)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .toolbar {
-                            ToolbarItem(placement: .principal) {
-                                ChatTitleButtonInline(
-                                    title: chat.title,
-                                    avatarPath: avatarPath(for: chat.id)
-                                )
-                                .onTapGesture {
-                                    inspectorShown.toggle()
+                .listStyle(.sidebar)
+                .searchable(text: $searchText, placement: .sidebar)
+            } detail: {
+                Group {
+                    if let chat = selectedChat {
+                        ChatScreen(store: store, chat: chat)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .toolbar {
+                                ToolbarItem(placement: .principal) {
+                                    ChatTitleButtonInline(
+                                        title: chat.title,
+                                        avatarPath: avatarPath(for: chat.id)
+                                    )
+                                    .onTapGesture {
+                                        inspectorShown.toggle()
+                                    }
                                 }
                             }
-                        }
-                } else {
-                    ContentUnavailableView("Select a chat", systemImage: "bubble.left.and.bubble.right")
-                        .foregroundStyle(.secondary)
+                    } else {
+                        ContentUnavailableView("Select a chat", systemImage: "bubble.left.and.bubble.right")
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
-        }
-        .inspector(isPresented: $inspectorShown) {
-            if let chat = selectedChat {
-                ChatInspectorView(chat: chat)
-                    .inspectorColumnWidth(min: 320, ideal: 360, max: 420)
-            } else {
-                ContentUnavailableView("No chat selected", systemImage: "sidebar.right")
-                    .padding(16)
-                    .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
+            .inspector(isPresented: $inspectorShown) {
+                if let chat = selectedChat {
+                    ChatInspectorView(chat: chat)
+                        .inspectorColumnWidth(min: 320, ideal: 360, max: 420)
+                } else {
+                    ContentUnavailableView("No chat selected", systemImage: "sidebar.right")
+                        .padding(16)
+                        .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
+                }
             }
-        }
-        .task {
-            if let id = store.selectedChatId {
-                store.selectChat(id, forceReload: false)
+            .task {
+                if let id = store.selectedChatId {
+                    store.selectChat(id, forceReload: false)
+                }
             }
-        }
-        .onChange(of: store.selectedChatId) { _, newChatId in
-            guard let id = newChatId else { return }
-            store.selectChat(id)
+            .onChange(of: store.selectedChatId) { _, newChatId in
+                guard let id = newChatId else { return }
+                store.selectChat(id)
+            }
+
+            if !store.isAuthorized {
+                TelegramLoginView(store: store)
+            }
         }
     }
 }

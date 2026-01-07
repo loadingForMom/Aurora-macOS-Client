@@ -13,7 +13,7 @@ struct AuroraApp: App {
 
     var body: some Scene {
         WindowGroup {
-            AuthRootView(store: store)
+            ContentView(store: store)
                 .environmentObject(store)
         }
         .commands {
