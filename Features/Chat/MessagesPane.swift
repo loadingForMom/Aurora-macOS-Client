@@ -30,6 +30,7 @@ struct MessagesPane: View {
     @State private var windowMessages: [TGMessage] = []
     @State private var windowApplyToken = UUID()
     @State private var windowChatId: Int64? = nil
+    @State private var needsRepoRetry: Bool = false
     @State private var viewedMessageIds = Set<Int64>()
     @State private var lastVisibleGroupIds = Set<String>()
     @State private var viewMessagesDebouncer = ViewMessagesDebouncer()
@@ -98,9 +99,27 @@ struct MessagesPane: View {
     }
 
     private func fetchLatestMessages() {
-        guard let repo = store.databaseRepository else { return }
+        guard let repo = store.databaseRepository else {
+#if DEBUG
+            print("[DB WINDOW] fetchLatestMessages repo=nil chatId=\(chat.id)")
+#endif
+            DispatchQueue.main.async {
+                needsRepoRetry = true
+            }
+            return
+        }
+        if needsRepoRetry {
+            DispatchQueue.main.async {
+                needsRepoRetry = false
+            }
+        }
         let limit = store.historyWindowLimitByChatId[chat.id] ?? 160
         let latest = repo.fetchLatestMessages(chatId: chat.id, limit: limit)
+#if DEBUG
+        if latest.isEmpty {
+            print("[DB WINDOW] fetchLatestMessages returned 0 chatId=\(chat.id)")
+        }
+#endif
         applyWindowMessages(store.sortChronological(latest), anchorGroupId: nil)
     }
 
@@ -124,6 +143,11 @@ struct MessagesPane: View {
             print("[DB WINDOW] dropped \(dropped) messages not in chat \(expectedChatId)")
         }
 
+        if filtered.isEmpty, !messages.isEmpty {
+#if DEBUG
+            print("[DB WINDOW] fetchLatestMessages filtered out all rows chatId=\(expectedChatId)")
+#endif
+        }
         DispatchQueue.main.async { [token, expectedChatId, filtered] in
             guard windowApplyToken == token else { return }
             guard chat.id == expectedChatId else { return }
@@ -133,6 +157,19 @@ struct MessagesPane: View {
             windowMessages = filtered
             cachedRows = buildRows(filtered)
             windowChatId = expectedChatId
+        }
+    }
+
+    private func scheduleFetchLatestMessages(reason: String) {
+        let token = windowApplyToken
+        let chatId = chat.id
+#if DEBUG
+        print("[DB WINDOW] chatId=\(chatId) token=\(token) fetch scheduled (\(reason))")
+#endif
+        DispatchQueue.main.async { [token, chatId] in
+            guard windowApplyToken == token else { return }
+            guard chat.id == chatId else { return }
+            fetchLatestMessages()
         }
     }
 
@@ -455,7 +492,7 @@ struct MessagesPane: View {
                 .onAppear {
                     // Build once; after that, scrolling should not re-run grouping.
                     cachedRows = buildRows(messages)
-                    fetchLatestMessages()
+                    scheduleFetchLatestMessages(reason: "onAppear")
 
                     lastKnownMessageCount = messages.count
                     newIncomingCount = 0
@@ -499,9 +536,21 @@ struct MessagesPane: View {
                     topVisibleMessageId = nil
                     visibleMinMessageId = nil
                     visibleMaxMessageId = nil
+
+                    needsRepoRetry = false
+                    scheduleFetchLatestMessages(reason: "chat change")
                 }
                 .onChange(of: storeMessages.count) { _, _ in
-                    fetchLatestMessages()
+                    scheduleFetchLatestMessages(reason: "store update")
+                }
+                .onChange(of: store.databaseRepository != nil) { _, isReady in
+                    guard isReady else { return }
+                    DispatchQueue.main.async {
+                        if needsRepoRetry || windowChatId != chat.id {
+                            scheduleFetchLatestMessages(reason: "db ready")
+                        }
+                        needsRepoRetry = false
+                    }
                 }
                 .onChange(of: messages.count) { _, newCount in
                     if newCount < lastKnownMessageCount {

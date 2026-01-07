@@ -99,6 +99,9 @@ struct TGMessage: Identifiable, Hashable {
     let isOutgoing: Bool
     let senderUserId: Int64?
     let text: String
+    let contentType: String = "messageText"
+    let rawText: String? = nil
+    let entities: [TGTextEntity] = []
 
     // Optimistic / sending state
     var sendState: TGMessageSendState = .sent
@@ -127,6 +130,11 @@ struct TGMessage: Identifiable, Hashable {
 
     var previewText: String { text }
 
+    var textForRendering: String? {
+        guard contentType == "messageText" else { return nil }
+        return rawText ?? text
+    }
+
     var messageKey: MessageKey {
         MessageKey(chatId: chatId, messageId: id)
     }
@@ -142,4 +150,22 @@ struct TGMessage: Identifiable, Hashable {
 struct MessageKey: Hashable {
     let chatId: Int64
     let messageId: Int64
+}
+
+struct TGTextEntity: Hashable {
+    let type: TGTextEntityType
+    let offset: Int
+    let length: Int
+}
+
+enum TGTextEntityType: Hashable {
+    case bold
+    case italic
+    case underline
+    case strikethrough
+    case code
+    case pre
+    case preCode(language: String?)
+    case textUrl(url: String)
+    case unknown(String)
 }

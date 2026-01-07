@@ -6,18 +6,28 @@
 //
 
 import SwiftUI
+import AppKit
 
 struct ChatTitleButton: View {
     let title: String
+    let chatId: Int64
     let avatarPath: String?
 
     var body: some View {
         HStack(spacing: 10) {
             AvatarCircle(
                 title: title,
-                path: avatarPath,
+                identityKey: AvatarCacheKey(
+                    kind: .chat,
+                    id: chatId,
+                    size: 26,
+                    scale: NSScreen.main?.backingScaleFactor ?? 2.0
+                ),
                 size: 26,
-                font: .caption.weight(.semibold)
+                font: .caption.weight(.semibold),
+                imageProvider: {
+                    avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
+                }
             )
             Text(title)
                 .font(.headline)

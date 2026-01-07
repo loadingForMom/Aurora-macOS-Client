@@ -27,7 +27,7 @@ final class TelegramStore: ObservableObject {
     // MARK: - App DB
 
     var database: AppDatabase? = nil
-    var databaseRepository: AppDatabaseRepository? = nil
+    @Published var databaseRepository: AppDatabaseRepository? = nil
     @Published var lastDatabaseStats: DatabaseStats?
 
     // MARK: - Storage / Cache (Settings)

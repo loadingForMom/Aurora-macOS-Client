@@ -67,6 +67,7 @@ struct ContentView: View {
                                 ToolbarItem(placement: .principal) {
                                     ChatTitleButtonInline(
                                         title: chat.title,
+                                        chatId: chat.id,
                                         avatarPath: avatarPath(for: chat.id)
                                     )
                                     .onTapGesture {
@@ -109,15 +110,24 @@ struct ContentView: View {
 
 struct ChatTitleButtonInline: View {
     let title: String
+    let chatId: Int64
     let avatarPath: String?
 
     var body: some View {
         HStack(spacing: 8) {
             AvatarCircle(
                 title: title,
-                path: avatarPath,
+                identityKey: AvatarCacheKey(
+                    kind: .chat,
+                    id: chatId,
+                    size: 28,
+                    scale: NSScreen.main?.backingScaleFactor ?? 2.0
+                ),
                 size: 28,
-                font: .system(size: 11, weight: .semibold, design: .rounded)
+                font: .system(size: 11, weight: .semibold, design: .rounded),
+                imageProvider: {
+                    avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
+                }
             )
             .overlay(Circle().strokeBorder(Color.primary.opacity(0.06), lineWidth: 1))
 
