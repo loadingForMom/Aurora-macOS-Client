@@ -59,8 +59,8 @@ final class TelegramStore: ObservableObject {
 
     // MARK: - JSON parsing cache
 
-    fileprivate var lastParsedUpdate: String?
-    fileprivate var lastParsedObject: [String: Any]?
+    var lastParsedUpdate: String?
+       var lastParsedObject: [String: Any]?
 
     // MARK: - Thumbnail cache
 
