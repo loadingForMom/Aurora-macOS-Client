@@ -58,7 +58,7 @@ final class ChatTimelineViewModel: ObservableObject {
 
     private let log = Logger(subsystem: "Aurora.Chat", category: "Timeline")
     private let signposter = OSSignposter(subsystem: "Aurora.Chat", category: "Timeline")
-    private var openSignpostId: OSSignpostID?
+    private var openSignpostState: OSSignpostIntervalState?
     private var openStartedAt: Date?
 
     private static var scrollMemory: [Int64: Int64] = [:]
@@ -316,16 +316,14 @@ final class ChatTimelineViewModel: ObservableObject {
     }
 
     private func startOpenSignpost() {
-        let id = signposter.makeSignpostID()
-        openSignpostId = id
+        openSignpostState = signposter.beginInterval("ChatOpen")
         openStartedAt = Date()
-        signposter.beginInterval("ChatOpen", id: id, "chatId", chat.id)
     }
 
     private func stopOpenSignpost() {
-        guard let id = openSignpostId else { return }
-        signposter.endInterval("ChatOpen", id: id, "chatId", chat.id)
-        openSignpostId = nil
+        guard let state = openSignpostState else { return }
+        signposter.endInterval("ChatOpen", state)
+        openSignpostState = nil
         if let start = openStartedAt {
             metrics.initialRenderSeconds = Date().timeIntervalSince(start)
         }
