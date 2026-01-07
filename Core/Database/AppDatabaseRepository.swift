@@ -174,13 +174,28 @@ final class AppDatabaseRepository {
                     ORDER BY message_id DESC
                     LIMIT ?
                     """,
-                    arguments: [chatId, limit]
+                    arguments: StatementArguments([chatId, limit])
                 )
                 let messages = rows.map(mapMessageRow)
 #if DEBUG
-                assert(messages.allSatisfy { $0.chatId == chatId }, "DB invariant failed: mismatched chat_id in fetchLatestMessages")
+                if let bad = messages.first(where: { $0.chatId != chatId }) {
+                    assertionFailure("DB returned wrong chatId: expected \(chatId), got \(bad.chatId)")
+                }
 #endif
-                return messages
+                let filtered = messages.filter { $0.chatId == chatId }
+#if !DEBUG
+                if filtered.count != messages.count {
+                    struct LogOnce { static var didLog = false }
+                    if !LogOnce.didLog {
+                        LogOnce.didLog = true
+                        print("[DB] fetchLatestMessages dropped \(messages.count - filtered.count) rows for chatId=\(chatId)")
+                    }
+                }
+#endif
+#if DEBUG
+                assert(filtered.allSatisfy { $0.chatId == chatId }, "DB invariant failed: mismatched chat_id in fetchLatestMessages")
+#endif
+                return filtered
             }
         } catch {
             print("[DB] fetchLatestMessages failed: \(error)")
@@ -201,13 +216,28 @@ final class AppDatabaseRepository {
                     ORDER BY message_id DESC
                     LIMIT ?
                     """,
-                    arguments: [chatId, beforeMessageId, limit]
+                    arguments: StatementArguments([chatId, beforeMessageId, limit])
                 )
                 let messages = rows.map(mapMessageRow)
 #if DEBUG
-                assert(messages.allSatisfy { $0.chatId == chatId }, "DB invariant failed: mismatched chat_id in fetchOlderMessages")
+                if let bad = messages.first(where: { $0.chatId != chatId }) {
+                    assertionFailure("DB returned wrong chatId: expected \(chatId), got \(bad.chatId)")
+                }
 #endif
-                return messages
+                let filtered = messages.filter { $0.chatId == chatId }
+#if !DEBUG
+                if filtered.count != messages.count {
+                    struct LogOnce { static var didLog = false }
+                    if !LogOnce.didLog {
+                        LogOnce.didLog = true
+                        print("[DB] fetchOlderMessages dropped \(messages.count - filtered.count) rows for chatId=\(chatId)")
+                    }
+                }
+#endif
+#if DEBUG
+                assert(filtered.allSatisfy { $0.chatId == chatId }, "DB invariant failed: mismatched chat_id in fetchOlderMessages")
+#endif
+                return filtered
             }
         } catch {
             print("[DB] fetchOlderMessages failed: \(error)")

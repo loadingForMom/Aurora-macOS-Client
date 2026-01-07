@@ -9,6 +9,7 @@ import SwiftUI
 
 struct MessageBubble: View {
     let msg: TGMessage
+    let currentChatId: Int64
 
     /// Trackpad “reveal exact time” (0…maxReveal), passed from parent.
     let revealTimeX: CGFloat
@@ -23,12 +24,14 @@ struct MessageBubble: View {
 
     init(
         msg: TGMessage,
+        currentChatId: Int64,
         revealTimeX: CGFloat = 0,
         onRetry: @escaping () -> Void = {},
         onDelete: @escaping () -> Void = {},
         jellyOffsetY: CGFloat = 0
     ) {
         self.msg = msg
+        self.currentChatId = currentChatId
         self.revealTimeX = revealTimeX
         self.onRetry = onRetry
         self.onDelete = onDelete
@@ -36,6 +39,9 @@ struct MessageBubble: View {
     }
 
     var body: some View {
+#if DEBUG
+        assert(msg.chatId == currentChatId, "Message chatId mismatch: expected \(currentChatId) got \(msg.chatId)")
+#endif
         let reveal = min(max(0, revealTimeX), maxReveal)
         let isRevealingTime = reveal > 0.5
 
