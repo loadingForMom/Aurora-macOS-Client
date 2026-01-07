@@ -28,9 +28,10 @@ struct MessagesPane: View {
     @State private var cachedRows: [Row] = []
     @State private var windowMessages: [TGMessage] = []
     @State private var windowApplyToken = UUID()
+    @State private var windowChatId: Int64? = nil
     @State private var viewedMessageIds = Set<Int64>()
     @State private var lastVisibleGroupIds = Set<String>()
-    @StateObject private var viewMessagesDebouncer = ViewMessagesDebouncer()
+    @State private var viewMessagesDebouncer = ViewMessagesDebouncer()
 
     @State private var topVisibleGroupId: String? = nil
     @State private var topVisibleMessageId: Int64? = nil
@@ -130,6 +131,7 @@ struct MessagesPane: View {
             }
             windowMessages = filtered
             cachedRows = buildRows(filtered)
+            windowChatId = expectedChatId
         }
     }
 
@@ -140,6 +142,37 @@ struct MessagesPane: View {
             store.viewMessages(chatId: chatId, messageIds: Array(unseen), forceRead: false)
             viewedMessageIds.formUnion(unseen)
         }
+    }
+
+    @MainActor
+    private func updateVisibleGroups(
+        frames: [String: CGRect],
+        groupMessageBounds: [String: (min: Int64, max: Int64)],
+        groupMessageIds: [String: [Int64]]
+    ) {
+        let visibleGroups = frames.filter { $0.value.maxY >= 0 && $0.value.minY <= jellyContainerHeight }
+        let visibleGroupIds = Set(visibleGroups.keys)
+        let visibleBounds = visibleGroups.compactMap { groupMessageBounds[$0.key] }
+
+        let newMin = visibleBounds.map(\.min).min()
+        let newMax = visibleBounds.map(\.max).max()
+        let newTopGroup = visibleGroups.min(by: { $0.value.minY < $1.value.minY })?.key
+        let newTopMessageId = newTopGroup.flatMap { groupMessageBounds[$0]?.min }
+
+        let visibilityChanged = visibleGroupIds != lastVisibleGroupIds
+        let boundsChanged = newMin != visibleMinMessageId || newMax != visibleMaxMessageId
+        let anchorChanged = newTopGroup != topVisibleGroupId || newTopMessageId != topVisibleMessageId
+
+        guard visibilityChanged || boundsChanged || anchorChanged else { return }
+
+        lastVisibleGroupIds = visibleGroupIds
+        visibleMinMessageId = newMin
+        visibleMaxMessageId = newMax
+        topVisibleGroupId = newTopGroup
+        topVisibleMessageId = newTopMessageId
+
+        let visibleMessageIds = Set(visibleGroupIds.flatMap { groupMessageIds[$0] ?? [] })
+        scheduleViewMessages(visibleMessageIds)
     }
 
     private var pagingStateLabel: String {
@@ -286,8 +319,10 @@ struct MessagesPane: View {
 
     var body: some View {
         let storeMessages = store.messagesByChatId[chat.id] ?? []
-        let messages = windowMessages
-        let rows = cachedRows.isEmpty ? buildRows(messages) : cachedRows
+        let messages = windowChatId == chat.id ? windowMessages : []
+        let rows = windowChatId == chat.id
+            ? (cachedRows.isEmpty ? buildRows(messages) : cachedRows)
+            : []
 
         let groupIds: [String] = rows.compactMap {
             if case .group(let g) = $0 { return g.id }
@@ -355,29 +390,14 @@ struct MessagesPane: View {
                     pushJellyImpulse(delta: delta)
                 }
                 .onPreferenceChange(GroupFrameKey.self) { frames in
-                    let visibleGroups = frames.filter { $0.value.maxY >= 0 && $0.value.minY <= jellyContainerHeight }
-                    let visibleGroupIds = Set(visibleGroups.keys)
-                    let visibleBounds = visibleGroups.compactMap { groupMessageBounds[$0.key] }
-
-                    let newMin = visibleBounds.map(\.min).min()
-                    let newMax = visibleBounds.map(\.max).max()
-                    let newTopGroup = visibleGroups.min(by: { $0.value.minY < $1.value.minY })?.key
-                    let newTopMessageId = newTopGroup.flatMap { groupMessageBounds[$0]?.min }
-
-                    let visibilityChanged = visibleGroupIds != lastVisibleGroupIds
-                    let boundsChanged = newMin != visibleMinMessageId || newMax != visibleMaxMessageId
-                    let anchorChanged = newTopGroup != topVisibleGroupId || newTopMessageId != topVisibleMessageId
-
-                    guard visibilityChanged || boundsChanged || anchorChanged else { return }
-
-                    lastVisibleGroupIds = visibleGroupIds
-                    visibleMinMessageId = newMin
-                    visibleMaxMessageId = newMax
-                    topVisibleGroupId = newTopGroup
-                    topVisibleMessageId = newTopMessageId
-
-                    let visibleMessageIds = Set(visibleGroupIds.flatMap { groupMessageIds[$0] ?? [] })
-                    scheduleViewMessages(visibleMessageIds)
+                    Task {
+                        await Task.yield()
+                        await updateVisibleGroups(
+                            frames: frames,
+                            groupMessageBounds: groupMessageBounds,
+                            groupMessageIds: groupMessageIds
+                        )
+                    }
                 }
                 .onAppear {
                     jellyContainerHeight = containerGeo.size.height
@@ -462,6 +482,7 @@ struct MessagesPane: View {
                     cachedRows = []
                     windowMessages = []
                     windowApplyToken = UUID()
+                    windowChatId = nil
                     viewMessagesDebouncer.cancel()
                     viewedMessageIds = []
                     lastVisibleGroupIds = []
@@ -546,6 +567,7 @@ struct MessagesPane: View {
                 }
             }
         }
+        .id(chat.id)
         .background(Color(nsColor: .textBackgroundColor))
     }
 
@@ -636,7 +658,7 @@ struct MessagesPane: View {
     }
 }
 
-private final class ViewMessagesDebouncer: ObservableObject {
+private final class ViewMessagesDebouncer {
     private var workItem: DispatchWorkItem?
 
     func schedule(delay: TimeInterval, action: @escaping () -> Void) {

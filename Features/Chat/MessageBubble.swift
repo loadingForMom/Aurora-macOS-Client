@@ -36,14 +36,12 @@ struct MessageBubble: View {
         self.onRetry = onRetry
         self.onDelete = onDelete
         self.jellyOffsetY = jellyOffsetY
+#if DEBUG
+        assert(msg.chatId == currentChatId, "Message chatId mismatch: expected \(currentChatId) got \(msg.chatId)")
+#endif
     }
 
     var body: some View {
-#if DEBUG
-        let _ = { () -> Void in
-            assert(msg.chatId == currentChatId, "Message chatId mismatch: expected \(currentChatId) got \(msg.chatId)")
-        }()
-#endif
         let reveal = min(max(0, revealTimeX), maxReveal)
         let isRevealingTime = reveal > 0.5
 
