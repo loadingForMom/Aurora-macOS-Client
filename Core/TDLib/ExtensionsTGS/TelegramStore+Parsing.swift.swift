@@ -9,11 +9,31 @@ extension TelegramStore {
     // MARK: - JSON helpers
 
     func sendJSON(_ obj: Any) {
-        guard JSONSerialization.isValidJSONObject(obj),
-              let data = try? JSONSerialization.data(withJSONObject: obj),
-              let str = String(data: data, encoding: .utf8)
-        else { return }
-        td.send(str)
+        guard JSONSerialization.isValidJSONObject(obj) else {
+            print("[TD->] INVALID JSON: \(obj)")
+            return
+        }
+
+        do {
+            let data = try JSONSerialization.data(withJSONObject: obj)
+            if let str = String(data: data, encoding: .utf8) {
+                print("[TD->] \(str)")
+                td.send(str)
+            } else {
+                print("[TD->] encode error: invalid utf8")
+            }
+        } catch {
+            print("[TD->] encode error: \(error)")
+        }
+    }
+
+    func parseTdError(_ resp: String) -> (code: Int, message: String, extra: String?)? {
+        guard let obj = parseJSON(resp) else { return nil }
+        guard (obj["@type"] as? String) == "error" else { return nil }
+        let code = (obj["code"] as? NSNumber)?.intValue ?? -1
+        let message = obj["message"] as? String ?? "(unknown)"
+        let extra = obj["@extra"] as? String
+        return (code, message, extra)
     }
 
     func parseJSON(_ upd: String) -> [String: Any]? {

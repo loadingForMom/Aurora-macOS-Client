@@ -164,6 +164,11 @@ extension TelegramStore {
     }
 
     func handleResponse(_ resp: String) {
+        if let err = parseTdError(resp) {
+            print("[TDLib][error] code=\(err.code) message=\(err.message) extra=\(err.extra ?? "nil")")
+            return
+        }
+
         if let ids = parseChatsResponse(resp) {
             for id in ids {
                 td.send(#"{"@type":"getChat","chat_id":\#(id)}"#)

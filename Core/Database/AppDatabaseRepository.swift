@@ -234,9 +234,15 @@ final class AppDatabaseRepository {
         do {
             try dbWriter.write { db in
                 let placeholders = Array(repeating: "?", count: messageIds.count).joined(separator: ",")
+                var args = StatementArguments()
+                args += [chatId]
+                for messageId in messageIds {
+                    args += [messageId]
+                }
                 try db.execute(
                     sql: "DELETE FROM messages WHERE chat_id = ? AND message_id IN (\(placeholders))",
-                    arguments: StatementArguments([chatId] + messageIds)                )
+                    arguments: args
+                )
             }
         } catch {
             print("[DB] deleteMessages failed: \(error)")
