@@ -16,6 +16,9 @@ extension TelegramStore {
             } else if previous == "authorizationStateReady", st != "authorizationStateReady" {
                 resetSessionState()
             }
+            if let st = parseAuthState(from: upd) {
+                print("[AUTH] state =", st)
+            }
         }
 
         if let (chatId, lastMessage) = parseUpdateChatLastMessage(upd) {
@@ -47,6 +50,10 @@ extension TelegramStore {
         if authState == "authorizationStateReady", !didRequestInitialStorageStats {
             didRequestInitialStorageStats = true
             refreshStorageStatistics()
+        }
+        
+        if authState == "authorizationStateWaitEncryptionKey" {
+            td.send(#"{"@type":"checkDatabaseEncryptionKey","encryption_key":""}"#)
         }
 
         if let (id, title) = parseUpdateChatTitle(upd) {

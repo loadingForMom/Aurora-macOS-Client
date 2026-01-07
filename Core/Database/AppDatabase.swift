@@ -59,10 +59,11 @@ final class AppDatabase {
                 t.column("sending_id", .integer)
                 t.primaryKey(["chat_id", "message_id"])
             }
-            try db.createIndex(
-                "idx_messages_chat_id_message_id_desc",
+            try db.create(
+                index: "idx_messages_chat_id_message_id",
                 on: "messages",
-                columns: [IndexColumn("chat_id"), IndexColumn("message_id", .desc)]
+                columns: ["chat_id", "message_id"],
+                options: [.ifNotExists]
             )
         }
 

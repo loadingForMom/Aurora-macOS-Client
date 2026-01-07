@@ -26,8 +26,8 @@ final class TelegramStore: ObservableObject {
 
     // MARK: - App DB
 
-    let database: AppDatabase?
-    let databaseRepository: AppDatabaseRepository?
+    var database: AppDatabase? = nil
+    var databaseRepository: AppDatabaseRepository? = nil
     @Published var lastDatabaseStats: DatabaseStats?
 
     // MARK: - Storage / Cache (Settings)
@@ -66,7 +66,7 @@ final class TelegramStore: ObservableObject {
     // MARK: - JSON parsing cache
 
     var lastParsedUpdate: String?
-       var lastParsedObject: [String: Any]?
+    var lastParsedObject: [String: Any]?
 
     // MARK: - Thumbnail cache
 
@@ -125,6 +125,22 @@ final class TelegramStore: ObservableObject {
 
         imageMemCache.countLimit = 256
 
+        if let n = UserDefaults.standard.object(forKey: cacheLimitBytesKey) as? NSNumber {
+            cacheLimitBytes = n.int64Value
+        }
+
+        // ✅ СНАЧАЛА DB (до любых замыканий, где мелькает self)
+        do {
+            let db = try AppDatabase()
+            database = db
+            databaseRepository = AppDatabaseRepository(dbWriter: db.dbWriter)
+        } catch {
+            database = nil
+            databaseRepository = nil
+            print("[DB] Failed to initialize app database: \(error)")
+        }
+
+        // ✅ ПОТОМ event loop (тут создаются closures и захватывается self)
         td.startEventLoop(onUpdate: { [weak self] upd in
             Task { @MainActor in
                 self?.pushLog(upd)
@@ -138,22 +154,7 @@ final class TelegramStore: ObservableObject {
         })
 
         td.send(#"{"@type":"getOption","name":"version"}"#)
-
-        if let n = UserDefaults.standard.object(forKey: cacheLimitBytesKey) as? NSNumber {
-            cacheLimitBytes = n.int64Value
-        }
-
-        do {
-            let db = try AppDatabase()
-            database = db
-            databaseRepository = AppDatabaseRepository(dbWriter: db.dbWriter)
-        } catch {
-            database = nil
-            databaseRepository = nil
-            print("[DB] Failed to initialize app database: \(error)")
-        }
     }
-
     // MARK: - Computed
 
     var sortedChats: [TGChat] {
