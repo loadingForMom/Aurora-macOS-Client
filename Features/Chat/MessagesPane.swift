@@ -7,6 +7,7 @@
 
 import SwiftUI
 import Foundation
+import Combine
 
 struct MessagesPane: View {
     static let scrollSpaceName = "Aurora.ChatScrollSpace"
@@ -658,7 +659,15 @@ struct MessagesPane: View {
     }
 }
 
+<<<<<<< Updated upstream
 private final class ViewMessagesDebouncer {
+=======
+private final class ViewMessagesDebouncer: ObservableObject {
+    // We don't publish any @Published properties, but @StateObject requires ObservableObject conformance.
+    // Provide a concrete publisher to satisfy the protocol.
+    let objectWillChange = ObservableObjectPublisher()
+
+>>>>>>> Stashed changes
     private var workItem: DispatchWorkItem?
 
     func schedule(delay: TimeInterval, action: @escaping () -> Void) {
