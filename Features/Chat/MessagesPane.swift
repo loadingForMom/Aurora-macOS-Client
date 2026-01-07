@@ -73,11 +73,11 @@ struct MessagesPane: View {
 
     // MARK: - Paging
 
-    private func requestOlderHistory(anchorGroupId: String?) {
+    private func requestOlderHistory(anchorGroupId: String?, anchorMessageId: Int64?) {
         guard pagingEnabled else { return }
         guard !pagingInFlight else { return }
         guard !store.isLoadingHistory else { return }
-        guard let anchorGroupId else { return }
+        guard let anchorGroupId, let anchorMessageId else { return }
 
         // Prevent “double fire” when SwiftUI reuses/rebuilds the top area.
         if lastPagingAnchor == anchorGroupId { return }
@@ -85,7 +85,7 @@ struct MessagesPane: View {
 
         restoreAnchorGroupId = anchorGroupId
         pagingInFlight = true
-        store.loadMoreHistory(chatId: chat.id)
+        store.loadMoreHistory(chatId: chat.id, anchorMessageId: anchorMessageId)
     }
 
     // MARK: - Scrolling helpers
@@ -201,7 +201,7 @@ struct MessagesPane: View {
                 guard let firstGroupId, g.id == firstGroupId else { return }
                 // Don't page while user is already at the bottom (initial open / reading newest).
                 guard !isAtBottom else { return }
-                requestOlderHistory(anchorGroupId: g.id)
+                requestOlderHistory(anchorGroupId: g.id, anchorMessageId: g.messages.first?.id)
             }
         }
     }
