@@ -66,7 +66,7 @@ final class ChatTimelineViewModel: ObservableObject {
     var onWindowUpdate: ((WindowUpdate) -> Void)?
     private var pendingWindowUpdate: WindowUpdate?
 
-    init(store: TelegramStore, chat: TGChat, renderer: MessageTextRenderer = MessageTextRenderer()) {
+    init(store: TelegramStore, chat: TGChat, renderer: MessageTextRenderer) {
         self.store = store
         self.chat = chat
         self.renderer = renderer

@@ -13,10 +13,11 @@ struct ChatTimelineContainer: View {
 
     @StateObject private var viewModel: ChatTimelineViewModel
 
+    @MainActor
     init(store: TelegramStore, chat: TGChat) {
         self.store = store
         self.chat = chat
-        _viewModel = StateObject(wrappedValue: ChatTimelineViewModel(store: store, chat: chat))
+        _viewModel = StateObject(wrappedValue: ChatTimelineViewModel(store: store, chat: chat, renderer: MessageTextRenderer()))
     }
 
     var body: some View {
@@ -240,7 +241,7 @@ extension ChatTimelineNSView: NSCollectionViewDelegateFlowLayout {
 }
 
 extension ChatTimelineNSView: NSCollectionViewPrefetching {
-    func collectionView(_ collectionView: NSCollectionView, prefetchItemsAt indexPaths: Set<IndexPath>) {
+    func collectionView(_ collectionView: NSCollectionView, prefetchItemsAt indexPaths: [IndexPath]) {
         let indices = indexPaths.map { $0.item }
         viewModel?.prefetch(indices: indices)
     }
