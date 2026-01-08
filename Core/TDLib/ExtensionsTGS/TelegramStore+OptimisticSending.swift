@@ -270,6 +270,7 @@ extension TelegramStore {
             pendingByLocalId.removeValue(forKey: localId)
             localIdBySendingId = localIdBySendingId.filter { $0.value != localId }
             localIdByTempMessageId.removeValue(forKey: succ.oldMessageId)
+            serverMessageIdByLocalId[localId] = final.id
         }
 
         updateChatLastFromLocalTimeline(chatId: chatId)
@@ -283,6 +284,7 @@ extension TelegramStore {
             pendingByLocalId.removeValue(forKey: localId)
             localIdBySendingId = localIdBySendingId.filter { $0.value != localId }
             localIdByTempMessageId.removeValue(forKey: fail.oldMessageId)
+            serverMessageIdByLocalId.removeValue(forKey: localId)
         }
 
         updateChatLastFromLocalTimeline(chatId: chatId)
@@ -306,6 +308,7 @@ extension TelegramStore {
         link.placeholderId = merged.id
         pendingByLocalId[localId] = link
         localIdByTempMessageId[merged.id] = localId
+        serverMessageIdByLocalId[localId] = merged.id
 
         keepOptimisticChatPreviewIfNeeded(chatId: chatId)
         return true

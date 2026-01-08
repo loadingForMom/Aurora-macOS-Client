@@ -1,6 +1,12 @@
 # Aurora macOS Client — Codebase Documentation (Snapshot)
 
 **Snapshot source:** `Aurora.zip` (imported into ChatGPT on 2026-01-06).
+**Last updated:** 2026-01-08.
+
+## Recent changes since the snapshot
+- Message rendering: added `MessageTextPipeline` to render `AttributedString` from TDLib text + entities (cached per chat/message/style).
+- Timeline correctness: history/application is merge-based (not replace-based) and guarded by per-chat generation tokens to avoid stale responses overwriting newer state.
+- Identity safety: message identity supports server ids and local optimistic ids; avatar loading uses identity-keyed async caching with cancellation to prevent mismatches.
 
 This document describes what the code currently does, how the pieces fit together, and what technologies are used. It’s written as a “living” architecture + module map for the current stage of the project.
 
@@ -111,8 +117,11 @@ Update handling is split into focused extensions:
 - `TGChatKind`: categorizes chats (`privateChat`, `basicGroup`, `supergroup`, `secret`, `unknown`).
 - `TGChat`: `Identifiable` + `Hashable` representation with fields like `id`, `title`, `order`, `unreadCount`, `lastMessagePreview`, `lastMessageId`, `lastReadInboxMessageId`, etc.
 - `TGUser`: minimal user model with a `displayName` convenience.
-- `TGMessageSendState`: state machine for outgoing messages: `.pending(sendingId:)`, `.failed(error:)`, `.sent`.
-- `TGMessage`: UI-ready message with `id`, `chatId`, `date`, `isOutgoing`, `senderUserId`, `text`, plus optimistic bookkeeping (`localId`, `sendingId`, `sendState`).
+- `TGMessageSendState`: state machine for outgoing messages: `.pending`, `.failed(errorText:)`, `.sent`.
+- `TGMessage`: UI-ready message with `chatId`, timestamps, sender/outgoing flags, preview `text`, plus richer rendering payload for text messages:
+  - `contentType`, `rawText`, `entities` (for correctness-first rendering)
+  - optimistic bookkeeping: `localId`, `sendingId`, `sendState`
+  - stable identity for UI diffing: server message id when available, otherwise local optimistic id
 
 ## 6. Chat list: from TDLib to the sidebar
 
@@ -135,6 +144,8 @@ TDLib updates that keep the sidebar correct:
 
 The store maintains `messagesByChatId: [Int64: [TGMessage]]`. Each chat’s messages are kept sorted chronologically.
 
+Correctness invariants: history/window updates must merge into the existing per-chat timeline (not replace it), so we never drop newer tail messages or optimistic placeholders. UI diffing relies on a stable per-message identity (server id or local optimistic id).
+
 `TelegramStore+Timeline.swift` provides:
 - `sortChronological(_:)`
 - `appendMessage(_:, chatId:)`
@@ -151,6 +162,8 @@ Key mechanisms:
 - The store keeps `historyJobs: [String: HistoryJob]` keyed by that extra.
 - `HistoryJob` stores an accumulator (`accById`) so the final array is de-duplicated and stable.
 - `reachedHistoryStart: Set<Int64>` prevents repeat paging once TDLib reports there is no more history.
+- History application is guarded by a per-chat generation/token. Stale responses are discarded so out-of-order TDLib replies can’t overwrite a newer timeline.
+- When history pages arrive, messages are merged into the in-memory timeline rather than replacing the whole array.
 
 Entry points:
 - `loadLatestHistory(chatId:)` resets the timeline and requests an initial page.
@@ -162,6 +175,8 @@ Entry points:
 - Groups messages by day.
 - Tracks scroll position and requests older history when the user approaches the top (when paging is enabled and not already in flight).
 - Delegates message layout to `MessageGroupView` + `MessageBubble`.
+- Coalesces geometry/preference-driven updates so we don’t mutate published state during SwiftUI render passes.
+- Uses a local “window” snapshot for stable scrolling/initial positioning while the store continues receiving updates.
 
 `ChatScreen.swift` composes the timeline with the bottom composer using `safeAreaInset`.
 
@@ -208,6 +223,8 @@ Key behaviors:
 - The store registers file ids per chat and downloads the small avatar automatically (big avatar is not automatically downloaded).
 - When TDLib sends `updateFile` (or similar file-path updates), the store maps the file id back to the chat id and publishes a usable file path in `chatAvatarPathByChatId`.
 
+UI identity note: avatar views load images using an identity-keyed cache and cancellation (`.task(id:)`) to prevent the classic SwiftUI race where rows/toolbars briefly show the wrong avatar when lists update quickly.
+
 Caching:
 - `imageMemCache: NSCache<NSString, NSImage>` inside the store caches decoded images.
 - Thumbnails are stored under Application Support: `~/Library/Application Support/Aurora/thumbs`.
@@ -249,8 +266,9 @@ The code uses `@extra` correlation strings for storage operations and keeps a `s
 
 ### 13.4 Message rendering
 
-- `MessageBubble.swift` implements bubble layout and a trackpad interaction to reveal timestamps. It also provides a context menu for outgoing messages (retry/delete).
-- `MessageGroupView.swift` groups and lays out bubbles.
+- `MessageBubble.swift` implements bubble layout and a trackpad interaction to reveal timestamps. It also provides a context menu for outgoing messages (retry/delete). Text rendering goes through `MessageTextPipeline` (AttributedString + TDLib entities) with caching.
+- `MessageGroupView.swift` groups and lays out message bubbles.
+- `MessageTextPipeline.swift` converts TDLib text + UTF-16 entity ranges into safe `AttributedString` ranges (bounds-checked) and applies formatting/link attributes.
 - `BottomScrim.swift` provides visual scrims/fades.
 
 ### 13.5 Inspector UI
@@ -303,6 +321,7 @@ Note: at this snapshot, section titles are in Russian (e.g., “Общие”), 
 - `Features/Chat/MessagesPane.swift` — Scroll-driven timeline view; day grouping; triggers paging.
 - `Features/Chat/MessageGroupView.swift` — Groups and lays out message bubbles (per-day, per-sender grouping).
 - `Features/Chat/MessageBubble.swift` — Bubble styling; trackpad time reveal; outgoing context menu (retry/delete).
+- `Features/Chat/MessageTextPipeline.swift` — Cached message text rendering pipeline (TDLib entities → safe `AttributedString`).
 - `Features/Chat/ComposerBar.swift` — Glass-effect message composer bar with send button.
 - `Features/Chat/BottomScrim.swift` — Bottom fade/scrim visuals supporting the chat UI.
 - `Features/Chat/ChatInspectorView.swift` — Inspector panel with pinned header and blur/dissolve effects; scroll-geometry driven.
@@ -318,7 +337,7 @@ Note: at this snapshot, section titles are in Russian (e.g., “Общие”), 
 ## 17. Snapshot constraints / known gaps
 
 - No interactive authentication/login UI.
-- Parsing currently does multiple `JSONSerialization` passes per update in several paths; this is correct-but-inefficient and could become a performance bottleneck with high update volume.
+- Parsing currently does multiple `JSONSerialization` passes per update in several paths; this is correct-but-inefficient and could become a performance bottleneck with high update volume. (The text/entity rendering path is now correctness-first; optimize only after stability.)
 - No integrated Assets catalog in the active build.
 
 ## 18. Glossary

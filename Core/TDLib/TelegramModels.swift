@@ -172,7 +172,13 @@ struct TGMessage: Identifiable, Hashable {
     }
 
     var messageKey: MessageKey {
-        MessageKey(chatId: chatId, messageId: id)
+        MessageKey(chatId: chatId, stableId: stableId)
+    }
+
+    var stableId: MessageStableId {
+        if id > 0 { return .server(id) }
+        if let localId { return .local(localId) }
+        return .server(id)
     }
 
     func withLocal(localId: UUID?, sendingId: Int32?) -> TGMessage {
@@ -183,9 +189,14 @@ struct TGMessage: Identifiable, Hashable {
     }
 }
 
+enum MessageStableId: Hashable {
+    case server(Int64)
+    case local(UUID)
+}
+
 struct MessageKey: Hashable {
     let chatId: Int64
-    let messageId: Int64
+    let stableId: MessageStableId
 }
 
 struct TGTextEntity: Hashable {

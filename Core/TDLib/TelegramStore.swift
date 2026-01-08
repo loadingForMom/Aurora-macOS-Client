@@ -97,6 +97,7 @@ final class TelegramStore: ObservableObject {
     var pendingByLocalId: [UUID: PendingLink] = [:]
     var localIdBySendingId: [Int32: UUID] = [:]
     var localIdByTempMessageId: [Int64: UUID] = [:]
+    var serverMessageIdByLocalId: [UUID: Int64] = [:]
     var nextLocalTempId: Int64 = -1
 
     // MARK: - History jobs
@@ -110,11 +111,13 @@ final class TelegramStore: ObservableObject {
         let requestedLimit: Int
         let windowLimit: Int
         let onlyLocal: Bool
+        let generation: Int
     }
 
     var historyJobs: [String: HistoryJob] = [:]
     var reachedHistoryStart: Set<Int64> = []
     var historyWindowLimitByChatId: [Int64: Int] = [:]
+    var historyGenerationByChatId: [Int64: Int] = [:]
 
     // MARK: - Init
 
@@ -347,11 +350,13 @@ final class TelegramStore: ObservableObject {
         pendingByLocalId = [:]
         localIdBySendingId = [:]
         localIdByTempMessageId = [:]
+        serverMessageIdByLocalId = [:]
         nextLocalTempId = -1
 
         historyJobs = [:]
         reachedHistoryStart = []
         historyWindowLimitByChatId = [:]
+        historyGenerationByChatId = [:]
 
         didLoadInitialData = false
         didSendTdlibParameters = false

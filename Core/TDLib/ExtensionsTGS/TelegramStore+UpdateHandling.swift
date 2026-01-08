@@ -228,6 +228,18 @@ extension TelegramStore {
 
         // History responses
         if let res = parseMessagesResponse(resp), let job = historyJobs[res.extra] {
+            let currentGeneration = historyGenerationByChatId[job.chatId] ?? 0
+            guard currentGeneration == job.generation else {
+                // Discard stale history so older responses can't replace a newer window.
+#if DEBUG
+                print("[HistoryMerge] chatId=\(job.chatId) discarded response gen=\(job.generation) current=\(currentGeneration)")
+#endif
+                historyJobs.removeValue(forKey: res.extra)
+                if selectedChatId == job.chatId {
+                    isLoadingHistory = historyJobs.values.contains(where: { $0.chatId == job.chatId })
+                }
+                return
+            }
 #if DEBUG
             let minId = res.messages.min(by: { $0.id < $1.id })?.id
             let maxId = res.messages.max(by: { $0.id < $1.id })?.id
@@ -247,7 +259,7 @@ extension TelegramStore {
             }
 
             historyJobs.removeValue(forKey: res.extra)
-            refreshMessagesWindow(chatId: job.chatId)
+            mergeMessages(chatId: job.chatId, incoming: res.messages, windowLimit: job.windowLimit, reason: "history:\(job.kind)")
 
             if job.kind == .initialLocal {
                 let extra = "history:\(job.chatId):initial:remote:\(UUID().uuidString)"
@@ -257,7 +269,8 @@ extension TelegramStore {
                     anchorMessageId: 0,
                     requestedLimit: job.requestedLimit,
                     windowLimit: job.windowLimit,
-                    onlyLocal: false
+                    onlyLocal: false,
+                    generation: job.generation
                 )
                 sendChatHistory(
                     chatId: job.chatId,
