@@ -19,6 +19,7 @@ struct MessagesPane: View {
     @State private var pagingInFlight: Bool = false
     @State private var restoreAnchorGroupId: String? = nil
     @State private var lastPagingAnchor: String? = nil
+    @State private var showLogs: Bool = false
 
     // “Don’t annoy me” UX
     @State private var isAtBottom: Bool = true
@@ -422,7 +423,7 @@ struct MessagesPane: View {
                             rowView(row, firstGroupId: firstGroupId)
                         }
 
-                        if store.showLogs {
+                        if showLogs {
                             Divider().padding(.vertical, 10)
                             Text(store.logs.joined(separator: "\n\n"))
                                 .font(.system(.footnote, design: .monospaced))
