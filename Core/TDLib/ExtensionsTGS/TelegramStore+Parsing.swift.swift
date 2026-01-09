@@ -458,9 +458,6 @@ extension TelegramStore {
             switch st {
             case "messageSendingStatePending":
                 sendState = .pending
-                if let sidNum = sending["sending_id"] as? NSNumber {
-                    sendingId = sidNum.int32Value
-                }
             case "messageSendingStateFailed":
                 canRetry = (sending["can_retry"] as? Bool) ?? false
                 if let err = sending["error"] as? [String: Any],
@@ -472,6 +469,9 @@ extension TelegramStore {
                 }
             default:
                 break
+            }
+            if let sidNum = sending["sending_id"] as? NSNumber {
+                sendingId = sidNum.int32Value
             }
         }
 

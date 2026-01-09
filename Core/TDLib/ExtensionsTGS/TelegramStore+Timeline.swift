@@ -15,8 +15,12 @@ extension TelegramStore {
 
     func appendMessage(_ msg: TGMessage, chatId: Int64) {
         var arr = messagesByChatId[chatId] ?? []
-        if arr.contains(where: { $0.messageKey == msg.messageKey }) { return }
-        arr.append(msg)
+        if let idx = arr.firstIndex(where: { $0.id == msg.id }) {
+            arr[idx] = msg
+        } else {
+            if arr.contains(where: { $0.messageKey == msg.messageKey }) { return }
+            arr.append(msg)
+        }
         arr = sortChronological(arr)
         if arr.count > 800 { arr.removeFirst(arr.count - 800) }
         messagesByChatId[chatId] = arr

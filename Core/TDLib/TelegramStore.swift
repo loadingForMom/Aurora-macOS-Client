@@ -185,11 +185,12 @@ final class TelegramStore: ObservableObject {
 
     // Read/viewed
     func viewMessages(chatId: Int64, messageIds: [Int64], forceRead: Bool = false) {
-        guard !messageIds.isEmpty else { return }
+        let filteredIds = messageIds.filter { $0 > 0 }
+        guard !filteredIds.isEmpty else { return }
         let req: [String: Any] = [
             "@type": "viewMessages",
             "chat_id": chatId,
-            "message_ids": messageIds,
+            "message_ids": filteredIds,
             "force_read": forceRead
         ]
         sendJSON(req)
