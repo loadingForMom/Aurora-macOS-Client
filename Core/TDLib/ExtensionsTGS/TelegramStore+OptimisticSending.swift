@@ -210,7 +210,13 @@ extension TelegramStore {
 
     func handleFunctionResponseMessage(_ resp: FunctionResponseMessage) {
         let msg = resp.message
-        if tryReconcileOutgoingPendingMessage(msg) {
+        let reconciled = tryReconcileOutgoingPendingMessage(msg)
+#if DEBUG
+        if let extra = resp.extra, extra.hasPrefix("send:") {
+            print("[SendResponse] handled message response extra=\(extra) reconciled=\(reconciled), skipped timeline insert")
+        }
+#endif
+        if reconciled {
             updateChatLastFromLocalTimeline(chatId: msg.chatId)
         }
     }
@@ -294,6 +300,11 @@ extension TelegramStore {
             resolvedLocalId = localId
         }
 
+        coalesceOutgoingDuplicates(chatId: chatId, localId: resolvedLocalId, keepMessageId: final.id, fallbackMessage: final)
+        if succ.oldMessageId != final.id {
+            _ = removeMessageById(chatId: chatId, id: succ.oldMessageId)
+        }
+
         if let localId = resolvedLocalId {
             pendingByLocalId.removeValue(forKey: localId)
             localIdBySendingId = localIdBySendingId.filter { $0.value != localId }
@@ -314,6 +325,8 @@ extension TelegramStore {
         if !didReplace {
             _ = replaceMessageIfExists(chatId: chatId, id: fail.message.id, newMessage: fail.message)
         }
+
+        coalesceOutgoingDuplicates(chatId: chatId, localId: localIdByTempMessageId[fail.oldMessageId], keepMessageId: fail.message.id, fallbackMessage: fail.message)
 
         if let localId = localIdByTempMessageId[fail.oldMessageId] {
             pendingByLocalId.removeValue(forKey: localId)
@@ -348,6 +361,7 @@ extension TelegramStore {
 #if DEBUG
             print("[Reconcile] updateNewMessage matched sending_id=\(sid) placeholderId=\(placeholderId)")
 #endif
+            coalesceOutgoingDuplicates(chatId: chatId, localId: localId, keepMessageId: merged.id, fallbackMessage: merged)
             return true
         }
 
@@ -377,6 +391,49 @@ extension TelegramStore {
 #if DEBUG
         print("[Reconcile] updateNewMessage matched fallback placeholderId=\(placeholderId)")
 #endif
+        coalesceOutgoingDuplicates(chatId: chatId, localId: link.localId, keepMessageId: merged.id, fallbackMessage: merged)
         return true
+    }
+
+    func coalesceOutgoingDuplicates(
+        chatId: Int64,
+        localId: UUID?,
+        keepMessageId: Int64,
+        fallbackMessage: TGMessage?
+    ) {
+        guard var arr = messagesByChatId[chatId] else { return }
+        var idsToRemove: [Int64] = []
+
+        if let localId {
+            idsToRemove = arr.filter { $0.localId == localId && $0.id != keepMessageId }.map(\.id)
+        } else if let fallbackMessage {
+            let fallbackText = fallbackMessage.rawText ?? fallbackMessage.text
+            let candidates = arr.filter {
+                $0.isOutgoing &&
+                ($0.rawText ?? $0.text) == fallbackText &&
+                abs($0.date - fallbackMessage.date) <= 10 &&
+                {
+                    switch $0.sendState {
+                    case .pending, .failed:
+                        return true
+                    case .sent:
+                        return false
+                    }
+                }()
+            }
+            if candidates.count == 1, let candidate = candidates.first, candidate.id != keepMessageId {
+                idsToRemove = [candidate.id]
+            }
+        }
+
+        guard !idsToRemove.isEmpty else { return }
+        idsToRemove.forEach { id in
+            arr.removeAll { $0.id == id }
+#if DEBUG
+            print("[Deduper] removed duplicate id=\(id) keep=\(keepMessageId) localId=\(localId?.uuidString ?? "nil")")
+#endif
+            databaseRepository?.deleteMessages(chatId: chatId, messageIds: [id])
+        }
+        messagesByChatId[chatId] = arr
     }
 }

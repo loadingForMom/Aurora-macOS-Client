@@ -154,7 +154,9 @@ extension TelegramStore {
             requestUserIfNeeded(msg.senderUserId)
 
             if tryReconcileOutgoingPendingMessage(msg) {
-                // reconciled
+#if DEBUG
+                print("[UpdateNewMessage] reconciled=true -> skip append")
+#endif
             } else {
                 appendMessage(msg, chatId: chatId)
             }
