@@ -62,6 +62,10 @@ final class TelegramStore: ObservableObject {
 
     var lastParsedUpdate: String?
     var lastParsedObject: [String: Any]?
+#if DEBUG
+    private var debugCachedParseCount = 0
+    private let debugCachedParseLogInterval = 200
+#endif
 
     // MARK: - Avatar service
 
@@ -123,13 +127,15 @@ final class TelegramStore: ObservableObject {
         }
 
         // ✅ ПОТОМ event loop (тут создаются closures и захватывается self)
-        td.startEventLoop(onUpdate: { [weak self] upd in
+        td.startEventLoop(onUpdate: { [weak self] upd, obj in
             Task { @MainActor in
+                self?.cacheParsedObject(json: upd, obj: obj)
                 self?.pushLog(upd)
                 self?.handleUpdate(upd)
             }
-        }, onResponse: { [weak self] resp in
+        }, onResponse: { [weak self] resp, obj in
             Task { @MainActor in
+                self?.cacheParsedObject(json: resp, obj: obj)
                 self?.pushLog(resp)
                 self?.handleResponse(resp)
             }
@@ -204,6 +210,18 @@ final class TelegramStore: ObservableObject {
         let stats = databaseRepository.fetchStats()
         lastDatabaseStats = stats
         print("[DB] Stats chats=\(stats.chats) messages=\(stats.messages) users=\(stats.users)")
+    }
+
+    private func cacheParsedObject(json: String, obj: [String: Any]?) {
+        guard let obj else { return }
+        lastParsedUpdate = json
+        lastParsedObject = obj
+#if DEBUG
+        debugCachedParseCount += 1
+        if debugCachedParseCount % debugCachedParseLogInterval == 0 {
+            print("[TDLib][parse] cached objects injected=\(debugCachedParseCount)")
+        }
+#endif
     }
 
     // MARK: - App DB helpers

@@ -15,6 +15,10 @@ final class TDLibClient {
 
     private var client: UnsafeMutableRawPointer?
     private var isRunning = false
+#if DEBUG
+    private var debugParseCount = 0
+    private let debugParseLogInterval = 200
+#endif
 
     init() {
         client = td_json_client_create()
@@ -49,7 +53,8 @@ final class TDLibClient {
         }
     }
 
-    func startEventLoop(onUpdate: @escaping (String) -> Void, onResponse: @escaping (String) -> Void) {
+    func startEventLoop(onUpdate: @escaping (String, [String: Any]?) -> Void,
+                        onResponse: @escaping (String, [String: Any]?) -> Void) {
         // Prevent accidental double-start.
         guard !isRunning else { return }
         isRunning = true
@@ -58,10 +63,19 @@ final class TDLibClient {
             guard let self else { return }
             while self.isRunning {
                 if let json = self.receive(timeout: 1.0) {
-                    if self.isUpdate(json) {
-                        onUpdate(json)
+                    let obj = self.parseJSONObject(json)
+#if DEBUG
+                    if obj != nil {
+                        self.debugParseCount += 1
+                        if self.debugParseCount % self.debugParseLogInterval == 0 {
+                            print("[TDLib][parse] eventLoop JSON parses=\(self.debugParseCount)")
+                        }
+                    }
+#endif
+                    if let obj, let type = obj["@type"] as? String, type.hasPrefix("update") {
+                        onUpdate(json, obj)
                     } else {
-                        onResponse(json)
+                        onResponse(json, obj)
                     }
                 }
             }
@@ -72,11 +86,10 @@ final class TDLibClient {
         isRunning = false
     }
 
-    private func isUpdate(_ json: String) -> Bool {
+    private func parseJSONObject(_ json: String) -> [String: Any]? {
         guard let data = json.data(using: .utf8),
-              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let type = obj["@type"] as? String
-        else { return false }
-        return type.hasPrefix("update")
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return nil }
+        return obj
     }
 }
