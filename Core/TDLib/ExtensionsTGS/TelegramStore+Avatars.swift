@@ -59,10 +59,12 @@ extension TelegramStore {
             bigFileId: bigFileId,
             initialBestPath: initialBestPath,
             chatAvatarMetaByChatId: &chatAvatarMetaByChatId,
-            chatIdByAvatarFileId: &chatIdByAvatarFileId,
-            requestedAvatarFileIds: &requestedAvatarFileIds,
-            downloadFileIfNeeded: downloadFileIfNeeded
+            chatIdByAvatarFileId: &chatIdByAvatarFileId
         )
+
+        if let sid = smallFileId {
+            downloadFileIfNeeded(fileId: sid, priority: 16)
+        }
     }
 
     func applyChatAvatarFileUpdate(chatId: Int64, fileId: Int32, path: String) {

@@ -132,9 +132,7 @@ final class AvatarService {
         bigFileId: Int32?,
         initialBestPath: String?,
         chatAvatarMetaByChatId: inout [Int64: ChatAvatarMeta],
-        chatIdByAvatarFileId: inout [Int32: Int64],
-        requestedAvatarFileIds: inout Set<Int32>,
-        downloadFileIfNeeded: (Int32, Int) -> Void
+        chatIdByAvatarFileId: inout [Int32: Int64]
     ) {
         var meta = chatAvatarMetaByChatId[chatId] ?? ChatAvatarMeta()
         meta.smallFileId = smallFileId
@@ -149,7 +147,6 @@ final class AvatarService {
 
         if let sid = smallFileId {
             chatIdByAvatarFileId[sid] = chatId
-            downloadFileIfNeeded(sid, 16)
         }
 
         if let bid = bigFileId {
