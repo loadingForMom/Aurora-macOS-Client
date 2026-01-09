@@ -56,6 +56,7 @@ extension TelegramStore {
             text: clean,
             date: now
         )
+        localIdByTempMessageId[placeholderId] = localId
         localIdBySendingId[sendingId] = localId
 
         let options: [String: Any] = [
@@ -222,6 +223,7 @@ extension TelegramStore {
         merged.sendingId = merged.sendingId ?? link.sendingId
 
         replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: merged)
+        _ = removeMessageById(chatId: chatId, id: placeholderId)
 
         link.placeholderId = merged.id
         pendingByLocalId[localId] = link
@@ -377,6 +379,7 @@ extension TelegramStore {
             merged.sendingId = sid
 
             replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: merged)
+            _ = removeMessageById(chatId: chatId, id: placeholderId)
 
             link.placeholderId = merged.id
             pendingByLocalId[localId] = link
@@ -407,6 +410,7 @@ extension TelegramStore {
         merged.sendingId = merged.sendingId ?? link.sendingId
 
         replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: merged)
+        _ = removeMessageById(chatId: chatId, id: placeholderId)
 
         link.placeholderId = merged.id
         pendingByLocalId[link.localId] = link

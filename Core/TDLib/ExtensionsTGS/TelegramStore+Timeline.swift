@@ -43,9 +43,11 @@ extension TelegramStore {
 
     func removeMessageById(chatId: Int64, id: Int64) -> TGMessage? {
         var arr = messagesByChatId[chatId] ?? []
-        guard let idx = arr.firstIndex(where: { $0.id == id }) else { return nil }
-        let removed = arr.remove(at: idx)
-        messagesByChatId[chatId] = arr
+        var removed: TGMessage?
+        if let idx = arr.firstIndex(where: { $0.id == id }) {
+            removed = arr.remove(at: idx)
+            messagesByChatId[chatId] = arr
+        }
         databaseRepository?.deleteMessages(chatId: chatId, messageIds: [id])
         return removed
     }
