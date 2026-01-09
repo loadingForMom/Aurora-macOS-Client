@@ -56,6 +56,7 @@ extension TelegramStore {
             text: clean,
             date: now
         )
+        localIdByTempMessageId[placeholderId] = localId
         localIdBySendingId[sendingId] = localId
 
         let options: [String: Any] = [
@@ -208,9 +209,36 @@ extension TelegramStore {
         return FunctionResponseMessage(extra: extra, message: msg, raw: obj)
     }
 
+    func reconcileFunctionResponseSend(extra: String?, msg: TGMessage) -> Bool {
+        guard let extra, extra.hasPrefix("send:") else { return false }
+        let suffix = String(extra.dropFirst("send:".count))
+        guard let localId = UUID(uuidString: suffix),
+              var link = pendingByLocalId[localId] else { return false }
+
+        let chatId = link.chatId
+        let placeholderId = link.placeholderId
+
+        var merged = msg
+        merged.localId = localId
+        merged.sendingId = merged.sendingId ?? link.sendingId
+
+        replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: merged)
+        _ = removeMessageById(chatId: chatId, id: placeholderId)
+
+        link.placeholderId = merged.id
+        pendingByLocalId[localId] = link
+        localIdByTempMessageId[merged.id] = localId
+        serverMessageIdByLocalId[localId] = merged.id
+
+        keepOptimisticChatPreviewIfNeeded(chatId: chatId)
+        coalesceOutgoingDuplicates(chatId: chatId, localId: localId, keepMessageId: merged.id, fallbackMessage: merged)
+        return true
+    }
+
     func handleFunctionResponseMessage(_ resp: FunctionResponseMessage) {
         let msg = resp.message
-        let reconciled = tryReconcileOutgoingPendingMessage(msg)
+        let reconciled = reconcileFunctionResponseSend(extra: resp.extra, msg: msg)
+            || tryReconcileOutgoingPendingMessage(msg)
 #if DEBUG
         if let extra = resp.extra, extra.hasPrefix("send:") {
             print("[SendResponse] handled message response extra=\(extra) reconciled=\(reconciled), skipped timeline insert")
@@ -351,6 +379,7 @@ extension TelegramStore {
             merged.sendingId = sid
 
             replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: merged)
+            _ = removeMessageById(chatId: chatId, id: placeholderId)
 
             link.placeholderId = merged.id
             pendingByLocalId[localId] = link
@@ -381,6 +410,7 @@ extension TelegramStore {
         merged.sendingId = merged.sendingId ?? link.sendingId
 
         replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: merged)
+        _ = removeMessageById(chatId: chatId, id: placeholderId)
 
         link.placeholderId = merged.id
         pendingByLocalId[link.localId] = link
