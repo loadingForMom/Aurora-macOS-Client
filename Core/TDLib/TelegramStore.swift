@@ -39,6 +39,7 @@ final class TelegramStore: ObservableObject {
     let cacheLimitBytesKey = "aurora.cache_limit_bytes"
     var storageExtrasInFlight: Set<String> = []
     var didRequestInitialStorageStats = false
+    let storageManager = StorageManager()
 
     // MARK: - Current user (Settings header)
 
