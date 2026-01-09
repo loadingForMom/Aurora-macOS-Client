@@ -105,8 +105,8 @@ struct TGMessage: Identifiable, Hashable {
 
     /// correctness-first rendering payload
     let contentType: String
-    let rawText: String?
-    let entities: [TGTextEntity]
+    var rawText: String?
+    var entities: [TGTextEntity]
 
     // Optimistic / sending state
     var sendState: TGMessageSendState

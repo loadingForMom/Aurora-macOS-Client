@@ -20,12 +20,11 @@ extension TelegramStore {
         return x
     }
 
+    @MainActor
     func startPendingCleanupTimer() {
         pendingCleanupTimer?.invalidate()
         pendingCleanupTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.cleanupExpiredPendingItems()
-            }
+            self?.cleanupExpiredPendingItems()
         }
     }
 
