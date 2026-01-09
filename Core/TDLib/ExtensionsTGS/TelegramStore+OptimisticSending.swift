@@ -146,7 +146,14 @@ extension TelegramStore {
 
     func optimisticInsertMessage(_ msg: TGMessage) {
         var arr = messagesByChatId[msg.chatId] ?? []
-        arr.append(msg)
+        if let idx = arr.firstIndex(where: { $0.id == msg.id }) {
+            arr[idx] = msg
+#if DEBUG
+            print("[Message][dedupe] chatId=\(msg.chatId) replaced existing id=\(msg.id) (optimisticInsert)")
+#endif
+        } else {
+            arr.append(msg)
+        }
         arr = sortChronological(arr)
         if arr.count > 800 { arr.removeFirst(arr.count - 800) }
         messagesByChatId[msg.chatId] = arr
@@ -203,7 +210,13 @@ extension TelegramStore {
 
     func handleFunctionResponseMessage(_ resp: FunctionResponseMessage) {
         let msg = resp.message
-        if tryReconcileOutgoingPendingMessage(msg) {
+        let reconciled = tryReconcileOutgoingPendingMessage(msg)
+#if DEBUG
+        if let extra = resp.extra, extra.hasPrefix("send:") {
+            print("[SendResponse] handled message response extra=\(extra) reconciled=\(reconciled), skipped timeline insert")
+        }
+#endif
+        if reconciled {
             updateChatLastFromLocalTimeline(chatId: msg.chatId)
         }
     }
@@ -263,10 +276,36 @@ extension TelegramStore {
         var final = succ.message
         final.sendState = .sent
         final.canRetry = false
+        var resolvedLocalId: UUID? = localIdByTempMessageId[succ.oldMessageId]
+        var didReplace = replaceMessageIfExists(chatId: chatId, id: succ.oldMessageId, newMessage: final)
+        if !didReplace, let sendingId = final.sendingId, let localId = localIdBySendingId[sendingId],
+           let link = pendingByLocalId[localId] {
+            resolvedLocalId = localId
+            didReplace = replaceMessageIfExists(chatId: chatId, id: link.placeholderId, newMessage: final)
+            if didReplace {
+#if DEBUG
+                print("[Reconcile] sendSucceeded matched sending_id=\(sendingId) placeholderId=\(link.placeholderId)")
+#endif
+            }
+        }
+        if !didReplace, let localId = resolvedLocalId, let link = pendingByLocalId[localId] {
+            didReplace = replaceMessageIfExists(chatId: chatId, id: link.placeholderId, newMessage: final)
+        }
+        if !didReplace {
+            _ = replaceMessageIfExists(chatId: chatId, id: final.id, newMessage: final)
+        }
 
-        replaceMessage(chatId: chatId, oldId: succ.oldMessageId, newMessage: final)
+        if resolvedLocalId == nil,
+           let localId = serverMessageIdByLocalId.first(where: { $0.value == final.id })?.key {
+            resolvedLocalId = localId
+        }
 
-        if let localId = localIdByTempMessageId[succ.oldMessageId] {
+        coalesceOutgoingDuplicates(chatId: chatId, localId: resolvedLocalId, keepMessageId: final.id, fallbackMessage: final)
+        if succ.oldMessageId != final.id {
+            _ = removeMessageById(chatId: chatId, id: succ.oldMessageId)
+        }
+
+        if let localId = resolvedLocalId {
             pendingByLocalId.removeValue(forKey: localId)
             localIdBySendingId = localIdBySendingId.filter { $0.value != localId }
             localIdByTempMessageId.removeValue(forKey: succ.oldMessageId)
@@ -278,7 +317,16 @@ extension TelegramStore {
 
     func handleSendFailed(_ fail: SendFailed) {
         let chatId = fail.message.chatId
-        replaceMessage(chatId: chatId, oldId: fail.oldMessageId, newMessage: fail.message)
+        var didReplace = replaceMessageIfExists(chatId: chatId, id: fail.oldMessageId, newMessage: fail.message)
+        if !didReplace, let localId = localIdByTempMessageId[fail.oldMessageId],
+           let link = pendingByLocalId[localId] {
+            didReplace = replaceMessageIfExists(chatId: chatId, id: link.placeholderId, newMessage: fail.message)
+        }
+        if !didReplace {
+            _ = replaceMessageIfExists(chatId: chatId, id: fail.message.id, newMessage: fail.message)
+        }
+
+        coalesceOutgoingDuplicates(chatId: chatId, localId: localIdByTempMessageId[fail.oldMessageId], keepMessageId: fail.message.id, fallbackMessage: fail.message)
 
         if let localId = localIdByTempMessageId[fail.oldMessageId] {
             pendingByLocalId.removeValue(forKey: localId)
@@ -292,25 +340,93 @@ extension TelegramStore {
 
     func tryReconcileOutgoingPendingMessage(_ msg: TGMessage) -> Bool {
         guard msg.isOutgoing else { return false }
-        guard let sid = msg.sendingId else { return false }
-        guard let localId = localIdBySendingId[sid] else { return false }
-        guard var link = pendingByLocalId[localId] else { return false }
+        if let sid = msg.sendingId,
+           let localId = localIdBySendingId[sid],
+           var link = pendingByLocalId[localId] {
+            let chatId = link.chatId
+            let placeholderId = link.placeholderId
+
+            var merged = msg
+            merged.localId = localId
+            merged.sendingId = sid
+
+            replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: merged)
+
+            link.placeholderId = merged.id
+            pendingByLocalId[localId] = link
+            localIdByTempMessageId[merged.id] = localId
+            serverMessageIdByLocalId[localId] = merged.id
+
+            keepOptimisticChatPreviewIfNeeded(chatId: chatId)
+#if DEBUG
+            print("[Reconcile] updateNewMessage matched sending_id=\(sid) placeholderId=\(placeholderId)")
+#endif
+            coalesceOutgoingDuplicates(chatId: chatId, localId: localId, keepMessageId: merged.id, fallbackMessage: merged)
+            return true
+        }
+
+        let messageText = msg.rawText ?? msg.text
+        let candidates = pendingByLocalId.values.filter {
+            $0.chatId == msg.chatId &&
+            abs($0.date - msg.date) <= 10 &&
+            $0.text == messageText
+        }
+        guard candidates.count == 1, let match = candidates.first else { return false }
+        guard var link = pendingByLocalId[match.localId] else { return false }
 
         let chatId = link.chatId
         let placeholderId = link.placeholderId
-
         var merged = msg
-        merged.localId = localId
-        merged.sendingId = sid
+        merged.localId = link.localId
+        merged.sendingId = merged.sendingId ?? link.sendingId
 
         replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: merged)
 
         link.placeholderId = merged.id
-        pendingByLocalId[localId] = link
-        localIdByTempMessageId[merged.id] = localId
-        serverMessageIdByLocalId[localId] = merged.id
+        pendingByLocalId[link.localId] = link
+        localIdByTempMessageId[merged.id] = link.localId
+        serverMessageIdByLocalId[link.localId] = merged.id
 
         keepOptimisticChatPreviewIfNeeded(chatId: chatId)
+#if DEBUG
+        print("[Reconcile] updateNewMessage matched fallback placeholderId=\(placeholderId)")
+#endif
+        coalesceOutgoingDuplicates(chatId: chatId, localId: link.localId, keepMessageId: merged.id, fallbackMessage: merged)
         return true
+    }
+
+    func coalesceOutgoingDuplicates(
+        chatId: Int64,
+        localId: UUID?,
+        keepMessageId: Int64,
+        fallbackMessage: TGMessage?
+    ) {
+        guard var arr = messagesByChatId[chatId] else { return }
+        var idsToRemove: [Int64] = []
+
+        if let localId {
+            idsToRemove = arr.filter { $0.localId == localId && $0.id != keepMessageId }.map(\.id)
+        } else if let fallbackMessage {
+            let fallbackText = fallbackMessage.rawText ?? fallbackMessage.text
+            let candidates = arr.filter {
+                $0.isOutgoing &&
+                ($0.rawText ?? $0.text) == fallbackText &&
+                abs($0.date - fallbackMessage.date) <= 10 &&
+                ($0.sendState != .sent)
+            }
+            if candidates.count == 1, let candidate = candidates.first, candidate.id != keepMessageId {
+                idsToRemove = [candidate.id]
+            }
+        }
+
+        guard !idsToRemove.isEmpty else { return }
+        idsToRemove.forEach { id in
+            arr.removeAll { $0.id == id }
+#if DEBUG
+            print("[Deduper] removed duplicate id=\(id) keep=\(keepMessageId) localId=\(localId?.uuidString ?? "nil")")
+#endif
+            self.deleteMessages(chatId: chatId, messageIds: [id]) // deleteMessages(chatId:messageIds:)
+        }
+        messagesByChatId[chatId] = arr
     }
 }
