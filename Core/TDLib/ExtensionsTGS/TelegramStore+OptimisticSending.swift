@@ -412,14 +412,7 @@ extension TelegramStore {
                 $0.isOutgoing &&
                 ($0.rawText ?? $0.text) == fallbackText &&
                 abs($0.date - fallbackMessage.date) <= 10 &&
-                {
-                    switch $0.sendState {
-                    case .pending, .failed:
-                        return true
-                    case .sent:
-                        return false
-                    }
-                }()
+                ($0.sendState != .sent)
             }
             if candidates.count == 1, let candidate = candidates.first, candidate.id != keepMessageId {
                 idsToRemove = [candidate.id]
