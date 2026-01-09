@@ -36,15 +36,21 @@ extension TelegramStore {
 
         let now = Int(Date().timeIntervalSince1970)
         for var message in pendingMessages {
+            var needsPersist = false
             if message.localId == nil {
                 message.localId = UUID()
-                persistMessage(message)
+                needsPersist = true
             }
             if message.sendingId == nil {
                 message.sendingId = makeSendingId()
-                persistMessage(message)
+                needsPersist = true
             }
             guard let localId = message.localId else { continue }
+            if needsPersist {
+                if !replaceMessageIfExists(chatId: message.chatId, id: message.id, newMessage: message) {
+                    persistMessage(message)
+                }
+            }
 
             let link = PendingLink(
                 chatId: message.chatId,
@@ -462,6 +468,19 @@ extension TelegramStore {
             persistMessage(finalMessage)
         }
 
+        if let finalMessage, placeholderId != finalMessage.id {
+            if var arr = messagesByChatId[chatId], arr.contains(where: { $0.id == placeholderId }) {
+                arr.removeAll { $0.id == placeholderId }
+                messagesByChatId[chatId] = arr
+            }
+            databaseRepository?.deleteMessages(chatId: chatId, messageIds: [placeholderId])
+#if DEBUG
+            if let repo = databaseRepository, repo.messageExists(chatId: chatId, messageId: placeholderId) {
+                assertionFailure("[Pending] placeholder row leak chatId=\(chatId) id=\(placeholderId)")
+            }
+#endif
+        }
+
         updateChatLastFromLocalTimeline(chatId: chatId)
         logPendingTransition(result: result, link: link, message: finalMessage)
     }
@@ -520,6 +539,9 @@ extension TelegramStore {
         merged.sendingId = merged.sendingId ?? link.sendingId
         merged.retryCount = link.retryCount
         merged.nextRetryAt = link.nextRetryAt
+        if merged.replyToMessageId == nil { merged.replyToMessageId = link.replyToMessageId }
+        if merged.rawText == nil { merged.rawText = link.rawText }
+        if merged.entities.isEmpty { merged.entities = link.entities }
         if case .pending = merged.sendState {
             merged.sendState = .sending
         }
@@ -536,6 +558,7 @@ extension TelegramStore {
 
         keepOptimisticChatPreviewIfNeeded(chatId: chatId)
         coalesceOutgoingDuplicates(chatId: chatId, localId: localId, keepMessageId: merged.id, fallbackMessage: merged)
+        persistMessage(merged)
 
 #if DEBUG
         print("[Reconcile] \(logLabel) localId=\(localId.uuidString) placeholderId=\(placeholderId) -> messageId=\(merged.id)")

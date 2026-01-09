@@ -20,3 +20,9 @@
 ## Retry + cancel
 - Force a send failure and retry; verify the same localId is reused and only one placeholder exists.
 - Cancel a pending message; confirm it is removed from the timeline and DB.
+
+## Placeholder row cleanup
+- After reconcile where placeholderId != serverId, verify DB contains ONLY the serverId row.
+
+## Restart after sent
+- Send, reconcile, restart, load history from DB: no negative/temp message ids should reappear.

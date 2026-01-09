@@ -300,6 +300,22 @@ final class AppDatabaseRepository {
         }
     }
 
+    func messageExists(chatId: Int64, messageId: Int64) -> Bool {
+        do {
+            return try dbWriter.read { db in
+                let count = try Int.fetchOne(
+                    db,
+                    sql: "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND message_id = ?",
+                    arguments: [chatId, messageId]
+                ) ?? 0
+                return count > 0
+            }
+        } catch {
+            print("[DB] messageExists failed: \(error)")
+            return false
+        }
+    }
+
     func fetchPendingMessages() -> [TGMessage] {
         do {
             return try dbWriter.read { db in

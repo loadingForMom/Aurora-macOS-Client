@@ -59,13 +59,29 @@ extension TelegramStore {
         } else {
             arr.append(newMessage)
         }
-        if let dupIdx = arr.firstIndex(where: { $0.id == newMessage.id && $0.messageKey != newMessage.messageKey }) {
-            arr.remove(at: dupIdx)
+        var deduped: [TGMessage] = []
+        var seenIds = Set<Int64>()
+        for msg in arr {
+            if msg.id == newMessage.id {
+                if !seenIds.contains(msg.id) {
+                    deduped.append(newMessage)
+                    seenIds.insert(msg.id)
+                }
+                continue
+            }
+            if seenIds.insert(msg.id).inserted {
+                deduped.append(msg)
+            }
         }
+        arr = deduped
         arr = sortChronological(arr)
         if arr.count > 800 { arr.removeFirst(arr.count - 800) }
         messagesByChatId[chatId] = arr
         persistMessage(newMessage)
+#if DEBUG
+        let ids = arr.map(\.id)
+        assert(Set(ids).count == ids.count, "[Timeline] duplicate message ids after replace chatId=\(chatId)")
+#endif
     }
 
     // Merge (do not replace) to avoid dropping newer tail/optimistic rows when history windows arrive.
