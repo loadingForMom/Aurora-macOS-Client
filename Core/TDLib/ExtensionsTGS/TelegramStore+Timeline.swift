@@ -86,6 +86,11 @@ extension TelegramStore {
         messagesByChatId[chatId] = merged
 
 #if DEBUG
+        if reason.hasPrefix("history") && beforeCount > 0 {
+            let existingKeys = Set(existing.map(\.messageKey))
+            let mergedKeys = Set(merged.map(\.messageKey))
+            assert(!existingKeys.isDisjoint(with: mergedKeys), "[HistoryMerge] chatId=\(chatId) replaced timeline during \(reason)")
+        }
         let afterMax = merged.map(\.id).max() ?? 0
         print("[HistoryMerge] chatId=\(chatId) reason=\(reason) count \(beforeCount)->\(merged.count) maxId \(beforeMax)->\(afterMax)")
 #endif
