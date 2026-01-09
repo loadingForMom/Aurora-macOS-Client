@@ -432,7 +432,7 @@ extension TelegramStore {
 #if DEBUG
             print("[Deduper] removed duplicate id=\(id) keep=\(keepMessageId) localId=\(localId?.uuidString ?? "nil")")
 #endif
-            deleteMessages(chatId: chatId, messageIds: [id])
+            self.deleteMessages(chatId: chatId, messageIds: [id]) // deleteMessages(chatId:messageIds:)
         }
         messagesByChatId[chatId] = arr
     }
