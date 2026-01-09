@@ -24,7 +24,9 @@ struct ChatScreen: View {
                     onSend: {
                         let t = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !t.isEmpty else { return }
-                        store.sendText(chatId: chat.id, text: t)
+                        Task { @MainActor in
+                            store.sendText(chatId: chat.id, text: t)
+                        }
                         draft = ""
                     }
                 )

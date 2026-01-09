@@ -89,6 +89,7 @@ struct TGUser: Identifiable, Hashable {
 enum TGMessageSendState: Hashable {
     case sent
     case pending
+    case sending
     case failed(errorText: String)
 }
 
@@ -110,6 +111,9 @@ struct TGMessage: Identifiable, Hashable {
     // Optimistic / sending state
     var sendState: TGMessageSendState
 
+    /// Reply-to message id (if any).
+    var replyToMessageId: Int64?
+
     /// Local identity for UI bookkeeping (optimistic placeholder ↔ TDLib message).
     var localId: UUID?
 
@@ -122,6 +126,10 @@ struct TGMessage: Identifiable, Hashable {
     /// From TDLib messageSendingStateFailed.can_retry (and/or sending_state.failed.can_retry).
     var canRetry: Bool
 
+    /// Local retry bookkeeping.
+    var retryCount: Int
+    var nextRetryAt: Int?
+
     init(
         id: Int64,
         chatId: Int64,
@@ -133,10 +141,13 @@ struct TGMessage: Identifiable, Hashable {
         rawText: String? = nil,
         entities: [TGTextEntity] = [],
         sendState: TGMessageSendState = .sent,
+        replyToMessageId: Int64? = nil,
         localId: UUID? = nil,
         sendingId: Int32? = nil,
         editedAt: Int? = nil,
-        canRetry: Bool = false
+        canRetry: Bool = false,
+        retryCount: Int = 0,
+        nextRetryAt: Int? = nil
     ) {
         self.id = id
         self.chatId = chatId
@@ -148,10 +159,13 @@ struct TGMessage: Identifiable, Hashable {
         self.rawText = rawText
         self.entities = entities
         self.sendState = sendState
+        self.replyToMessageId = replyToMessageId
         self.localId = localId
         self.sendingId = sendingId
         self.editedAt = editedAt
         self.canRetry = canRetry
+        self.retryCount = retryCount
+        self.nextRetryAt = nextRetryAt
     }
 
     var isEdited: Bool {

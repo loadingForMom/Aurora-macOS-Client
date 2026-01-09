@@ -118,10 +118,14 @@ final class AppDatabaseRepository {
                         text,
                         send_state,
                         send_state_error,
+                        local_id,
+                        reply_to_message_id,
                         can_retry,
+                        retry_count,
+                        next_retry_at,
                         edited_at,
                         sending_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(chat_id, message_id) DO UPDATE SET
                         date = excluded.date,
                         sender_user_id = excluded.sender_user_id,
@@ -129,7 +133,11 @@ final class AppDatabaseRepository {
                         text = excluded.text,
                         send_state = excluded.send_state,
                         send_state_error = excluded.send_state_error,
+                        local_id = excluded.local_id,
+                        reply_to_message_id = excluded.reply_to_message_id,
                         can_retry = excluded.can_retry,
+                        retry_count = excluded.retry_count,
+                        next_retry_at = excluded.next_retry_at,
                         edited_at = excluded.edited_at,
                         sending_id = excluded.sending_id
                     """,
@@ -142,7 +150,11 @@ final class AppDatabaseRepository {
                         message.text,
                         state,
                         errorText,
+                        message.localId?.uuidString,
+                        message.replyToMessageId,
                         message.canRetry,
+                        message.retryCount,
+                        message.nextRetryAt,
                         message.editedAt,
                         message.sendingId
                     ]
@@ -168,7 +180,8 @@ final class AppDatabaseRepository {
                     db,
                     sql: """
                     SELECT chat_id, message_id, date, sender_user_id, is_outgoing, text,
-                           send_state, send_state_error, can_retry, edited_at, sending_id
+                           send_state, send_state_error, local_id, reply_to_message_id,
+                           can_retry, retry_count, next_retry_at, edited_at, sending_id
                     FROM messages
                     WHERE chat_id = :chatId
                     ORDER BY message_id DESC
@@ -213,7 +226,8 @@ final class AppDatabaseRepository {
                     db,
                     sql: """
                     SELECT chat_id, message_id, date, sender_user_id, is_outgoing, text,
-                           send_state, send_state_error, can_retry, edited_at, sending_id
+                           send_state, send_state_error, local_id, reply_to_message_id,
+                           can_retry, retry_count, next_retry_at, edited_at, sending_id
                     FROM messages
                     WHERE chat_id = :chatId AND message_id < :before
                     ORDER BY message_id DESC
@@ -286,6 +300,28 @@ final class AppDatabaseRepository {
         }
     }
 
+    func fetchPendingMessages() -> [TGMessage] {
+        do {
+            return try dbWriter.read { db in
+                let rows = try Row.fetchAll(
+                    db,
+                    sql: """
+                    SELECT chat_id, message_id, date, sender_user_id, is_outgoing, text,
+                           send_state, send_state_error, local_id, reply_to_message_id,
+                           can_retry, retry_count, next_retry_at, edited_at, sending_id
+                    FROM messages
+                    WHERE send_state IN ('pending', 'sending') AND is_outgoing = 1
+                    ORDER BY date DESC
+                    """
+                )
+                return rows.map(mapMessageRow)
+            }
+        } catch {
+            print("[DB] fetchPendingMessages failed: \(error)")
+            return []
+        }
+    }
+
     private func mapMessageRow(_ row: Row) -> TGMessage {
         let chatId: Int64 = row["chat_id"]
         let messageId: Int64 = row["message_id"]
@@ -297,7 +333,11 @@ final class AppDatabaseRepository {
             state: row["send_state"],
             error: row["send_state_error"]
         )
+        let localIdString: String? = row["local_id"]
+        let replyToMessageId: Int64? = row["reply_to_message_id"]
         let canRetry: Bool = row["can_retry"]
+        let retryCount: Int = row["retry_count"]
+        let nextRetryAt: Int? = row["next_retry_at"]
         let editedAt: Int? = row["edited_at"]
         let sendingId: Int32? = row["sending_id"]
 
@@ -312,10 +352,13 @@ final class AppDatabaseRepository {
             rawText: text,
             entities: [],
             sendState: sendState,
-            localId: nil,
+            replyToMessageId: replyToMessageId,
+            localId: localIdString.flatMap(UUID.init(uuidString:)),
             sendingId: sendingId,
             editedAt: editedAt,
-            canRetry: canRetry
+            canRetry: canRetry,
+            retryCount: retryCount,
+            nextRetryAt: nextRetryAt
         )
     }
 
@@ -325,6 +368,8 @@ final class AppDatabaseRepository {
             return ("sent", nil)
         case .pending:
             return ("pending", nil)
+        case .sending:
+            return ("sending", nil)
         case .failed(let errorText):
             return ("failed", errorText)
         }
@@ -334,6 +379,8 @@ final class AppDatabaseRepository {
         switch state {
         case "pending":
             return .pending
+        case "sending":
+            return .sending
         case "failed":
             return .failed(errorText: error ?? "Failed to send")
         default:

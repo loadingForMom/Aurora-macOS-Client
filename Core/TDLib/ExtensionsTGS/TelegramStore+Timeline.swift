@@ -59,6 +59,9 @@ extension TelegramStore {
         } else {
             arr.append(newMessage)
         }
+        if let dupIdx = arr.firstIndex(where: { $0.id == newMessage.id && $0.messageKey != newMessage.messageKey }) {
+            arr.remove(at: dupIdx)
+        }
         arr = sortChronological(arr)
         if arr.count > 800 { arr.removeFirst(arr.count - 800) }
         messagesByChatId[chatId] = arr
@@ -126,6 +129,10 @@ extension TelegramStore {
             let mergedKeys = Set(merged.map(\.messageKey))
             assert(!existingKeys.isDisjoint(with: mergedKeys), "[HistoryMerge] chatId=\(chatId) replaced timeline during \(reason)")
         }
+        let mergedIds = merged.map(\.id)
+        let mergedKeys = merged.map(\.messageKey)
+        assert(Set(mergedIds).count == mergedIds.count, "[HistoryMerge] chatId=\(chatId) duplicate message ids after merge")
+        assert(Set(mergedKeys).count == mergedKeys.count, "[HistoryMerge] chatId=\(chatId) duplicate message keys after merge")
         let afterMax = merged.map(\.id).max() ?? 0
         print("[HistoryMerge] chatId=\(chatId) reason=\(reason) count \(beforeCount)->\(merged.count) maxId \(beforeMax)->\(afterMax)")
 #endif
@@ -140,6 +147,8 @@ extension TelegramStore {
 
         switch localLast.sendState {
         case .pending:
+            c.lastMessagePreview = "You: (sending…) \(localLast.previewText)"
+        case .sending:
             c.lastMessagePreview = "You: (sending…) \(localLast.previewText)"
         case .failed:
             c.lastMessagePreview = "You: (failed) \(localLast.previewText)"
@@ -161,6 +170,8 @@ extension TelegramStore {
             c.lastMessageDate = last.date
             switch last.sendState {
             case .pending:
+                c.lastMessagePreview = "You: (sending…) \(last.previewText)"
+            case .sending:
                 c.lastMessagePreview = "You: (sending…) \(last.previewText)"
             case .failed:
                 c.lastMessagePreview = "You: (failed) \(last.previewText)"
