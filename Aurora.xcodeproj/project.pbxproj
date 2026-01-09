@@ -8,6 +8,9 @@
 
 /* Begin PBXBuildFile section */
 		4BAF66654B604D97B1825501 /* AppDatabaseRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E6E622924B142AC9E7EC3AF /* AppDatabaseRepository.swift */; };
+		84C7420A2F1144480041D863 /* ImageMemCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84C742082F1144480041D863 /* ImageMemCache.swift */; };
+		84C7420B2F1144480041D863 /* AvatarService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84C742092F1144480041D863 /* AvatarService.swift */; };
+		84C7420D2F11446E0041D863 /* ThumbnailService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84C7420C2F11446E0041D863 /* ThumbnailService.swift */; };
 		84D085012F094A5A00C35112 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085002F0949F700C35112 /* ContentView.swift */; };
 		84D085022F094A5A00C35112 /* AuroraApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D084FF2F0949CC00C35112 /* AuroraApp.swift */; };
 		84D085062F094CED00C35112 /* libtdjson.1.8.59.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = 84D085052F094CED00C35112 /* libtdjson.1.8.59.dylib */; };
@@ -59,6 +62,9 @@
 
 /* Begin PBXFileReference section */
 		84C741C82F103DE00041D863 /* AURORA_CODEBASE_DOCUMENTATION.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = AURORA_CODEBASE_DOCUMENTATION.md; sourceTree = "<group>"; };
+		84C742082F1144480041D863 /* ImageMemCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageMemCache.swift; sourceTree = "<group>"; };
+		84C742092F1144480041D863 /* AvatarService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AvatarService.swift; sourceTree = "<group>"; };
+		84C7420C2F11446E0041D863 /* ThumbnailService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThumbnailService.swift; sourceTree = "<group>"; };
 		84D084E32F09476900C35112 /* Aurora.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Aurora.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		84D084FF2F0949CC00C35112 /* AuroraApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuroraApp.swift; sourceTree = "<group>"; };
 		84D085002F0949F700C35112 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -185,7 +191,10 @@
 			children = (
 				84EE1A052F0D35BB00890773 /* ExtensionsTGS */,
 				84D085112F095F9B00C35112 /* TelegramStore.swift */,
+				84C742092F1144480041D863 /* AvatarService.swift */,
+				84C742082F1144480041D863 /* ImageMemCache.swift */,
 				84D0850D2F095F2F00C35112 /* TelegramModels.swift */,
+				84C7420C2F11446E0041D863 /* ThumbnailService.swift */,
 				84D085092F094D8400C35112 /* TDLibClient.swift */,
 				84D085032F094BC300C35112 /* TDLibBridge.h */,
 			);
@@ -357,6 +366,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				84C7420D2F11446E0041D863 /* ThumbnailService.swift in Sources */,
+				84C7420A2F1144480041D863 /* ImageMemCache.swift in Sources */,
+				84C7420B2F1144480041D863 /* AvatarService.swift in Sources */,
 				84EE1A0F2F0D368400890773 /* TelegramStore+Timeline.swift in Sources */,
 				84D0851D2F09691700C35112 /* ChatInspectorView.swift in Sources */,
 				84EE1A152F0D36CD00890773 /* TelegramStore+Parsing.swift.swift in Sources */,
