@@ -22,7 +22,6 @@ final class TelegramStore: ObservableObject {
     @Published var isLoadingHistory: Bool = false
 
     @Published var logs: [String] = []
-    @Published var showLogs: Bool = false
 
     // MARK: - App DB
 
@@ -50,12 +49,7 @@ final class TelegramStore: ObservableObject {
 
     @Published var chatAvatarPathByChatId: [Int64: String] = [:]
 
-    struct ChatAvatarMeta {
-        var smallFileId: Int32?
-        var bigFileId: Int32?
-        var smallPath: String?
-        var bigPath: String?
-    }
+    typealias ChatAvatarMeta = AvatarService.ChatAvatarMeta
 
     var chatAvatarMetaByChatId: [Int64: ChatAvatarMeta] = [:]
     var chatIdByAvatarFileId: [Int32: Int64] = [:]
@@ -68,15 +62,9 @@ final class TelegramStore: ObservableObject {
     var lastParsedUpdate: String?
     var lastParsedObject: [String: Any]?
 
-    // MARK: - Thumbnail cache
+    // MARK: - Avatar service
 
-    let imageMemCache = NSCache<NSString, NSImage>()
-    let thumbsDirURL: URL
-
-    let defaultListThumbMaxPx: Int = 128
-    let defaultProfileThumbMaxPx: Int = 128
-    let defaultInspectorThumbMaxPx: Int = 1024
-    let defaultPosterThumbMaxPx: Int = 2048
+    let avatarService = AvatarService()
 
     // MARK: - Boot flags
 
@@ -122,14 +110,6 @@ final class TelegramStore: ObservableObject {
     // MARK: - Init
 
     init() {
-        // Thumbs directory
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("Aurora/thumbs", isDirectory: true)
-        thumbsDirURL = dir
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-
-        imageMemCache.countLimit = 256
-
         // ✅ СНАЧАЛА DB (до любых замыканий, где мелькает self)
         do {
             let db = try AppDatabase()
