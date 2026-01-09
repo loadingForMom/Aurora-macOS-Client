@@ -17,6 +17,9 @@ extension TelegramStore {
         var arr = messagesByChatId[chatId] ?? []
         if let idx = arr.firstIndex(where: { $0.id == msg.id }) {
             arr[idx] = msg
+#if DEBUG
+            print("[Message][dedupe] chatId=\(chatId) replaced existing id=\(msg.id) (appendMessage)")
+#endif
         } else {
             if arr.contains(where: { $0.messageKey == msg.messageKey }) { return }
             arr.append(msg)
@@ -25,6 +28,17 @@ extension TelegramStore {
         if arr.count > 800 { arr.removeFirst(arr.count - 800) }
         messagesByChatId[chatId] = arr
         persistMessage(msg)
+    }
+
+    func replaceMessageIfExists(chatId: Int64, id: Int64, newMessage: TGMessage) -> Bool {
+        var arr = messagesByChatId[chatId] ?? []
+        guard let idx = arr.firstIndex(where: { $0.id == id }) else { return false }
+        arr[idx] = newMessage
+        arr = sortChronological(arr)
+        if arr.count > 800 { arr.removeFirst(arr.count - 800) }
+        messagesByChatId[chatId] = arr
+        persistMessage(newMessage)
+        return true
     }
 
     func replaceMessage(chatId: Int64, oldId: Int64, newMessage: TGMessage) {
@@ -50,10 +64,12 @@ extension TelegramStore {
 
         var byKey: [MessageKey: TGMessage] = [:]
         var keyByLocalId: [UUID: MessageKey] = [:]
+        var keyById: [Int64: MessageKey] = [:]
 
         for msg in existing where msg.chatId == chatId {
             let key = msg.messageKey
             byKey[key] = msg
+            keyById[msg.id] = key
             if let localId = msg.localId {
                 keyByLocalId[localId] = key
             }
@@ -73,6 +89,9 @@ extension TelegramStore {
                     byKey.removeValue(forKey: existingKey)
                 }
             }
+            if let existingKey = keyById[msg.id], existingKey != msg.messageKey {
+                byKey.removeValue(forKey: existingKey)
+            }
 
             let key = msg.messageKey
             if let existing = byKey[key] {
@@ -80,6 +99,7 @@ extension TelegramStore {
             } else {
                 byKey[key] = msg
             }
+            keyById[msg.id] = key
         }
 
         var merged = Array(byKey.values)

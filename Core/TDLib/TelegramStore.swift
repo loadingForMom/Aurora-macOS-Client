@@ -186,6 +186,11 @@ final class TelegramStore: ObservableObject {
     // Read/viewed
     func viewMessages(chatId: Int64, messageIds: [Int64], forceRead: Bool = false) {
         let filteredIds = messageIds.filter { $0 > 0 }
+#if DEBUG
+        if filteredIds.count != messageIds.count {
+            print("[TDLib][viewMessages] filtered invalid ids from \(messageIds)")
+        }
+#endif
         guard !filteredIds.isEmpty else { return }
         let req: [String: Any] = [
             "@type": "viewMessages",

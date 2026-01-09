@@ -474,6 +474,9 @@ extension TelegramStore {
                 sendingId = sidNum.int32Value
             }
         }
+        if sendingId == nil, let sidNum = obj["sending_id"] as? NSNumber {
+            sendingId = sidNum.int32Value
+        }
 
         var m = TGMessage(
             id: id,
