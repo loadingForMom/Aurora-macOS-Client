@@ -233,6 +233,7 @@ extension TelegramStore {
                 // Discard stale history so older responses can't replace a newer window.
 #if DEBUG
                 print("[HistoryMerge] chatId=\(job.chatId) discarded response gen=\(job.generation) current=\(currentGeneration)")
+                print("[HistoryDiscard] chatId=\(job.chatId) extra=\(res.extra) kind=\(job.kind) gen=\(job.generation) current=\(currentGeneration)")
 #endif
                 historyJobs.removeValue(forKey: res.extra)
                 if selectedChatId == job.chatId {
