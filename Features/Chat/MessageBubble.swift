@@ -146,6 +146,12 @@ struct MessageBubble: View {
                 Text("Sending…")
             }
 
+        case .sending:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("Sending…")
+            }
+
         case .failed:
             HStack(spacing: 6) {
                 Image(systemName: "exclamationmark.circle.fill")

@@ -82,9 +82,18 @@ final class TelegramStore: ObservableObject {
         let chatId: Int64
         var placeholderId: Int64
         let localId: UUID
-        let sendingId: Int32
+        var sendingId: Int32
         let text: String
         let date: Int
+        let isOutgoing: Bool
+        let senderUserId: Int64?
+        let replyToMessageId: Int64?
+        let contentType: String
+        let rawText: String?
+        let entities: [TGTextEntity]
+        let attachmentFingerprint: String?
+        var retryCount: Int
+        var nextRetryAt: Int?
     }
 
     var pendingByLocalId: [UUID: PendingLink] = [:]
@@ -92,6 +101,19 @@ final class TelegramStore: ObservableObject {
     var localIdByTempMessageId: [Int64: UUID] = [:]
     var serverMessageIdByLocalId: [UUID: Int64] = [:]
     var nextLocalTempId: Int64 = -1
+    var pendingCleanupTimer: Timer? = nil
+
+    let pendingTtlSeconds: Int = 10 * 60
+
+    struct PendingMetrics {
+        var reconcileBySendingId: Int = 0
+        var reconcileByFunctionResponseExtra: Int = 0
+        var reconcileByFallback: Int = 0
+        var fallbackAmbiguous: Int = 0
+        var coalesceRemovedCount: Int = 0
+    }
+
+    var pendingMetrics = PendingMetrics()
 
     // MARK: - History jobs
 
@@ -146,6 +168,9 @@ final class TelegramStore: ObservableObject {
         if let n = UserDefaults.standard.object(forKey: cacheLimitBytesKey) as? NSNumber {
             cacheLimitBytes = n.int64Value
         }
+
+        restorePendingMessagesFromDatabase()
+        startPendingCleanupTimer()
     }
     // MARK: - Computed
 
@@ -255,6 +280,7 @@ final class TelegramStore: ObservableObject {
     // Messages actions (implemented in +OptimisticSending)
     func sendText(chatId: Int64, text: String) { _sendText_impl(chatId: chatId, text: text) }
     func retrySend(message: TGMessage) { _retrySend_impl(message: message) }
+    func cancelPending(message: TGMessage) { _cancelPending_impl(message: message) }
     func deleteMessages(chatId: Int64, messageIds: [Int64], revoke: Bool = true) { _deleteMessages_impl(chatId: chatId, messageIds: messageIds, revoke: revoke) }
     func editMessageText(chatId: Int64, messageId: Int64, newText: String) { _editMessageText_impl(chatId: chatId, messageId: messageId, newText: newText) }
 
@@ -357,6 +383,10 @@ final class TelegramStore: ObservableObject {
         localIdByTempMessageId = [:]
         serverMessageIdByLocalId = [:]
         nextLocalTempId = -1
+        pendingMetrics = PendingMetrics()
+
+        pendingCleanupTimer?.invalidate()
+        pendingCleanupTimer = nil
 
         historyJobs = [:]
         reachedHistoryStart = []
@@ -366,5 +396,7 @@ final class TelegramStore: ObservableObject {
         didLoadInitialData = false
         didSendTdlibParameters = false
         didRequestInitialStorageStats = false
+
+        startPendingCleanupTimer()
     }
 }

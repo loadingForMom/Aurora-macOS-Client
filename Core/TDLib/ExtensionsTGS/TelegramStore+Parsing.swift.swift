@@ -429,6 +429,7 @@ extension TelegramStore {
         let date = (obj["date"] as? NSNumber)?.intValue ?? 0
         let editDate = (obj["edit_date"] as? NSNumber)?.intValue ?? 0
         let isOutgoing = (obj["is_outgoing"] as? Bool) ?? false
+        var replyToMessageId: Int64? = nil
 
         var senderUserId: Int64? = nil
         if let sender = obj["sender_id"] as? [String: Any],
@@ -457,7 +458,7 @@ extension TelegramStore {
            let st = sending["@type"] as? String {
             switch st {
             case "messageSendingStatePending":
-                sendState = .pending
+                sendState = .sending
             case "messageSendingStateFailed":
                 canRetry = (sending["can_retry"] as? Bool) ?? false
                 if let err = sending["error"] as? [String: Any],
@@ -478,6 +479,17 @@ extension TelegramStore {
             sendingId = sidNum.int32Value
         }
 
+        if let replyTo = obj["reply_to"] as? [String: Any] {
+            if let messageId = (replyTo["message_id"] as? NSNumber)?.int64Value {
+                replyToMessageId = messageId
+            } else if let replyToMessageIdNum = (replyTo["reply_to_message_id"] as? NSNumber)?.int64Value {
+                replyToMessageId = replyToMessageIdNum
+            }
+        }
+        if replyToMessageId == nil, let replyToMessageIdNum = (obj["reply_to_message_id"] as? NSNumber)?.int64Value {
+            replyToMessageId = replyToMessageIdNum
+        }
+
         var m = TGMessage(
             id: id,
             chatId: chatId,
@@ -489,10 +501,13 @@ extension TelegramStore {
             rawText: rawText,
             entities: entities,
             sendState: sendState,
+            replyToMessageId: replyToMessageId,
             localId: nil,
             sendingId: sendingId,
             editedAt: (editDate > 0 ? editDate : nil),
-            canRetry: canRetry
+            canRetry: canRetry,
+            retryCount: 0,
+            nextRetryAt: nil
         )
 
         if editDate > 0 {

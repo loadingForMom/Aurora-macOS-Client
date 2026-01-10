@@ -65,10 +65,13 @@ extension TelegramStore {
             rawText: parsed.rawText,
             entities: parsed.entities,
             sendState: old.sendState,
+            replyToMessageId: old.replyToMessageId,
             localId: old.localId,
             sendingId: old.sendingId,
             editedAt: old.editedAt,
-            canRetry: old.canRetry
+            canRetry: old.canRetry,
+            retryCount: old.retryCount,
+            nextRetryAt: old.nextRetryAt
         )
 
         arr[idx] = updated
@@ -100,9 +103,15 @@ extension TelegramStore {
 
         for id in messageIds {
             if let localId = localIdByTempMessageId[id] {
-                pendingByLocalId.removeValue(forKey: localId)
-                localIdBySendingId = localIdBySendingId.filter { $0.value != localId }
-                localIdByTempMessageId.removeValue(forKey: id)
+                if pendingByLocalId[localId] != nil {
+                    finalizePending(localId: localId, result: .canceled)
+                } else {
+                    localIdBySendingId = localIdBySendingId.filter { $0.value != localId }
+                    localIdByTempMessageId.removeValue(forKey: id)
+                }
+            }
+            if let localId = serverMessageIdByLocalId.first(where: { $0.value == id })?.key {
+                serverMessageIdByLocalId.removeValue(forKey: localId)
             }
         }
 

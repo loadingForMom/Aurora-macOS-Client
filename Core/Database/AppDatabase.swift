@@ -65,6 +65,15 @@ final class AppDatabase {
             """)
         }
 
+        migrator.registerMigration("addMessagePendingMetadata") { db in
+            try db.alter(table: "messages") { t in
+                t.add(column: "local_id", .text)
+                t.add(column: "reply_to_message_id", .integer)
+                t.add(column: "retry_count", .integer).notNull().defaults(to: 0)
+                t.add(column: "next_retry_at", .integer)
+            }
+        }
+
         migrator.registerMigration("createChatLastMessage") { db in
             try db.create(table: "chat_last_message") { t in
                 t.column("chat_id", .integer).notNull().primaryKey()

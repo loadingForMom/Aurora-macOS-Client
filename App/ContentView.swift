@@ -100,7 +100,7 @@ struct ContentView: View {
             }
             .onChange(of: store.selectedChatId) { _, newChatId in
                 guard let id = newChatId else { return }
-                DispatchQueue.main.async {
+                Task { @MainActor in
                     store.selectChat(id)
                 }
             }

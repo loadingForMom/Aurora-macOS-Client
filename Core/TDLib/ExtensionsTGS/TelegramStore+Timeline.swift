@@ -59,10 +59,29 @@ extension TelegramStore {
         } else {
             arr.append(newMessage)
         }
+        var deduped: [TGMessage] = []
+        var seenIds = Set<Int64>()
+        for msg in arr {
+            if msg.id == newMessage.id {
+                if !seenIds.contains(msg.id) {
+                    deduped.append(newMessage)
+                    seenIds.insert(msg.id)
+                }
+                continue
+            }
+            if seenIds.insert(msg.id).inserted {
+                deduped.append(msg)
+            }
+        }
+        arr = deduped
         arr = sortChronological(arr)
         if arr.count > 800 { arr.removeFirst(arr.count - 800) }
         messagesByChatId[chatId] = arr
         persistMessage(newMessage)
+#if DEBUG
+        let ids = arr.map(\.id)
+        assert(Set(ids).count == ids.count, "[Timeline] duplicate message ids after replace chatId=\(chatId)")
+#endif
     }
 
     // Merge (do not replace) to avoid dropping newer tail/optimistic rows when history windows arrive.
@@ -126,6 +145,10 @@ extension TelegramStore {
             let mergedKeys = Set(merged.map(\.messageKey))
             assert(!existingKeys.isDisjoint(with: mergedKeys), "[HistoryMerge] chatId=\(chatId) replaced timeline during \(reason)")
         }
+        let mergedIds = merged.map(\.id)
+        let mergedKeys = merged.map(\.messageKey)
+        assert(Set(mergedIds).count == mergedIds.count, "[HistoryMerge] chatId=\(chatId) duplicate message ids after merge")
+        assert(Set(mergedKeys).count == mergedKeys.count, "[HistoryMerge] chatId=\(chatId) duplicate message keys after merge")
         let afterMax = merged.map(\.id).max() ?? 0
         print("[HistoryMerge] chatId=\(chatId) reason=\(reason) count \(beforeCount)->\(merged.count) maxId \(beforeMax)->\(afterMax)")
 #endif
@@ -140,6 +163,8 @@ extension TelegramStore {
 
         switch localLast.sendState {
         case .pending:
+            c.lastMessagePreview = "You: (sending…) \(localLast.previewText)"
+        case .sending:
             c.lastMessagePreview = "You: (sending…) \(localLast.previewText)"
         case .failed:
             c.lastMessagePreview = "You: (failed) \(localLast.previewText)"
@@ -161,6 +186,8 @@ extension TelegramStore {
             c.lastMessageDate = last.date
             switch last.sendState {
             case .pending:
+                c.lastMessagePreview = "You: (sending…) \(last.previewText)"
+            case .sending:
                 c.lastMessagePreview = "You: (sending…) \(last.previewText)"
             case .failed:
                 c.lastMessagePreview = "You: (failed) \(last.previewText)"
