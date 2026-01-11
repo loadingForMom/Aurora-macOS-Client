@@ -21,14 +21,8 @@ extension TelegramStore {
         return UpdateMessageEditedParsed(chatId: chatId, messageId: messageId, editDate: editDate)
     }
 
-    func applyMessageEdited(chatId: Int64, messageId: Int64, editDate: Int) {
-        guard var arr = messagesByChatId[chatId] else { return }
-        guard let idx = arr.firstIndex(where: { $0.id == messageId }) else { return }
-        var m = arr[idx]
-        m.editedAt = editDate
-        arr[idx] = m
-        messagesByChatId[chatId] = sortChronological(arr)
-        persistMessage(m)
+    func applyMessageEdited(chatId: Int64, messageId: Int64, editDate: Int) async {
+        await databaseBatchWriter.enqueue(.updateMessageEdited(chatId: chatId, messageId: messageId, editDate: editDate))
     }
 
     struct UpdateMessageContentParsed {
@@ -46,38 +40,10 @@ extension TelegramStore {
         return UpdateMessageContentParsed(chatId: chatId, messageId: messageId, newContent: newContent)
     }
 
-    func applyMessageContentChanged(chatId: Int64, messageId: Int64, newContent: [String: Any]) {
-        guard var arr = messagesByChatId[chatId] else { return }
-        guard let idx = arr.firstIndex(where: { $0.id == messageId }) else { return }
-
+    func applyMessageContentChanged(chatId: Int64, messageId: Int64, newContent: [String: Any]) async {
         let newText = renderPreviewTextFromContent(newContent)
-        let parsed = parseMessageTextPayload(newContent)
-        let old = arr[idx]
-
-        let updated = TGMessage(
-            id: old.id,
-            chatId: old.chatId,
-            date: old.date,
-            isOutgoing: old.isOutgoing,
-            senderUserId: old.senderUserId,
-            text: newText,
-            contentType: parsed.contentType,
-            rawText: parsed.rawText,
-            entities: parsed.entities,
-            sendState: old.sendState,
-            replyToMessageId: old.replyToMessageId,
-            localId: old.localId,
-            sendingId: old.sendingId,
-            editedAt: old.editedAt,
-            canRetry: old.canRetry,
-            retryCount: old.retryCount,
-            nextRetryAt: old.nextRetryAt
-        )
-
-        arr[idx] = updated
-        messagesByChatId[chatId] = sortChronological(arr)
-        updateChatLastFromLocalTimeline(chatId: chatId)
-        persistMessage(updated)
+        await updateChatLastFromLocalTimeline(chatId: chatId)
+        await databaseBatchWriter.enqueue(.updateMessageText(chatId: chatId, messageId: messageId, text: newText))
     }
 
     struct UpdateDeleteMessagesParsed {
@@ -94,17 +60,11 @@ extension TelegramStore {
         return UpdateDeleteMessagesParsed(chatId: chatId, messageIds: ids)
     }
 
-    func applyMessagesDeleted(chatId: Int64, messageIds: [Int64]) {
-        if var arr = messagesByChatId[chatId], !arr.isEmpty {
-            let s = Set(messageIds)
-            arr.removeAll { s.contains($0.id) }
-            messagesByChatId[chatId] = arr
-        }
-
+    func applyMessagesDeleted(chatId: Int64, messageIds: [Int64]) async {
         for id in messageIds {
             if let localId = localIdByTempMessageId[id] {
                 if pendingByLocalId[localId] != nil {
-                    finalizePending(localId: localId, result: .canceled)
+                    Task { await finalizePending(localId: localId, result: .canceled) }
                 } else {
                     localIdBySendingId = localIdBySendingId.filter { $0.value != localId }
                     localIdByTempMessageId.removeValue(forKey: id)
@@ -115,8 +75,8 @@ extension TelegramStore {
             }
         }
 
-        updateChatLastFromLocalTimeline(chatId: chatId)
-        deleteMessages(chatId: chatId, messageIds: messageIds)
+        await updateChatLastFromLocalTimeline(chatId: chatId)
+        await databaseBatchWriter.enqueue(.deleteMessages(chatId: chatId, messageIds: messageIds))
     }
 
     func renderPreviewTextFromContent(_ content: [String: Any]) -> String {

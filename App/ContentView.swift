@@ -10,6 +10,7 @@ import AppKit
 
 struct ContentView: View {
     @ObservedObject var store: TelegramStore
+    @StateObject private var chatListViewModel: ChatListViewModel
 
     @State private var searchText: String = ""
     @State private var inspectorShown: Bool = true
@@ -18,8 +19,8 @@ struct ContentView: View {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !q.isEmpty else { return base }
 
-        // NOTE: we only use chat fields here (not store.messagesByChatId),
-        // so the sidebar won't rerender on every message update.
+        // NOTE: sidebar uses chat rows only, sourced from DB observation,
+        // so it won't rerender on every message update.
         return base.filter {
             $0.title.lowercased().contains(q) ||
             $0.lastMessagePreview.lowercased().contains(q)
@@ -37,11 +38,16 @@ struct ContentView: View {
 
     private var selectedChat: TGChat? {
         guard let chatId = store.selectedChatId else { return nil }
-        return store.chatsById[chatId]
+        return chatListViewModel.chats.first(where: { $0.id == chatId })
+    }
+
+    init(store: TelegramStore) {
+        self.store = store
+        _chatListViewModel = StateObject(wrappedValue: ChatListViewModel(dbPool: store.dbPool))
     }
 
     var body: some View {
-        let baseChats = store.sortedChats
+        let baseChats = chatListViewModel.chats
         let chats = filteredChats(baseChats, query: searchText)
 
         ZStack {
@@ -93,16 +99,12 @@ struct ContentView: View {
             }
             .task {
                 if let id = store.selectedChatId {
-                    await MainActor.run {
-                        store.selectChat(id, forceReload: false)
-                    }
+                    store.selectChat(id, forceReload: false)
                 }
             }
             .onChange(of: store.selectedChatId) { _, newChatId in
                 guard let id = newChatId else { return }
-                Task { @MainActor in
-                    store.selectChat(id)
-                }
+                store.selectChat(id)
             }
 
             if !store.isAuthorized {

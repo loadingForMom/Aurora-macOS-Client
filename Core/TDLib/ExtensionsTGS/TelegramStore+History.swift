@@ -10,7 +10,9 @@ extension TelegramStore {
     private var maxHistoryWindowLimit: Int { 800 }
 
     func loadInitialHistory(chatId: Int64) {
-        isLoadingHistory = (selectedChatId == chatId)
+        Task { @MainActor in
+            isLoadingHistory = (selectedChatId == chatId)
+        }
         reachedHistoryStart.remove(chatId)
 
         // Bump generation so stale history responses can't overwrite a newer timeline.
@@ -18,15 +20,6 @@ extension TelegramStore {
         historyGenerationByChatId[chatId] = generation
 
         historyWindowLimitByChatId[chatId] = initialHistoryWindowLimit
-        if let cached = databaseRepository?.fetchLatestMessages(chatId: chatId, limit: initialHistoryWindowLimit) {
-            if cached.isEmpty {
-                messagesByChatId[chatId] = []
-            } else {
-                mergeMessages(chatId: chatId, incoming: cached, windowLimit: initialHistoryWindowLimit, reason: "initial-local")
-            }
-        } else {
-            messagesByChatId[chatId] = []
-        }
         cancelHistoryJobs(for: chatId)
 
         let extra = "history:\(chatId):initial:local:\(UUID().uuidString)"
@@ -58,7 +51,9 @@ extension TelegramStore {
         let currentLimit = historyWindowLimitByChatId[chatId] ?? initialHistoryWindowLimit
         if currentLimit >= maxHistoryWindowLimit { return }
 
-        isLoadingHistory = (selectedChatId == chatId)
+        Task { @MainActor in
+            isLoadingHistory = (selectedChatId == chatId)
+        }
         let target = min(maxHistoryWindowLimit, currentLimit + pageSize)
         historyWindowLimitByChatId[chatId] = target
 
@@ -103,10 +98,4 @@ extension TelegramStore {
         sendJSON(req)
     }
 
-    func refreshMessagesWindow(chatId: Int64) {
-        guard let windowLimit = historyWindowLimitByChatId[chatId] else { return }
-        guard let databaseRepository else { return }
-        let latest = databaseRepository.fetchLatestMessages(chatId: chatId, limit: windowLimit)
-        mergeMessages(chatId: chatId, incoming: latest, windowLimit: windowLimit, reason: "db-window")
-    }
 }

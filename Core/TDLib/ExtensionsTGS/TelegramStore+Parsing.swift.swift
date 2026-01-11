@@ -10,20 +10,20 @@ extension TelegramStore {
 
     func sendJSON(_ obj: Any) {
         guard JSONSerialization.isValidJSONObject(obj) else {
-            print("[TD->] INVALID JSON: \(obj)")
+            log.error("tdlib invalid json: \(String(describing: obj), privacy: .public)")
             return
         }
 
         do {
             let data = try JSONSerialization.data(withJSONObject: obj)
             if let str = String(data: data, encoding: .utf8) {
-                print("[TD->] \(str)")
+                log.debug("tdlib send \(str, privacy: .public)")
                 td.send(str)
             } else {
-                print("[TD->] encode error: invalid utf8")
+                log.error("tdlib encode error: invalid utf8")
             }
         } catch {
-            print("[TD->] encode error: \(error)")
+            log.error("tdlib encode error: \(String(describing: error), privacy: .public)")
         }
     }
 

@@ -7,7 +7,7 @@ import Foundation
 import GRDB
 
 final class AppDatabase {
-    let dbWriter: DatabaseQueue
+    let dbPool: DatabasePool
 
     init() throws {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -15,8 +15,13 @@ final class AppDatabase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let dbURL = dir.appendingPathComponent("aurora.sqlite")
 
-        dbWriter = try DatabaseQueue(path: dbURL.path)
-        try migrator.migrate(dbWriter)
+        var config = Configuration()
+        config.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA journal_mode = WAL;")
+            try db.execute(sql: "PRAGMA foreign_keys = ON;")
+        }
+        dbPool = try DatabasePool(path: dbURL.path, configuration: config)
+        try migrator.migrate(dbPool)
     }
 
     private var migrator: DatabaseMigrator {
@@ -63,6 +68,10 @@ final class AppDatabase {
             CREATE INDEX IF NOT EXISTS idx_messages_chat_id_message_id_desc
             ON messages(chat_id, message_id DESC)
             """)
+            try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS idx_messages_chat_id_date
+            ON messages(chat_id, date)
+            """)
         }
 
         migrator.registerMigration("addMessagePendingMetadata") { db in
@@ -81,6 +90,30 @@ final class AppDatabase {
                 t.column("preview", .text).notNull().defaults(to: "")
                 t.column("date", .integer).notNull().defaults(to: 0)
             }
+        }
+
+        migrator.registerMigration("addChatOrderIndex") { db in
+            try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS idx_chats_order
+            ON chats(`order`)
+            """)
+        }
+
+        migrator.registerMigration("createMedia") { db in
+            try db.create(table: "media") { t in
+                t.column("file_id", .integer).notNull().primaryKey()
+                t.column("chat_id", .integer)
+                t.column("message_id", .integer)
+                t.column("type", .text).notNull()
+                t.column("local_path", .text)
+                t.column("remote_id", .text)
+                t.column("size", .integer)
+                t.column("created_at", .integer).notNull().defaults(to: 0)
+            }
+            try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS idx_media_chat_message
+            ON media(chat_id, message_id)
+            """)
         }
 
         return migrator

@@ -12,7 +12,7 @@ extension TelegramStore {
         let apiId = Config.apiId
         let apiHash = Config.apiHash
         guard apiId != 0, !apiHash.isEmpty else {
-            print("Missing TELEGRAM_API_ID / TELEGRAM_API_HASH in Config.swift")
+            log.error("Missing TELEGRAM_API_ID / TELEGRAM_API_HASH in Config.swift")
             return false
         }
 
@@ -24,12 +24,12 @@ extension TelegramStore {
         try? FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)
 
         guard let encryptionKey = getOrCreateDatabaseEncryptionKey() else {
-            print("Failed to resolve TDLib database encryption key")
+            log.error("Failed to resolve TDLib database encryption key")
             return false
         }
 
 #if DEBUG
-        print("[TDLib] setTdlibParameters database_directory=\(dbDir.path) files_directory=\(filesDir.path) use_message_database=true use_chat_info_database=true use_file_database=true")
+        log.debug("setTdlibParameters database_directory=\(dbDir.path, privacy: .public) files_directory=\(filesDir.path, privacy: .public) use_message_database=false use_chat_info_database=false use_file_database=false")
 #endif
 
         let req: [String: Any] = [
@@ -40,9 +40,9 @@ extension TelegramStore {
             "files_directory": filesDir.path,
             // TDLib docs: database_encryption_key must be stable across launches.
             "database_encryption_key": encryptionKey,
-            "use_message_database": true,
-            "use_chat_info_database": true,
-            "use_file_database": true,
+            "use_message_database": false,
+            "use_chat_info_database": false,
+            "use_file_database": false,
             "use_secret_chats": false,
             "api_id": apiId,
             "api_hash": apiHash,
@@ -56,9 +56,11 @@ extension TelegramStore {
         return true
     }
 
-    private func getOrCreateDatabaseEncryptionKey() -> String? {
-        if let existing = fetchKeychainValue() {
-            return existing
+    func getOrCreateDatabaseEncryptionKey() -> String? {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let keyURL = appSupport.appendingPathComponent("Aurora/tdlib.key")
+        if let data = try? Data(contentsOf: keyURL), data.count == 32 {
+            return data.base64EncodedString()
         }
 
         var bytes = [UInt8](repeating: 0, count: 32)
@@ -66,43 +68,13 @@ extension TelegramStore {
         guard status == errSecSuccess else { return nil }
 
         let data = Data(bytes)
-        let value = data.base64EncodedString()
-        guard storeKeychainValue(value) else { return nil }
-        return value
-    }
-
-    private func fetchKeychainValue() -> String? {
-        let query: [CFString: Any] = [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: "com.aurora.tdlib",
-            kSecAttrAccount: "tdlib_database_encryption_key",
-            kSecReturnData: true,
-            kSecMatchLimit: kSecMatchLimitOne
-        ]
-
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess,
-              let data = item as? Data,
-              let value = String(data: data, encoding: .utf8),
-              !value.isEmpty
-        else { return nil }
-        return value
-    }
-
-    private func storeKeychainValue(_ value: String) -> Bool {
-        let data = Data(value.utf8)
-        let query: [CFString: Any] = [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: "com.aurora.tdlib",
-            kSecAttrAccount: "tdlib_database_encryption_key"
-        ]
-
-        SecItemDelete(query as CFDictionary)
-
-        var attributes = query
-        attributes[kSecValueData] = data
-        let status = SecItemAdd(attributes as CFDictionary, nil)
-        return status == errSecSuccess
+        do {
+            try data.write(to: keyURL, options: [.atomic])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
+        } catch {
+            log.error("Failed to store TDLib key: \(String(describing: error), privacy: .public)")
+            return nil
+        }
+        return data.base64EncodedString()
     }
 }

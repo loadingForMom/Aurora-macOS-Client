@@ -8,18 +8,20 @@
 import SwiftUI
 import Foundation
 import Combine
+import OSLog
 
 struct MessagesPane: View {
     static let scrollSpaceName = "Aurora.ChatScrollSpace"
+    private let log = Logger(subsystem: "com.aurora.app", category: "messages.pane")
 
     @ObservedObject var store: TelegramStore
     let chat: TGChat
+    @ObservedObject var viewModel: ChatMessagesViewModel
 
     @State private var pagingEnabled: Bool = false
     @State private var pagingInFlight: Bool = false
     @State private var restoreAnchorGroupId: String? = nil
     @State private var lastPagingAnchor: String? = nil
-    @State private var showLogs: Bool = false
 
     // “Don’t annoy me” UX
     @State private var isAtBottom: Bool = true
@@ -30,8 +32,6 @@ struct MessagesPane: View {
     @State private var cachedRows: [Row] = []
     @State private var windowMessages: [TGMessage] = []
     @State private var windowApplyToken = UUID()
-    @State private var windowChatId: Int64? = nil
-    @State private var needsRepoRetry: Bool = false
     @State private var viewedMessageIds = Set<Int64>()
     @State private var lastVisibleGroupIds = Set<String>()
     @State private var viewMessagesDebouncer = ViewMessagesDebouncer()
@@ -96,46 +96,8 @@ struct MessagesPane: View {
         restoreAnchorGroupId = anchorGroupId
         pagingInFlight = true
 
-        fetchOlderMessages(beforeMessageId: anchorMessageId, anchorGroupId: anchorGroupId)
-        DispatchQueue.main.async {
-            store.loadMoreHistory(chatId: chat.id, anchorMessageId: anchorMessageId)
-        }
-    }
-
-    private func fetchLatestMessages() {
-        guard let repo = store.databaseRepository else {
-#if DEBUG
-            print("[DB WINDOW] fetchLatestMessages repo=nil chatId=\(chat.id)")
-#endif
-            DispatchQueue.main.async {
-                needsRepoRetry = true
-            }
-            return
-        }
-        if needsRepoRetry {
-            DispatchQueue.main.async {
-                needsRepoRetry = false
-            }
-        }
-        let limit = store.historyWindowLimitByChatId[chat.id] ?? 160
-        let latest = repo.fetchLatestMessages(chatId: chat.id, limit: limit)
-#if DEBUG
-        if latest.isEmpty {
-            print("[DB WINDOW] fetchLatestMessages returned 0 chatId=\(chat.id)")
-        }
-#endif
-        applyWindowMessages(store.sortChronological(latest), anchorGroupId: nil)
-    }
-
-    private func fetchOlderMessages(beforeMessageId: Int64, anchorGroupId: String) {
-        guard let repo = store.databaseRepository else { return }
-        let older = repo.fetchOlderMessages(chatId: chat.id, beforeMessageId: beforeMessageId, limit: 80)
-        guard !older.isEmpty else { return }
-        let sortedOlder = store.sortChronological(older)
-        let existingKeys = Set(windowMessages.map { $0.messageKey })
-        let filteredOlder = sortedOlder.filter { !existingKeys.contains($0.messageKey) }
-        guard !filteredOlder.isEmpty else { return }
-        applyWindowMessages(filteredOlder + windowMessages, anchorGroupId: anchorGroupId)
+        viewModel.loadOlder(pageSize: 80)
+        store.loadMoreHistory(chatId: chat.id, anchorMessageId: anchorMessageId)
     }
 
     private func applyWindowMessages(_ messages: [TGMessage], anchorGroupId: String?) {
@@ -144,12 +106,12 @@ struct MessagesPane: View {
         let filtered = messages.filter { $0.chatId == expectedChatId }
         let dropped = messages.count - filtered.count
         if dropped > 0 {
-            print("[DB WINDOW] dropped \(dropped) messages not in chat \(expectedChatId)")
+            log.debug("dropped \(dropped, privacy: .public) messages not in chat \(expectedChatId, privacy: .public)")
         }
 
         if filtered.isEmpty, !messages.isEmpty {
 #if DEBUG
-            print("[DB WINDOW] fetchLatestMessages filtered out all rows chatId=\(expectedChatId)")
+            log.debug("filtered out all rows chatId=\(expectedChatId, privacy: .public)")
 #endif
         }
         DispatchQueue.main.async { [token, expectedChatId, filtered] in
@@ -160,20 +122,6 @@ struct MessagesPane: View {
             }
             windowMessages = filtered
             cachedRows = buildRows(filtered)
-            windowChatId = expectedChatId
-        }
-    }
-
-    private func scheduleFetchLatestMessages(reason: String) {
-        let token = windowApplyToken
-        let chatId = chat.id
-#if DEBUG
-        print("[DB WINDOW] chatId=\(chatId) token=\(token) fetch scheduled (\(reason))")
-#endif
-        DispatchQueue.main.async { [token, chatId] in
-            guard windowApplyToken == token else { return }
-            guard chat.id == chatId else { return }
-            fetchLatestMessages()
         }
     }
 
@@ -380,11 +328,8 @@ struct MessagesPane: View {
     // MARK: - Body
 
     var body: some View {
-        let storeMessages = store.messagesByChatId[chat.id] ?? []
-        let messages = windowChatId == chat.id ? windowMessages : []
-        let rows = windowChatId == chat.id
-            ? (cachedRows.isEmpty ? buildRows(messages) : cachedRows)
-            : []
+        let messages = windowMessages
+        let rows = cachedRows.isEmpty ? buildRows(messages) : cachedRows
 
 #if DEBUG
         let _ = debugAssertUniqueMessageKeys(messages)
@@ -421,15 +366,6 @@ struct MessagesPane: View {
 
                         ForEach(rows) { row in
                             rowView(row, firstGroupId: firstGroupId)
-                        }
-
-                        if showLogs {
-                            Divider().padding(.vertical, 10)
-                            Text(store.logs.joined(separator: "\n\n"))
-                                .font(.system(.footnote, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .topLeading)
-                                .textSelection(.enabled)
                         }
 
                         Color.clear
@@ -516,8 +452,7 @@ struct MessagesPane: View {
                 }
                 .onAppear {
                     // Build once; after that, scrolling should not re-run grouping.
-                    cachedRows = buildRows(messages)
-                    scheduleFetchLatestMessages(reason: "onAppear")
+                    applyWindowMessages(viewModel.messages, anchorGroupId: nil)
 
                     lastKnownMessageCount = messages.count
                     newIncomingCount = 0
@@ -545,7 +480,6 @@ struct MessagesPane: View {
                     cachedRows = []
                     windowMessages = []
                     windowApplyToken = UUID()
-                    windowChatId = nil
                     viewMessagesDebouncer.cancel()
                     viewedMessageIds = []
                     lastVisibleGroupIds = []
@@ -561,21 +495,9 @@ struct MessagesPane: View {
                     topVisibleMessageId = nil
                     visibleMinMessageId = nil
                     visibleMaxMessageId = nil
-
-                    needsRepoRetry = false
-                    scheduleFetchLatestMessages(reason: "chat change")
                 }
-                .onChange(of: storeMessages.count) { _, _ in
-                    scheduleFetchLatestMessages(reason: "store update")
-                }
-                .onChange(of: store.databaseRepository != nil) { _, isReady in
-                    guard isReady else { return }
-                    DispatchQueue.main.async {
-                        if needsRepoRetry || windowChatId != chat.id {
-                            scheduleFetchLatestMessages(reason: "db ready")
-                        }
-                        needsRepoRetry = false
-                    }
+                .onChange(of: viewModel.messages) { _, newMessages in
+                    applyWindowMessages(newMessages, anchorGroupId: restoreAnchorGroupId)
                 }
                 .onChange(of: messages.count) { _, newCount in
                     if newCount < lastKnownMessageCount {

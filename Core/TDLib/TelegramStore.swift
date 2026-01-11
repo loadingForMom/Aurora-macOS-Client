@@ -5,28 +5,29 @@
 import Foundation
 import Combine
 import AppKit
+import OSLog
+import GRDB
 
-@MainActor
 final class TelegramStore: ObservableObject {
+    let log = Logger(subsystem: "com.aurora.app", category: "store")
     // TDLib
     let td = TDLibClient()
+    private let updateProcessor: TDLibUpdateProcessor
+    private let receiver: TDLibReceiver
 
     // MARK: - Core published state
 
     @Published var authState: String = "unknown"
-    @Published var chatsById: [Int64: TGChat] = [:]
-    @Published var usersById: [Int64: TGUser] = [:]
-    @Published var messagesByChatId: [Int64: [TGMessage]] = [:]
 
     @Published var selectedChatId: Int64?
     @Published var isLoadingHistory: Bool = false
 
-    @Published var logs: [String] = []
-
     // MARK: - App DB
 
-    var database: AppDatabase? = nil
-    @Published var databaseRepository: AppDatabaseRepository? = nil
+    let database: AppDatabase
+    let databaseRepository: AppDatabaseRepository
+    let databaseBatchWriter: DatabaseBatchWriter
+    let dbPool: DatabasePool
     @Published var lastDatabaseStats: DatabaseStats?
 
     // MARK: - Storage / Cache (Settings)
@@ -115,6 +116,10 @@ final class TelegramStore: ObservableObject {
 
     var pendingMetrics = PendingMetrics()
 
+    // MARK: - User cache (non-authoritative)
+
+    private var userCache: [Int64: TGUser] = [:]
+
     // MARK: - History jobs
 
     enum HistoryJobKind { case initialLocal, initialRemote, older }
@@ -137,31 +142,23 @@ final class TelegramStore: ObservableObject {
     // MARK: - Init
 
     init() {
-        // ✅ СНАЧАЛА DB (до любых замыканий, где мелькает self)
         do {
             let db = try AppDatabase()
             database = db
-            databaseRepository = AppDatabaseRepository(dbWriter: db.dbWriter)
         } catch {
-            database = nil
-            databaseRepository = nil
-            print("[DB] Failed to initialize app database: \(error)")
+            fatalError("Failed to initialize app database: \(error)")
         }
+        dbPool = database.dbPool
+        databaseRepository = AppDatabaseRepository(dbWriter: dbPool)
+        databaseBatchWriter = DatabaseBatchWriter(repository: databaseRepository)
 
-        // ✅ ПОТОМ event loop (тут создаются closures и захватывается self)
-        td.startEventLoop(onUpdate: { [weak self] upd, obj in
-            Task { @MainActor in
-                self?.cacheParsedObject(json: upd, obj: obj)
-                self?.pushLog(upd)
-                self?.handleUpdate(upd)
-            }
-        }, onResponse: { [weak self] resp, obj in
-            Task { @MainActor in
-                self?.cacheParsedObject(json: resp, obj: obj)
-                self?.pushLog(resp)
-                self?.handleResponse(resp)
-            }
-        })
+        updateProcessor = TDLibUpdateProcessor(store: self)
+        guard let receiver = td.makeReceiver() else {
+            fatalError("TDLib client not initialized")
+        }
+        self.receiver = receiver
+        receiver.start()
+        updateProcessor.start(stream: receiver.stream)
 
         td.send(#"{"@type":"getOption","name":"version"}"#)
 
@@ -174,17 +171,16 @@ final class TelegramStore: ObservableObject {
     }
     // MARK: - Computed
 
-    var sortedChats: [TGChat] {
-        chatsById.values.sorted {
-            if $0.order != $1.order { return $0.order > $1.order }
-            if $0.lastMessageDate != $1.lastMessageDate { return $0.lastMessageDate > $1.lastMessageDate }
-            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
-        }
-    }
-
     var myDisplayName: String {
         guard let id = myUserId else { return "" }
-        return usersById[id]?.displayName ?? ""
+        if let cached = userCache[id] {
+            return cached.displayName
+        }
+        if let user = databaseRepository.fetchUser(userId: id) {
+            userCache[id] = user
+            return user.displayName
+        }
+        return ""
     }
 
     var isAuthorized: Bool {
@@ -197,15 +193,25 @@ final class TelegramStore: ObservableObject {
         let isSame = (selectedChatId == chatId)
         if !isSame { selectedChatId = chatId }
 
-        if !forceReload, let existing = messagesByChatId[chatId], !existing.isEmpty {
-            return
+        Task.detached { [weak self] in
+            guard let self else { return }
+            if !forceReload, self.databaseRepository.hasMessages(chatId: chatId) {
+                return
+            }
+            self.loadInitialHistory(chatId: chatId)
         }
-        loadInitialHistory(chatId: chatId)
     }
 
     func userDisplayName(_ userId: Int64?) -> String {
         guard let id = userId else { return "" }
-        return usersById[id]?.displayName ?? "User \(id)"
+        if let cached = userCache[id] {
+            return cached.displayName
+        }
+        if let user = databaseRepository.fetchUser(userId: id) {
+            userCache[id] = user
+            return user.displayName
+        }
+        return "User \(id)"
     }
 
     // Read/viewed
@@ -213,7 +219,7 @@ final class TelegramStore: ObservableObject {
         let filteredIds = messageIds.filter { $0 > 0 }
 #if DEBUG
         if filteredIds.count != messageIds.count {
-            print("[TDLib][viewMessages] filtered invalid ids from \(messageIds)")
+            log.debug("viewMessages filtered invalid ids from \(messageIds, privacy: .public)")
         }
 #endif
         guard !filteredIds.isEmpty else { return }
@@ -227,20 +233,16 @@ final class TelegramStore: ObservableObject {
     }
 
     func markChatAsReadToLatestIfNeeded(chatId: Int64) {
-        guard let c = chatsById[chatId] else { return }
+        guard let c = databaseRepository.fetchChat(chatId: chatId) else { return }
         if c.unreadCount <= 0 { return }
         if c.lastMessageId == 0 { return }
         viewMessages(chatId: chatId, messageIds: [c.lastMessageId], forceRead: true)
     }
 
     func printDatabaseStats() {
-        guard let databaseRepository else {
-            print("[DB] Database not initialized")
-            return
-        }
         let stats = databaseRepository.fetchStats()
         lastDatabaseStats = stats
-        print("[DB] Stats chats=\(stats.chats) messages=\(stats.messages) users=\(stats.users)")
+        log.info("db stats chats=\(stats.chats) messages=\(stats.messages) users=\(stats.users)")
     }
 
     private func cacheParsedObject(json: String, obj: [String: Any]?) {
@@ -250,7 +252,7 @@ final class TelegramStore: ObservableObject {
 #if DEBUG
         debugCachedParseCount += 1
         if debugCachedParseCount % debugCachedParseLogInterval == 0 {
-            print("[TDLib][parse] cached objects injected=\(debugCachedParseCount)")
+            log.debug("cached objects injected=\(debugCachedParseCount, privacy: .public)")
         }
 #endif
     }
@@ -258,23 +260,24 @@ final class TelegramStore: ObservableObject {
     // MARK: - App DB helpers
 
     func persistChat(_ chat: TGChat) {
-        databaseRepository?.upsertChat(chat)
+        Task { await databaseBatchWriter.enqueue(.upsertChat(chat)) }
     }
 
     func persistChatLastMessage(chatId: Int64, messageId: Int64, preview: String, date: Int) {
-        databaseRepository?.upsertChatLastMessage(chatId: chatId, messageId: messageId, preview: preview, date: date)
+        Task { await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chatId, messageId: messageId, preview: preview, date: date)) }
     }
 
     func persistUser(_ user: TGUser) {
-        databaseRepository?.upsertUser(user)
+        userCache[user.id] = user
+        Task { await databaseBatchWriter.enqueue(.upsertUser(user)) }
     }
 
     func persistMessage(_ message: TGMessage) {
-        databaseRepository?.upsertMessage(message)
+        Task { await databaseBatchWriter.enqueue(.upsertMessage(message)) }
     }
 
     func deleteMessages(chatId: Int64, messageIds: [Int64]) {
-        databaseRepository?.deleteMessages(chatId: chatId, messageIds: messageIds)
+        Task { await databaseBatchWriter.enqueue(.deleteMessages(chatId: chatId, messageIds: messageIds)) }
     }
 
     // Messages actions (implemented in +OptimisticSending)
@@ -314,12 +317,6 @@ final class TelegramStore: ObservableObject {
 
     func prefetchChatAvatarHiResIfNeeded(chatId: Int64) { _prefetchChatAvatarHiResIfNeeded_impl(chatId: chatId) }
 
-    // MARK: - Logging
-    func pushLog(_ s: String) {
-        logs.append(s)
-        if logs.count > 250 { logs.removeFirst(logs.count - 250) }
-    }
-
     // MARK: - Authorization
 
     func submitPhoneNumber(_ phoneNumber: String) {
@@ -335,7 +332,7 @@ final class TelegramStore: ObservableObject {
             "@type": "checkAuthenticationCode",
             "code": code
         ]
-        print("[UI] submitAuthCode \(code)")
+        log.info("submit auth code")
         sendJSON(req)
     }
 
@@ -354,9 +351,7 @@ final class TelegramStore: ObservableObject {
     }
 
     func resetSessionState() {
-        chatsById = [:]
-        usersById = [:]
-        messagesByChatId = [:]
+        userCache = [:]
         selectedChatId = nil
         isLoadingHistory = false
 

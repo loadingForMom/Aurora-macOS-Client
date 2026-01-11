@@ -6,33 +6,32 @@ import Foundation
 
 extension TelegramStore {
 
-    func handleUpdate(_ upd: String) {
+    func handleUpdate(_ upd: String) async {
         if let st = parseAuthState(from: upd) {
             let previous = authState
-            authState = st
-
-            if st == "authorizationStateClosed" {
-                resetSessionState()
-            } else if previous == "authorizationStateReady", st != "authorizationStateReady" {
-                resetSessionState()
+            await MainActor.run {
+                authState = st
+                if st == "authorizationStateClosed" {
+                    resetSessionState()
+                } else if previous == "authorizationStateReady", st != "authorizationStateReady" {
+                    resetSessionState()
+                }
             }
-            if let st = parseAuthState(from: upd) {
-                print("[AUTH] state =", st)
-            }
+            log.info("auth state changed to \(st, privacy: .public)")
         }
 
         if let (chatId, lastMessage) = parseUpdateChatLastMessage(upd) {
 #if DEBUG
             debugLogMessageEvent(label: "updateChatLastMessage", chatId: chatId, messageId: lastMessage.id)
 #endif
-            applyChatLastMessageUpdate(chatId: chatId, lastMessageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
-            persistMessage(lastMessage)
-            persistChatLastMessage(chatId: chatId, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
-            keepOptimisticChatPreviewIfNeeded(chatId: chatId)
+            await applyChatLastMessageUpdate(chatId: chatId, lastMessageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
+            await databaseBatchWriter.enqueue(.upsertMessage(lastMessage))
+            await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chatId, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date))
+            await keepOptimisticChatPreviewIfNeeded(chatId: chatId)
         }
 
         if let (chatId, lastReadInboxMessageId, unreadCount) = parseUpdateChatReadInbox(upd) {
-            applyChatReadInboxUpdate(chatId: chatId, lastReadInboxMessageId: lastReadInboxMessageId, unreadCount: unreadCount)
+            await applyChatReadInboxUpdate(chatId: chatId, lastReadInboxMessageId: lastReadInboxMessageId, unreadCount: unreadCount)
         }
 
         if authState == "authorizationStateWaitTdlibParameters", !didSendTdlibParameters {
@@ -53,32 +52,32 @@ extension TelegramStore {
         }
         
         if authState == "authorizationStateWaitEncryptionKey" {
-            td.send(#"{"@type":"checkDatabaseEncryptionKey","encryption_key":""}"#)
+            if let key = getOrCreateDatabaseEncryptionKey() {
+                let req: [String: Any] = [
+                    "@type": "checkDatabaseEncryptionKey",
+                    "encryption_key": key
+                ]
+                sendJSON(req)
+            } else {
+                log.error("Failed to resolve TDLib encryption key during auth")
+            }
         }
 
         if let (id, title) = parseUpdateChatTitle(upd) {
-            if var c = chatsById[id] {
-                c.title = title
-                chatsById[id] = c
-                persistChat(c)
-            }
+            await databaseBatchWriter.enqueue(.updateChatTitle(chatId: id, title: title))
         }
 
         if let (chatId, order) = parseUpdateChatPosition(upd) {
-            if var c = chatsById[chatId] {
-                c.order = order
-                chatsById[chatId] = c
-                persistChat(c)
-            }
+            await databaseBatchWriter.enqueue(.updateChatOrder(chatId: chatId, order: order))
         }
 
         if let (u, photoFileId, photoPath) = parseUpdateUser(upt: upd) {
-            usersById[u.id] = u
-            persistUser(u)
+            userCache[u.id] = u
+            await databaseBatchWriter.enqueue(.upsertUser(u))
 
             if let meId = myUserId, meId == u.id {
                 if let p = photoPath {
-                    myProfilePhotoPath = p
+                    await MainActor.run { myProfilePhotoPath = p }
                 }
                 if let fid = photoFileId {
                     myPhotoFileId = fid
@@ -88,7 +87,7 @@ extension TelegramStore {
         }
 
         if let path = parseUpdateFilePathIfMyPhoto(upd) {
-            myProfilePhotoPath = path
+            await MainActor.run { myProfilePhotoPath = path }
             _ = myProfileNSImage(pointSize: 36)
         }
 
@@ -104,8 +103,8 @@ extension TelegramStore {
         }
 
         if let user = parseUserObject(upd) {
-            usersById[user.id] = user
-            persistUser(user)
+            userCache[user.id] = user
+            await databaseBatchWriter.enqueue(.upsertUser(user))
         }
 
         // Sending lifecycle updates
@@ -113,14 +112,14 @@ extension TelegramStore {
 #if DEBUG
             debugLogMessageEvent(label: "updateMessageSendSucceeded", chatId: succ.message.chatId, messageId: succ.message.id)
 #endif
-            handleSendSucceeded(succ)
+            await handleSendSucceeded(succ)
         }
 
         if let fail = parseUpdateMessageSendFailed(upd) {
 #if DEBUG
             debugLogMessageEvent(label: "updateMessageSendFailed", chatId: fail.message.chatId, messageId: fail.message.id)
 #endif
-            handleSendFailed(fail)
+            await handleSendFailed(fail)
         }
 
         // Edit / content changes
@@ -128,14 +127,14 @@ extension TelegramStore {
 #if DEBUG
             debugLogMessageEvent(label: "updateMessageEdited", chatId: edited.chatId, messageId: edited.messageId)
 #endif
-            applyMessageEdited(chatId: edited.chatId, messageId: edited.messageId, editDate: edited.editDate)
+            await applyMessageEdited(chatId: edited.chatId, messageId: edited.messageId, editDate: edited.editDate)
         }
 
         if let content = parseUpdateMessageContent(upd) {
 #if DEBUG
             debugLogMessageEvent(label: "updateMessageContent", chatId: content.chatId, messageId: content.messageId)
 #endif
-            applyMessageContentChanged(chatId: content.chatId, messageId: content.messageId, newContent: content.newContent)
+            await applyMessageContentChanged(chatId: content.chatId, messageId: content.messageId, newContent: content.newContent)
         }
 
         // Deletions
@@ -143,7 +142,7 @@ extension TelegramStore {
 #if DEBUG
             del.messageIds.forEach { debugLogMessageEvent(label: "updateDeleteMessages", chatId: del.chatId, messageId: $0) }
 #endif
-            applyMessagesDeleted(chatId: del.chatId, messageIds: del.messageIds)
+            await applyMessagesDeleted(chatId: del.chatId, messageIds: del.messageIds)
         }
 
         // New messages
@@ -153,21 +152,21 @@ extension TelegramStore {
 #endif
             requestUserIfNeeded(msg.senderUserId)
 
-            if tryReconcileOutgoingPendingMessage(msg) {
+            if await tryReconcileOutgoingPendingMessage(msg) {
 #if DEBUG
-                print("[UpdateNewMessage] reconciled=true -> skip append")
+                log.debug("updateNewMessage reconciled -> skip append")
 #endif
             } else {
-                appendMessage(msg, chatId: chatId)
+                await databaseBatchWriter.enqueue(.upsertMessage(msg))
             }
 
-            updateChatLastFromLocalTimeline(chatId: chatId)
+            await updateChatLastFromLocalTimeline(chatId: chatId)
         }
     }
 
-    func handleResponse(_ resp: String) {
+    func handleResponse(_ resp: String) async {
         if let err = parseTdError(resp) {
-            print("[TDLib][error] code=\(err.code) message=\(err.message) extra=\(err.extra ?? "nil")")
+            log.error("tdlib error code=\(err.code, privacy: .public) message=\(err.message, privacy: .public) extra=\(err.extra ?? "nil", privacy: .public)")
             return
         }
 
@@ -178,11 +177,10 @@ extension TelegramStore {
         }
 
         if let (chat, lastMessage, smallId, bigId, bestPath) = parseChatObject(resp) {
-            chatsById[chat.id] = chat
-            persistChat(chat)
+            await databaseBatchWriter.enqueue(.upsertChat(chat))
             if let lastMessage {
-                persistMessage(lastMessage)
-                persistChatLastMessage(chatId: chat.id, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
+                await databaseBatchWriter.enqueue(.upsertMessage(lastMessage))
+                await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chat.id, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date))
             }
 
             if let p = bestPath {
@@ -192,7 +190,7 @@ extension TelegramStore {
             registerChatAvatar(chatId: chat.id, smallFileId: smallId, bigFileId: bigId, initialBestPath: bestPath)
 
             if selectedChatId == nil {
-                selectedChatId = chat.id
+                await MainActor.run { selectedChatId = chat.id }
                 loadInitialHistory(chatId: chat.id)
             }
         }
@@ -200,12 +198,12 @@ extension TelegramStore {
         // MARK: - Current user (me) + profile photo
 
         if let (me, photoFileId, photoPath) = parseMeUserResponse(resp) {
-            myUserId = me.id
-            usersById[me.id] = me
-            persistUser(me)
+            await MainActor.run { myUserId = me.id }
+            userCache[me.id] = me
+            await databaseBatchWriter.enqueue(.upsertUser(me))
 
             if let p = photoPath {
-                myProfilePhotoPath = p
+                await MainActor.run { myProfilePhotoPath = p }
             }
 
             if let fid = photoFileId {
@@ -215,8 +213,8 @@ extension TelegramStore {
         }
 
         if let user = parseUserObject(resp) {
-            usersById[user.id] = user
-            persistUser(user)
+            userCache[user.id] = user
+            await databaseBatchWriter.enqueue(.upsertUser(user))
         }
 
         if let storage = parseStorageStatisticsAny(resp) {
@@ -225,7 +223,7 @@ extension TelegramStore {
 
         // Response message with @extra
         if let msgResponse = parseMessageFunctionResponse(resp) {
-            handleFunctionResponseMessage(msgResponse)
+            await handleFunctionResponseMessage(msgResponse)
         }
 
         // History responses
@@ -234,26 +232,27 @@ extension TelegramStore {
             guard currentGeneration == job.generation else {
                 // Discard stale history so older responses can't replace a newer window.
 #if DEBUG
-                print("[HistoryMerge] chatId=\(job.chatId) discarded response gen=\(job.generation) current=\(currentGeneration)")
-                print("[HistoryDiscard] chatId=\(job.chatId) extra=\(res.extra) kind=\(job.kind) gen=\(job.generation) current=\(currentGeneration)")
+                log.debug("history discarded chatId=\(job.chatId, privacy: .public) gen=\(job.generation, privacy: .public) current=\(currentGeneration, privacy: .public)")
+                log.debug("history discard extra=\(res.extra, privacy: .public) kind=\(String(describing: job.kind), privacy: .public)")
 #endif
                 historyJobs.removeValue(forKey: res.extra)
                 if selectedChatId == job.chatId {
-                    isLoadingHistory = historyJobs.values.contains(where: { $0.chatId == job.chatId })
+                    let loading = historyJobs.values.contains(where: { $0.chatId == job.chatId })
+                    await MainActor.run { isLoadingHistory = loading }
                 }
                 return
             }
 #if DEBUG
             let minId = res.messages.min(by: { $0.id < $1.id })?.id
             let maxId = res.messages.max(by: { $0.id < $1.id })?.id
-            print("[TDLib] getChatHistory chatId=\(job.chatId) anchorMessageId=\(job.anchorMessageId) limit=\(job.requestedLimit) returned=\(res.messages.count) minId=\(minId ?? 0) maxId=\(maxId ?? 0)")
+            log.debug("getChatHistory chatId=\(job.chatId, privacy: .public) anchorMessageId=\(job.anchorMessageId, privacy: .public) limit=\(job.requestedLimit, privacy: .public) returned=\(res.messages.count, privacy: .public) minId=\(minId ?? 0, privacy: .public) maxId=\(maxId ?? 0, privacy: .public)")
 #endif
             for m in res.messages {
 #if DEBUG
                 debugLogMessageEvent(label: "getChatHistory", chatId: job.chatId, messageId: m.id)
                 assert(m.chatId == job.chatId, "TDLib history message chatId mismatch: expected \(job.chatId) got \(m.chatId)")
 #endif
-                persistMessage(m)
+                await databaseBatchWriter.enqueue(.upsertMessage(m))
                 requestUserIfNeeded(m.senderUserId)
             }
 
@@ -262,7 +261,6 @@ extension TelegramStore {
             }
 
             historyJobs.removeValue(forKey: res.extra)
-            mergeMessages(chatId: job.chatId, incoming: res.messages, windowLimit: job.windowLimit, reason: "history:\(job.kind)")
 
             if job.kind == .initialLocal {
                 let extra = "history:\(job.chatId):initial:remote:\(UUID().uuidString)"
@@ -286,14 +284,15 @@ extension TelegramStore {
             }
 
             if selectedChatId == job.chatId {
-                isLoadingHistory = historyJobs.values.contains(where: { $0.chatId == job.chatId })
+                let loading = historyJobs.values.contains(where: { $0.chatId == job.chatId })
+                await MainActor.run { isLoadingHistory = loading }
             }
         }
     }
 
 #if DEBUG
     private func debugLogMessageEvent(label: String, chatId: Int64, messageId: Int64) {
-        print("[TDLib] \(label) chatId=\(chatId) messageId=\(messageId)")
+        log.debug("\(label, privacy: .public) chatId=\(chatId, privacy: .public) messageId=\(messageId, privacy: .public)")
     }
 #endif
 }
