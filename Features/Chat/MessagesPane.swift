@@ -340,7 +340,7 @@ struct MessagesPane: View {
             return nil
         }
         let firstGroupId = groupIds.first
-        let lastGroupId = groupIds.last
+        let _ = groupIds.last
         let groupMessageBounds: [String: (min: Int64, max: Int64)] = Dictionary(
             uniqueKeysWithValues: rows.compactMap { row in
                 guard case let .group(g) = row else { return nil }

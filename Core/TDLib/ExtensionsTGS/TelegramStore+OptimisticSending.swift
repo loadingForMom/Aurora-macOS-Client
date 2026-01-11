@@ -56,11 +56,19 @@ extension TelegramStore {
     }
 
     func startPendingCleanupTimer() {
+<<<<<<< Updated upstream
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.pendingCleanupTimer?.invalidate()
             self.pendingCleanupTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
                 self?.cleanupExpiredPendingItems()
+=======
+        pendingCleanupTimer?.invalidate()
+        pendingCleanupTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            guard let store = self else { return }
+            Task { @MainActor in
+                store.cleanupExpiredPendingItems()
+>>>>>>> Stashed changes
             }
         }
     }
