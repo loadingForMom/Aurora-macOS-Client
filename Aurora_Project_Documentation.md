@@ -72,6 +72,19 @@ SwiftUI UI → calls `TelegramStore` façade methods (`sendText`, `loadMoreHisto
 - Sends outgoing JSON on a separate queue so receive isn’t starved.
 - Exposes `startReceiveLoop(onUpdate:)`, `send(_:)`, `stop()`.
 
+
+#### TDLib initialization parameters (current)
+
+At startup Aurora sends `setTdlibParameters` with persistent paths and a stable encryption key:
+
+- `database_directory`: `~/Library/Application Support/Aurora/tdlib`
+- `files_directory`: `~/Library/Application Support/Aurora/tdlib-files`
+- `database_encryption_key`: 32 bytes stored at `~/Library/Application Support/Aurora/tdlib.key` (permissions `0600`) and passed to TDLib as Base64.
+- Databases: `use_message_database=true`, `use_chat_info_database=true`, `use_file_database=false`.
+- Other flags: `use_secret_chats=false`, `enable_storage_optimizer=true`.
+
+Note: if you delete/rotate `tdlib.key`, TDLib won’t be able to open the existing encrypted DB. In that case you must wipe the `database_directory` to start fresh.
+
 ### 4.2 `TelegramStore` (the application brain)
 
 `Core/TDLib/TelegramStore.swift` is the central state container (`@MainActor final class TelegramStore: ObservableObject`).
@@ -289,6 +302,9 @@ Note: at this snapshot, section titles are in Russian (e.g., “Общие”), 
 - The project’s `MACOSX_DEPLOYMENT_TARGET` is set to `26.1` in `project.pbxproj` (verify this matches your intended macOS target / toolchain).
 
 ### Running locally
+
+**Local data location:** on macOS the TDLib DB and downloads live under `~/Library/Application Support/Aurora/` (see the `tdlib`, `tdlib-files`, and `tdlib.key` files). The first sync can noticeably grow the DB size because message/chat-info databases are enabled by default.
+
 1) In Xcode, set environment variables for the scheme:
    - `TELEGRAM_API_ID`
    - `TELEGRAM_API_HASH`

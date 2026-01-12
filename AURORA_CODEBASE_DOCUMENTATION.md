@@ -157,9 +157,13 @@ Primary responsibilities and state:
 The store initializes the database first, then starts the TDLib event loop and sends initial requests (e.g., `getOption` for version).
 
 #### `TelegramStore+TDLibParameters.swift`
-- Builds the `setTdlibParameters` request, using `Config.apiId` and `Config.apiHash` and setting database/file directories under `Application Support/Aurora`.
-- Uses Keychain to generate/persist a stable encryption key (`com.aurora.tdlib` / `tdlib_database_encryption_key`).
-- **Concurrency**: all calls are on the main actor; Keychain access is synchronous.
+- Builds and sends `setTdlibParameters` with persistent directories under `~/Library/Application Support/Aurora/`:
+  - `database_directory`: `.../Aurora/tdlib`
+  - `files_directory`: `.../Aurora/tdlib-files`
+  - Enables local message + chat metadata databases (`use_message_database=true`, `use_chat_info_database=true`), keeps the file database off (`use_file_database=false`), and disables secret chats (`use_secret_chats=false`).
+  - Enables TDLib’s storage optimizer (`enable_storage_optimizer=true`).
+- Persists a stable 32‑byte `database_encryption_key` at `~/Library/Application Support/Aurora/tdlib.key` (written atomically; permissions `0600`) and passes it to TDLib as Base64.
+- **Concurrency**: TDLib initialization is on the main actor; the key file read/write is currently synchronous—consider moving it off the main thread to avoid UI hitching on cold start.
 
 #### `TelegramStore+Parsing.swift.swift`
 - JSON parsing helpers and caching to avoid repeated JSON decoding for identical strings.
@@ -420,6 +424,17 @@ Key features:
 
 ---
 
+
+### Local TDLib database size (why it grows)
+
+Once `use_message_database` and `use_chat_info_database` are enabled, TDLib stores more than “just messages”. It’s normal for the on-disk footprint to jump during the first sync (and sometimes after large chat list refreshes):
+
+- **SQLite tables + indexes**: enabling message + chat-info databases adds tables and indices that simply didn’t exist when those flags were off.
+- **WAL files**: SQLite may create `*.db-wal` / `*.db-shm` next to the main DB; these can temporarily make the folder look ~2× larger until a checkpoint runs.
+- **Chat metadata caching**: titles, photo references, pinned message metadata, message search structures, etc., contribute even with `use_file_database=false`.
+
+So seeing the local DB grow from ~30 MB to ~60 MB after turning those DBs on is expected. To verify where space is going, use TDLib `getStorageStatistics` and break it down by database vs files (Aurora surfaces this in the storage views).
+
 ## 11. Settings UI
 - A dedicated Settings window is provided via `SettingsRootView` in `AuroraApp`.
 - The settings UI uses a `NavigationSplitView` with a sidebar and detail panes.
@@ -433,6 +448,16 @@ Key features:
 ---
 
 ## 12. Logging & Debugging
+
+##### Troubleshooting: “messages don’t load” / `dropped … messages not in chat …`
+
+If you see logs like `dropped N messages not in chat <chatId>` during initial sync, Aurora is receiving `updateNewMessage` for a chat that hasn’t been materialized in the in-memory chat registry yet (the chat object wasn’t loaded when the message arrived). Dropping those updates will make the timeline look “stuck”.
+
+Recommended approach:
+- When a message/update arrives for an unknown `chat_id`, request the chat (`getChat`) and buffer the message until the chat exists, instead of discarding it.
+- Use `getChatHistory(..., only_local=true)` only as a fast warm-cache pass; always follow up with a remote `getChatHistory(..., only_local=false)` to backfill.
+- The SwiftUI warning “Publishing changes from within view updates…” usually means `@Published` state is being mutated while SwiftUI is rendering. Funnel TDLib updates through a main-actor queue (`Task { @MainActor … }`) to avoid undefined behavior.
+
 - `TelegramStore.pushLog` keeps a rolling in-memory log of TDLib JSON updates/responses (up to 250 entries).
 - A debug mode in `MessagesPane` can render these logs inline in the chat view.
 - Debug logging includes:

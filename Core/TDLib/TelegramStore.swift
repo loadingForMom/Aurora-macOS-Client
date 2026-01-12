@@ -12,9 +12,8 @@ final class TelegramStore: ObservableObject {
     let log = Logger(subsystem: "com.aurora.app", category: "store")
     // TDLib
     let td = TDLibClient()
-    private let updateProcessor: TDLibUpdateProcessor
+    private lazy var updateProcessor: TDLibUpdateProcessor = TDLibUpdateProcessor(store: self)
     private let receiver: TDLibReceiver
-
     // MARK: - Core published state
 
     @Published var authState: String = "unknown"
@@ -117,8 +116,8 @@ final class TelegramStore: ObservableObject {
     var pendingMetrics = PendingMetrics()
 
     // MARK: - User cache (non-authoritative)
-
-    private var userCache: [Int64: TGUser] = [:]
+    // Нужно из extensions в других файлах
+    var userCache: [Int64: TGUser] = [:]
 
     // MARK: - History jobs
 
@@ -152,13 +151,15 @@ final class TelegramStore: ObservableObject {
         databaseRepository = AppDatabaseRepository(dbWriter: dbPool)
         databaseBatchWriter = DatabaseBatchWriter(repository: databaseRepository)
 
-        updateProcessor = TDLibUpdateProcessor(store: self)
+        
         guard let receiver = td.makeReceiver() else {
             fatalError("TDLib client not initialized")
         }
         self.receiver = receiver
         receiver.start()
-        updateProcessor.start(stream: receiver.stream)
+        Task { [updateProcessor] in
+            await updateProcessor.start(stream: receiver.stream)
+        }
 
         td.send(#"{"@type":"getOption","name":"version"}"#)
 
@@ -193,7 +194,7 @@ final class TelegramStore: ObservableObject {
         let isSame = (selectedChatId == chatId)
         if !isSame { selectedChatId = chatId }
 
-        Task.detached { [weak self] in
+        Task { @MainActor [weak self] in
             guard let self else { return }
             if !forceReload, self.databaseRepository.hasMessages(chatId: chatId) {
                 return
@@ -252,7 +253,7 @@ final class TelegramStore: ObservableObject {
 #if DEBUG
         debugCachedParseCount += 1
         if debugCachedParseCount % debugCachedParseLogInterval == 0 {
-            log.debug("cached objects injected=\(debugCachedParseCount, privacy: .public)")
+            log.debug("cached objects injected=\(self.debugCachedParseCount, privacy: .public)")
         }
 #endif
     }

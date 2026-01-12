@@ -21,7 +21,7 @@ struct MessagesPane: View {
     @State private var pagingEnabled: Bool = false
     @State private var pagingInFlight: Bool = false
     @State private var restoreAnchorGroupId: String? = nil
-    @State private var lastPagingAnchor: String? = nil
+    @State private var lastPagingAnchorKey: String? = nil
 
     // “Don’t annoy me” UX
     @State private var isAtBottom: Bool = true
@@ -90,8 +90,9 @@ struct MessagesPane: View {
         guard let anchorGroupId, let anchorMessageId else { return }
 
         // Prevent “double fire” when SwiftUI reuses/rebuilds the top area.
-        if lastPagingAnchor == anchorGroupId { return }
-        lastPagingAnchor = anchorGroupId
+        let key = "\(anchorGroupId):\(anchorMessageId)"
+        if lastPagingAnchorKey == key { return }
+        lastPagingAnchorKey = key
 
         restoreAnchorGroupId = anchorGroupId
         pagingInFlight = true
@@ -130,7 +131,12 @@ struct MessagesPane: View {
         guard !unseen.isEmpty else { return }
         viewMessagesDebouncer.schedule(delay: 0.2) { [chatId = chat.id, unseen] in
             store.viewMessages(chatId: chatId, messageIds: Array(unseen), forceRead: false)
-            viewedMessageIds.formUnion(unseen)
+            viewMessagesDebouncer.schedule(delay: 0.2) { [chatId = chat.id, unseen] in
+                store.viewMessages(chatId: chatId, messageIds: Array(unseen), forceRead: false)
+                DispatchQueue.main.async {
+                    viewedMessageIds.formUnion(unseen)
+                }
+            }
         }
     }
 
@@ -313,9 +319,14 @@ struct MessagesPane: View {
             .onAppear {
                 // Trigger paging only when we actually reach the top of what's loaded.
                 guard pagingEnabled, !pagingInFlight, !store.isLoadingHistory else { return }
+
+                // Never page during the initial hidden render / jump-to-bottom sequence.
+                guard didInitialScrollToBottom, showAfterInitialJump else { return }
+
                 guard let firstGroupId, g.id == firstGroupId else { return }
                 // Don't page while user is already at the bottom (initial open / reading newest).
                 guard !isAtBottom else { return }
+
                 let anchorGroupId = topVisibleGroupId ?? g.id
                 let anchorMessageId = topVisibleMessageId ?? g.messages.first?.id
                 requestOlderHistory(anchorGroupId: anchorGroupId, anchorMessageId: anchorMessageId)
@@ -461,7 +472,7 @@ struct MessagesPane: View {
                     pagingEnabled = false
                     didInitialScrollToBottom = false
                     showAfterInitialJump = false
-                    lastPagingAnchor = nil
+                    lastPagingAnchorKey = nil
                     restoreAnchorGroupId = nil
                     pagingInFlight = false
 
@@ -474,12 +485,16 @@ struct MessagesPane: View {
                     pagingEnabled = false
                     pagingInFlight = false
                     restoreAnchorGroupId = nil
-                    lastPagingAnchor = nil
+                    lastPagingAnchorKey = nil
                     didInitialScrollToBottom = false
                     showAfterInitialJump = false
                     cachedRows = []
                     windowMessages = []
                     windowApplyToken = UUID()
+                    pendingGroupFrameUpdate?.cancel()
+                    pendingGroupFrameUpdate = nil
+                    jellyDecayTask?.cancel()
+                    jellyDecayTask = nil
                     viewMessagesDebouncer.cancel()
                     viewedMessageIds = []
                     lastVisibleGroupIds = []
@@ -543,6 +558,10 @@ struct MessagesPane: View {
                 .task(id: chat.id) {
                     guard !didInitialScrollToBottom else { return }
                     showAfterInitialJump = false
+                    
+                    // Kick off an initial load for this chat (local + remote).
+                    viewModel.loadOlder(pageSize: 80)
+                    store.loadMoreHistory(chatId: chat.id, anchorMessageId: 0)
 
                     // Let SwiftUI finish initial layout passes.
                     await Task.yield()
@@ -594,7 +613,7 @@ struct MessagesPane: View {
         func flushBucket() {
             guard let first = bucket.first else { return }
             let group = MessageGroup(
-                id: "\(chat.id):g:\(first.id)",
+                id: "\(chat.id):g:\(first.chatId):\(first.id):\(first.localId?.uuidString ?? "nil")",
                 isOutgoing: curOutgoing,
                 senderUserId: curSender,
                 messages: bucket

@@ -4,6 +4,7 @@
 
 import Foundation
 import AppKit
+import os
 
 extension TelegramStore {
 
@@ -56,19 +57,11 @@ extension TelegramStore {
     }
 
     func startPendingCleanupTimer() {
-<<<<<<< Updated upstream
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.pendingCleanupTimer?.invalidate()
             self.pendingCleanupTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
                 self?.cleanupExpiredPendingItems()
-=======
-        pendingCleanupTimer?.invalidate()
-        pendingCleanupTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            guard let store = self else { return }
-            Task { @MainActor in
-                store.cleanupExpiredPendingItems()
->>>>>>> Stashed changes
             }
         }
     }
@@ -497,12 +490,12 @@ extension TelegramStore {
         case .canceled:
             label = "canceled"
         }
-        log.debug("pending \(label, privacy: .public) localId=\(link.localId.uuidString, privacy: .public) sendingId=\(sendingId, privacy: .public) placeholderId=\(link.placeholderId, privacy: .public) serverMessageId=\(serverId, privacy: .public) retry=\(link.retryCount, privacy: .public)")
+        log.debug("pending \(label) localId=\(link.localId.uuidString) sendingId=\(sendingId) placeholderId=\(link.placeholderId) serverMessageId=\(serverId) retry=\(link.retryCount)")
     }
 
     func logPendingStateChange(state: String, link: PendingLink, messageId: Int64) {
         let serverId = serverMessageIdByLocalId[link.localId] ?? 0
-        log.debug("pending \(state, privacy: .public) localId=\(link.localId.uuidString, privacy: .public) sendingId=\(link.sendingId, privacy: .public) placeholderId=\(link.placeholderId, privacy: .public) serverMessageId=\(serverId, privacy: .public) messageId=\(messageId, privacy: .public) retry=\(link.retryCount, privacy: .public)")
+        log.debug("pending \(state) localId=\(link.localId.uuidString) sendingId=\(link.sendingId) placeholderId=\(link.placeholderId) serverMessageId=\(serverId) messageId=\(messageId) retry=\(link.retryCount)")
     }
 
     struct FunctionResponseMessage {
@@ -560,7 +553,7 @@ extension TelegramStore {
         await coalesceOutgoingDuplicates(chatId: chatId, localId: localId, keepMessageId: merged.id, fallbackMessage: merged)
 
 #if DEBUG
-        log.debug("reconcile \(logLabel, privacy: .public) localId=\(localId.uuidString, privacy: .public) placeholderId=\(placeholderId, privacy: .public) -> messageId=\(merged.id, privacy: .public)")
+        log.debug("reconcile \(logLabel) localId=\(localId.uuidString) placeholderId=\(placeholderId) -> messageId=\(merged.id)")
 #endif
         return true
     }
@@ -577,13 +570,21 @@ extension TelegramStore {
 
     func handleFunctionResponseMessage(_ resp: FunctionResponseMessage) async {
         let msg = resp.message
-        let reconciled = await reconcileFunctionResponseSend(extra: resp.extra, msg: msg)
-            || (await tryReconcileOutgoingPendingMessage(msg))
-#if DEBUG
+
+        let reconciledByFunctionResponse = await reconcileFunctionResponseSend(extra: resp.extra, msg: msg)
+        let reconciled: Bool
+        if reconciledByFunctionResponse {
+            reconciled = true
+        } else {
+            reconciled = await tryReconcileOutgoingPendingMessage(msg)
+        }
+
+    #if DEBUG
         if let extra = resp.extra, extra.hasPrefix("send:") {
             log.debug("send response extra=\(extra, privacy: .public) reconciled=\(reconciled, privacy: .public)")
         }
-#endif
+    #endif
+
         if reconciled {
             await updateChatLastFromLocalTimeline(chatId: msg.chatId)
         }
@@ -717,7 +718,7 @@ extension TelegramStore {
         if candidates.count > 1 {
             pendingMetrics.fallbackAmbiguous += 1
 #if DEBUG
-            log.debug("reconcile fallback ambiguous chatId=\(msg.chatId, privacy: .public) count=\(candidates.count, privacy: .public)")
+            log.debug("reconcile fallback ambiguous chatId=\(msg.chatId) count=\(candidates.count)")
 #endif
             return false
         }
@@ -737,7 +738,7 @@ extension TelegramStore {
         pendingMetrics.coalesceRemovedCount += 1
         await databaseBatchWriter.enqueue(.deleteMessagesByLocalId(chatId: chatId, localId: localId, keepingMessageId: keepMessageId))
 #if DEBUG
-        log.debug("deduper removed duplicates keep=\(keepMessageId, privacy: .public) localId=\(localId.uuidString, privacy: .public)")
+        log.debug("deduper removed duplicates keep=\(keepMessageId) localId=\(localId.uuidString)")
 #endif
     }
 }

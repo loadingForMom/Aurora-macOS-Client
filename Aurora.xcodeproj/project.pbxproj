@@ -8,6 +8,12 @@
 
 /* Begin PBXBuildFile section */
 		4BAF66654B604D97B1825501 /* AppDatabaseRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E6E622924B142AC9E7EC3AF /* AppDatabaseRepository.swift */; };
+		844D56AE2F14400600C3EE13 /* DatabaseBatchWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 844D56AC2F14400600C3EE13 /* DatabaseBatchWriter.swift */; };
+		844D56AF2F14400600C3EE13 /* TGRecordMapping.swift in Sources */ = {isa = PBXBuildFile; fileRef = 844D56AD2F14400600C3EE13 /* TGRecordMapping.swift */; };
+		844D56B22F14405A00C3EE13 /* TDLibReceiver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 844D56B02F14405A00C3EE13 /* TDLibReceiver.swift */; };
+		844D56B32F14405A00C3EE13 /* TDLibUpdateProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 844D56B12F14405A00C3EE13 /* TDLibUpdateProcessor.swift */; };
+		844D56B62F14410600C3EE13 /* ChatListViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 844D56B42F14410600C3EE13 /* ChatListViewModel.swift */; };
+		844D56B72F14410600C3EE13 /* ChatMessagesViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 844D56B52F14410600C3EE13 /* ChatMessagesViewModel.swift */; };
 		84C742112F114B8F0041D863 /* AvatarService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84C7420E2F114B8F0041D863 /* AvatarService.swift */; };
 		84C742122F114B8F0041D863 /* ImageMemCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84C7420F2F114B8F0041D863 /* ImageMemCache.swift */; };
 		84C742132F114B8F0041D863 /* ThumbnailService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84C742102F114B8F0041D863 /* ThumbnailService.swift */; };
@@ -62,6 +68,12 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		844D56AC2F14400600C3EE13 /* DatabaseBatchWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabaseBatchWriter.swift; sourceTree = "<group>"; };
+		844D56AD2F14400600C3EE13 /* TGRecordMapping.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TGRecordMapping.swift; sourceTree = "<group>"; };
+		844D56B02F14405A00C3EE13 /* TDLibReceiver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TDLibReceiver.swift; sourceTree = "<group>"; };
+		844D56B12F14405A00C3EE13 /* TDLibUpdateProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TDLibUpdateProcessor.swift; sourceTree = "<group>"; };
+		844D56B42F14410600C3EE13 /* ChatListViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatListViewModel.swift; sourceTree = "<group>"; };
+		844D56B52F14410600C3EE13 /* ChatMessagesViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessagesViewModel.swift; sourceTree = "<group>"; };
 		84C741C82F103DE00041D863 /* AURORA_CODEBASE_DOCUMENTATION.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = AURORA_CODEBASE_DOCUMENTATION.md; sourceTree = "<group>"; };
 		84C7420E2F114B8F0041D863 /* AvatarService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AvatarService.swift; sourceTree = "<group>"; };
 		84C7420F2F114B8F0041D863 /* ImageMemCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageMemCache.swift; sourceTree = "<group>"; };
@@ -122,6 +134,8 @@
 			isa = PBXGroup;
 			children = (
 				CC245C0F580D4ADBAD98EDCA /* AppDatabase.swift */,
+				844D56AC2F14400600C3EE13 /* DatabaseBatchWriter.swift */,
+				844D56AD2F14400600C3EE13 /* TGRecordMapping.swift */,
 				8E6E622924B142AC9E7EC3AF /* AppDatabaseRepository.swift */,
 			);
 			path = Database;
@@ -196,6 +210,8 @@
 				84C7420E2F114B8F0041D863 /* AvatarService.swift */,
 				84C7420F2F114B8F0041D863 /* ImageMemCache.swift */,
 				84C742142F114D4E0041D863 /* StorageManager.swift */,
+				844D56B02F14405A00C3EE13 /* TDLibReceiver.swift */,
+				844D56B12F14405A00C3EE13 /* TDLibUpdateProcessor.swift */,
 				84C742102F114B8F0041D863 /* ThumbnailService.swift */,
 				84D0850D2F095F2F00C35112 /* TelegramModels.swift */,
 				84D085092F094D8400C35112 /* TDLibClient.swift */,
@@ -235,6 +251,8 @@
 				84D085252F096F4500C35112 /* ChatRow.swift */,
 				84D085232F096ED500C35112 /* MessageBubble.swift */,
 				84D085EF2F1B123400C35112 /* MessageTextPipeline.swift */,
+				844D56B42F14410600C3EE13 /* ChatListViewModel.swift */,
+				844D56B52F14410600C3EE13 /* ChatMessagesViewModel.swift */,
 				84D0851C2F09689200C35112 /* ChatInspectorView.swift */,
 				84D0851B2F09687C00C35112 /* ComposerBar.swift */,
 				84D0851A2F09686100C35112 /* MessageGroupView.swift */,
@@ -369,6 +387,12 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				844D56B62F14410600C3EE13 /* ChatListViewModel.swift in Sources */,
+				844D56B72F14410600C3EE13 /* ChatMessagesViewModel.swift in Sources */,
+				844D56B22F14405A00C3EE13 /* TDLibReceiver.swift in Sources */,
+				844D56B32F14405A00C3EE13 /* TDLibUpdateProcessor.swift in Sources */,
+				844D56AE2F14400600C3EE13 /* DatabaseBatchWriter.swift in Sources */,
+				844D56AF2F14400600C3EE13 /* TGRecordMapping.swift in Sources */,
 				84C742152F114D4E0041D863 /* StorageManager.swift in Sources */,
 				84C742112F114B8F0041D863 /* AvatarService.swift in Sources */,
 				84C742122F114B8F0041D863 /* ImageMemCache.swift in Sources */,

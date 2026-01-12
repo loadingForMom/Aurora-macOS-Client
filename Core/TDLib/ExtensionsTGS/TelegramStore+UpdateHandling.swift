@@ -3,6 +3,7 @@
 //
 
 import Foundation
+import os
 
 extension TelegramStore {
 

@@ -5,6 +5,7 @@
 
 import SwiftUI
 
+
 struct ChatMessageGroupView: View {
     @ObservedObject var store: TelegramStore
     let chat: TGChat
@@ -47,6 +48,8 @@ struct ChatMessageGroupView: View {
 
             VStack(alignment: group.isOutgoing ? .trailing : .leading, spacing: 4) {
                 ForEach(group.messages, id: \.messageKey) { msg in
+                    let scrollSpace = MessagesPane.scrollSpaceName
+
                     MessageBubble(
                         msg: msg,
                         currentChatId: chat.id,
@@ -55,8 +58,7 @@ struct ChatMessageGroupView: View {
                         onDelete: { store.deleteMessages(chatId: msg.chatId, messageIds: [msg.id], revoke: true) }
                     )
                     .visualEffect { content, proxy in
-                        // Anchor jelly to bottom of visible container.
-                        let frame = proxy.frame(in: .named(MessagesPane.scrollSpaceName))
+                        let frame = proxy.frame(in: .named(scrollSpace))
                         let distanceToBottom = max(0, jellyContainerHeight - frame.maxY)
                         let k = max(0, 1 - min(distanceToBottom / 360, 1))
 

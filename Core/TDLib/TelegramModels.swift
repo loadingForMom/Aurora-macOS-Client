@@ -99,6 +99,9 @@ struct TGMessage: Identifiable, Hashable {
     let date: Int
     let isOutgoing: Bool
     let senderUserId: Int64?
+    
+    
+    
 
     /// Preview / fallback text (what you already used everywhere).
     let text: String

@@ -36,9 +36,7 @@ struct MessageBubble: View {
         self.onRetry = onRetry
         self.onDelete = onDelete
         self.jellyOffsetY = jellyOffsetY
-#if DEBUG
-        assert(msg.chatId == currentChatId, "Message chatId mismatch: expected \(currentChatId) got \(msg.chatId)")
-#endif
+
     }
 
     var body: some View {

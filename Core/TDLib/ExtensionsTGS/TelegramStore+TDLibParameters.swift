@@ -4,6 +4,7 @@
 
 import Foundation
 import Security
+import os
 
 extension TelegramStore {
 
@@ -40,8 +41,8 @@ extension TelegramStore {
             "files_directory": filesDir.path,
             // TDLib docs: database_encryption_key must be stable across launches.
             "database_encryption_key": encryptionKey,
-            "use_message_database": false,
-            "use_chat_info_database": false,
+            "use_message_database": true,
+            "use_chat_info_database": true,
             "use_file_database": false,
             "use_secret_chats": false,
             "api_id": apiId,
