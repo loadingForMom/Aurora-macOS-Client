@@ -33,8 +33,6 @@ struct ChatScreen: View {
                 .background(.clear)
             }
             .task(id: chat.id) {
-                // UI-only: reset draft whenever we enter/switch chats.
-                // (Chat selection + history loading should be handled elsewhere as the single source of truth.)
                 draft = ""
             }
     }

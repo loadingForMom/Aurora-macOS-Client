@@ -5,17 +5,8 @@
 //  Created by Sasha on 1/4/26.
 //
 
-//
-//  SettingsRootView.swift
-//  Aurora
-//
-//  Created by Sasha on 1/4/26.
-//
-
 import SwiftUI
 import AppKit
-
-// MARK: - Sections
 
 enum AuroraSettingsSection: String, CaseIterable, Identifiable {
     case general = "Общие"
@@ -44,8 +35,6 @@ enum AuroraSettingsSection: String, CaseIterable, Identifiable {
         }
     }
 }
-
-// MARK: - Root
 
 struct SettingsRootView: View {
     @ObservedObject var store: TelegramStore
@@ -114,11 +103,9 @@ struct SettingsRootView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .onAppear {
-            // Ensure the settings window always keeps the sidebar visible.
             columnVisibility = .doubleColumn
         }
         .onChange(of: columnVisibility) { _, newValue in
-            // If the system/user tries to collapse the sidebar, force it back.
             if newValue != .doubleColumn {
                 columnVisibility = .doubleColumn
             }
@@ -126,14 +113,16 @@ struct SettingsRootView: View {
     }
 }
 
-// MARK: - Sidebar header (profile)
-
 private struct SidebarProfileHeader: View {
     @ObservedObject var store: TelegramStore
 
     var body: some View {
         let displayName = store.myDisplayName
         let initials = initialsFrom(displayName)
+
+        // IMPORTANT:
+        // store.myProfileNSImage теперь отдаёт уже миниатюру (через дисковый кэш),
+        // а не “полный” decode исходника.
         let img = store.myProfileNSImage
 
         HStack(spacing: 12) {
@@ -179,7 +168,6 @@ private struct SidebarProfileHeader: View {
         return parts.joined()
     }
 }
-
 
 // MARK: - Panes
 
@@ -254,7 +242,6 @@ private struct DataAndStorageSettingsView: View {
     }
 
     private var cacheLimitBytes: Int64 {
-        // MB -> bytes
         Int64(cacheLimitMB * 1024 * 1024)
     }
 
@@ -342,7 +329,6 @@ private struct DataAndStorageSettingsView: View {
 
                     Slider(value: $cacheLimitMB, in: 256...16384, step: 256)
                         .onChange(of: cacheLimitMB) { _, newValue in
-                            // Дебаунс, чтобы не слать optimizeStorage на каждый тик слайдера.
                             cacheLimitApplyTask?.cancel()
                             cacheLimitApplyTask = Task { @MainActor in
                                 try? await Task.sleep(nanoseconds: 450_000_000)
@@ -404,8 +390,6 @@ private struct PlaceholderSettingsView: View {
         }
     }
 }
-
-// MARK: - Donut chart
 
 private struct DonutChart: View {
     let values: [Int64]
