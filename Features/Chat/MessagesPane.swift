@@ -18,8 +18,6 @@ struct MessagesPane: View {
     let chat: TGChat
     @ObservedObject var viewModel: ChatMessagesViewModel
 
-    @Environment(\.isLiveResizing) private var isLiveResizing
-
     @State private var pagingEnabled: Bool = false
     @State private var pagingInFlight: Bool = false
     @State private var restoreAnchorGroupId: String? = nil
@@ -164,15 +162,14 @@ struct MessagesPane: View {
             .flatMap { $0 }
 
         guard !messageIds.isEmpty else { return }
-        let sortedIds = messageIds.sorted()
-        let firstId = sortedIds.first.map(String.init) ?? "n/a"
-        let lastId = sortedIds.last.map(String.init) ?? "n/a"
+        let firstId = messageIds.min().map(String.init) ?? "n/a"
+        let lastId = messageIds.max().map(String.init) ?? "n/a"
         let lo = minMessageId.map(String.init) ?? "n/a"
         let hi = maxMessageId.map(String.init) ?? "n/a"
         SwiftUIPublishTrace.uiEvent(
             name: "onPreferenceChange_visibleRange",
             chatId: chat.id,
-            payload: "range=\(lo)..\(hi) count=\(sortedIds.count) visibleIdsCount=\(sortedIds.count) first=\(firstId) last=\(lastId)",
+            payload: "range=\(lo)..\(hi) count=\(messageIds.count) visibleIdsCount=\(messageIds.count) first=\(firstId) last=\(lastId)",
             reason: "fromVisibleRange"
         )
         store.reportVisibleMessages(
@@ -197,9 +194,8 @@ struct MessagesPane: View {
             let visibleIds = currentVisible
                 .compactMap { groupMessageIds[$0] }
                 .flatMap { $0 }
-                .sorted()
-            let firstId = visibleIds.first.map(String.init) ?? "n/a"
-            let lastId = visibleIds.last.map(String.init) ?? "n/a"
+            let firstId = visibleIds.min().map(String.init) ?? "n/a"
+            let lastId = visibleIds.max().map(String.init) ?? "n/a"
             SwiftUIPublishTrace.uiEvent(
                 name: "onChange_visibleMessageIds",
                 chatId: chat.id,
@@ -505,14 +501,7 @@ struct MessagesPane: View {
                             payload: "offsetY=\(Int(offsetY.rounded())) delta=\(Int(delta.rounded()))",
                             reason: "scrollGeometryPreference"
                         )
-                        guard !isLiveResizing else { return }
                         pushJellyImpulse(delta: delta)
-                    }
-                }
-                .onChange(of: isLiveResizing) { _, live in
-                    if live {
-                        jellyDecayTask?.cancel()
-                        jellyDecayTask = nil
                     }
                 }
                 .overlay(alignment: .bottomTrailing) {

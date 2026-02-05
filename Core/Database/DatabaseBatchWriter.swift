@@ -40,9 +40,7 @@ actor DatabaseBatchWriter {
         if pending.count >= maxPendingBeforeImmediateFlush {
             flushTask?.cancel()
             flushTask = nil
-            Task(priority: .utility) { [weak self] in
-                await self?.flush()
-            }
+            flush()
             return
         }
 
@@ -57,10 +55,10 @@ actor DatabaseBatchWriter {
     func flushNow() async {
         flushTask?.cancel()
         flushTask = nil
-        await flush()
+        flush()
     }
 
-    func flush() async {
+    private func flush() {
         flushTask = nil
         let operations = pending
         pending.removeAll(keepingCapacity: true)

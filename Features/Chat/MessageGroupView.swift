@@ -11,8 +11,6 @@ struct ChatMessageGroupView: View {
     let chat: TGChat
     let group: MessageGroup
 
-    @Environment(\.isLiveResizing) private var isLiveResizing
-
     /// Trackpad “reveal exact time” (0…maxReveal)
     let revealTimeX: CGFloat
 
@@ -34,8 +32,7 @@ struct ChatMessageGroupView: View {
     }
 
     var body: some View {
-        let enableJelly = !isLiveResizing
-            && abs(jellyScrollImpulse) > 0.5
+        let enableJelly = abs(jellyScrollImpulse) > 0.5
             && group.messages.count < 60
         let stretch = enableJelly ? (1 + min(abs(jellyScrollImpulse) / 320, 0.18)) : 1
         let y = enableJelly ? (-jellyScrollImpulse * 1.1) : 0
