@@ -52,6 +52,7 @@ extension TelegramStore {
 
     // MARK: - Avatar apply / download
 
+    @MainActor
     func registerChatAvatar(chatId: Int64, smallFileId: Int32?, bigFileId: Int32?, initialBestPath: String?) {
         avatarService.registerChatAvatar(
             chatId: chatId,
@@ -67,6 +68,7 @@ extension TelegramStore {
         }
     }
 
+    @MainActor
     func applyChatAvatarFileUpdate(chatId: Int64, fileId: Int32, path: String) {
         avatarService.applyChatAvatarFileUpdate(
             chatId: chatId,
@@ -75,10 +77,9 @@ extension TelegramStore {
             chatAvatarMetaByChatId: &chatAvatarMetaByChatId,
             chatAvatarPathByChatId: &chatAvatarPathByChatId
         )
-
-        objectWillChange.send()
     }
 
+    @MainActor
     func downloadFileIfNeeded(fileId: Int32, priority: Int) {
         avatarService.downloadFileIfNeeded(
             fileId: fileId,

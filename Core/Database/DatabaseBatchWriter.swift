@@ -39,6 +39,12 @@ actor DatabaseBatchWriter {
         }
     }
 
+    func flushNow() async {
+        flushTask?.cancel()
+        flushTask = nil
+        await flush()
+    }
+
     func flush() async {
         flushTask = nil
         let operations = pending

@@ -112,6 +112,15 @@ struct ContentView: View {
                 TelegramLoginView(store: store)
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willResignActiveNotification)) { _ in
+            store.flushDatabaseNow()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            store.flushDatabaseNow()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { _ in
+            store.flushDatabaseNow()
+        }
     }
 }
 

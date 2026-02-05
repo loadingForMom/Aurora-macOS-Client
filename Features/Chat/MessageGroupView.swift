@@ -11,30 +11,35 @@ struct ChatMessageGroupView: View {
     let chat: TGChat
     let group: MessageGroup
 
+    @Environment(\.isLiveResizing) private var isLiveResizing
+
     /// Trackpad “reveal exact time” (0…maxReveal)
     let revealTimeX: CGFloat
 
     /// Jelly impulse (computed by parent from scroll deltas)
     let jellyScrollImpulse: CGFloat
-    let jellyContainerHeight: CGFloat
 
     init(
         store: TelegramStore,
         chat: TGChat,
         group: MessageGroup,
         revealTimeX: CGFloat = 0,
-        jellyScrollImpulse: CGFloat = 0,
-        jellyContainerHeight: CGFloat = 0
+        jellyScrollImpulse: CGFloat = 0
     ) {
         self.store = store
         self.chat = chat
         self.group = group
         self.revealTimeX = revealTimeX
         self.jellyScrollImpulse = jellyScrollImpulse
-        self.jellyContainerHeight = jellyContainerHeight
     }
 
     var body: some View {
+        let enableJelly = !isLiveResizing
+            && abs(jellyScrollImpulse) > 0.5
+            && group.messages.count < 60
+        let stretch = enableJelly ? (1 + min(abs(jellyScrollImpulse) / 320, 0.18)) : 1
+        let y = enableJelly ? (-jellyScrollImpulse * 1.1) : 0
+
         VStack(alignment: group.isOutgoing ? .trailing : .leading, spacing: 6) {
             if chat.kind.isGroup && !group.isOutgoing {
                 let name = store.userDisplayName(group.senderUserId)
@@ -48,8 +53,6 @@ struct ChatMessageGroupView: View {
 
             VStack(alignment: group.isOutgoing ? .trailing : .leading, spacing: 4) {
                 ForEach(group.messages, id: \.messageKey) { msg in
-                    let scrollSpace = MessagesPane.scrollSpaceName
-
                     MessageBubble(
                         msg: msg,
                         currentChatId: chat.id,
@@ -57,22 +60,12 @@ struct ChatMessageGroupView: View {
                         onRetry: { store.retrySend(message: msg) },
                         onDelete: { store.deleteMessages(chatId: msg.chatId, messageIds: [msg.id], revoke: true) }
                     )
-                    .visualEffect { content, proxy in
-                        let frame = proxy.frame(in: .named(scrollSpace))
-                        let distanceToBottom = max(0, jellyContainerHeight - frame.maxY)
-                        let k = max(0, 1 - min(distanceToBottom / 360, 1))
-
-                        // Stronger amplitude (you asked for more).
-                        let y = (-jellyScrollImpulse * 1.45 * k)
-                        let stretch = 1 + min(abs(jellyScrollImpulse) / 320, 0.22) * k
-                        return content
-                            .scaleEffect(x: 1, y: stretch, anchor: .bottom)
-                            .offset(y: y)
-                    }
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: group.isOutgoing ? .trailing : .leading)
         .padding(.vertical, 2)
+        .scaleEffect(x: 1, y: stretch, anchor: .bottom)
+        .offset(y: y)
     }
 }

@@ -14,13 +14,16 @@ struct MessageBubble: View {
     /// Trackpad “reveal exact time” (0…maxReveal), passed from parent.
     let revealTimeX: CGFloat
 
+    @Environment(\.isLiveResizing) private var isLiveResizing
+
     var onRetry: () -> Void = {}
     var onDelete: () -> Void = {}
 
-    /// Kept for compatibility; jelly is applied via visualEffect in parent now.
+    /// Kept for compatibility; jelly is applied by the parent at the group level.
     var jellyOffsetY: CGFloat = 0
 
     private let maxReveal: CGFloat = 72
+    private let bubbleMaxWidth: CGFloat = 560
 
     init(
         msg: TGMessage,
@@ -97,9 +100,7 @@ struct MessageBubble: View {
                 entities: msg.entities,
                 style: .bubbleBody
             )
-            Text(attributed)
-                .foregroundStyle(msg.isOutgoing ? .white : .primary)
-                .textSelection(.enabled)
+            selectableText(attributed)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.vertical, 8)
                 .padding(.horizontal, 12)
@@ -129,6 +130,18 @@ struct MessageBubble: View {
                         .foregroundStyle(.secondary)
                 }
             }
+        }
+        .frame(maxWidth: bubbleMaxWidth, alignment: msg.isOutgoing ? .trailing : .leading)
+    }
+
+    @ViewBuilder
+    private func selectableText(_ attributed: AttributedString) -> some View {
+        let base = Text(attributed)
+            .foregroundStyle(msg.isOutgoing ? .white : .primary)
+        if isLiveResizing {
+            base.textSelection(.disabled)
+        } else {
+            base.textSelection(.enabled)
         }
     }
 

@@ -73,38 +73,61 @@ extension TelegramStore {
         }
 
         if let (u, photoFileId, photoPath) = parseUpdateUser(upt: upd) {
-            userCache[u.id] = u
-            await databaseBatchWriter.enqueue(.upsertUser(u))
-
-            if let meId = myUserId, meId == u.id {
+            let myPhotoToDownload: Int32? = await MainActor.run {
+                userCache[u.id] = u
+                guard let meId = myUserId, meId == u.id else { return nil }
                 if let p = photoPath {
-                    await MainActor.run { myProfilePhotoPath = p }
+                    myProfilePhotoPath = p
                 }
                 if let fid = photoFileId {
                     myPhotoFileId = fid
-                    downloadMyPhotoIfNeeded(fileId: fid)
+                    return fid
+                }
+                return nil
+            }
+            await databaseBatchWriter.enqueue(.upsertUser(u))
+
+            if let fid = myPhotoToDownload {
+                await downloadMyPhotoIfNeeded(fileId: fid)
+            }
+        }
+
+        if let (fileId, path) = parseUpdateFilePathIfMyPhoto(upd) {
+            await MainActor.run {
+                guard let target = myPhotoFileId, target == fileId else { return }
+                myProfilePhotoPath = path
+                _ = myProfileNSImage(pointSize: 36)
+            }
+        }
+
+        if let (fileId, path) = parseUpdateFilePathIfChatAvatar(upd) {
+            await MainActor.run {
+                guard let chatId = chatIdByAvatarFileId[fileId] else { return }
+                applyChatAvatarFileUpdate(chatId: chatId, fileId: fileId, path: path)
+            }
+        }
+
+        if let update = parseUpdateChatPhoto(upd) {
+            await MainActor.run {
+                if update.hasPhoto {
+                    if let p = update.bestPath {
+                        chatAvatarPathByChatId[update.chatId] = p
+                    }
+                    registerChatAvatar(
+                        chatId: update.chatId,
+                        smallFileId: update.smallId,
+                        bigFileId: update.bigId,
+                        initialBestPath: update.bestPath
+                    )
+                } else {
+                    chatAvatarPathByChatId.removeValue(forKey: update.chatId)
+                    chatAvatarMetaByChatId.removeValue(forKey: update.chatId)
                 }
             }
         }
 
-        if let path = parseUpdateFilePathIfMyPhoto(upd) {
-            await MainActor.run { myProfilePhotoPath = path }
-            _ = myProfileNSImage(pointSize: 36)
-        }
-
-        if let (chatId, fileId, path) = parseUpdateFilePathIfChatAvatar(upd) {
-            applyChatAvatarFileUpdate(chatId: chatId, fileId: fileId, path: path)
-        }
-
-        if let (chatId, smallId, bigId, bestPath) = parseUpdateChatPhoto(upd) {
-            if let p = bestPath {
-                chatAvatarPathByChatId[chatId] = p
-            }
-            registerChatAvatar(chatId: chatId, smallFileId: smallId, bigFileId: bigId, initialBestPath: bestPath)
-        }
-
         if let user = parseUserObject(upd) {
-            userCache[user.id] = user
+            await MainActor.run { userCache[user.id] = user }
             await databaseBatchWriter.enqueue(.upsertUser(user))
         }
 
@@ -151,7 +174,7 @@ extension TelegramStore {
 #if DEBUG
             debugLogMessageEvent(label: "updateNewMessage", chatId: chatId, messageId: msg.id)
 #endif
-            requestUserIfNeeded(msg.senderUserId)
+            await requestUserIfNeeded(msg.senderUserId)
 
             if await tryReconcileOutgoingPendingMessage(msg) {
 #if DEBUG
@@ -184,11 +207,12 @@ extension TelegramStore {
                 await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chat.id, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date))
             }
 
-            if let p = bestPath {
-                chatAvatarPathByChatId[chat.id] = p
+            await MainActor.run {
+                if let p = bestPath {
+                    chatAvatarPathByChatId[chat.id] = p
+                }
+                registerChatAvatar(chatId: chat.id, smallFileId: smallId, bigFileId: bigId, initialBestPath: bestPath)
             }
-
-            registerChatAvatar(chatId: chat.id, smallFileId: smallId, bigFileId: bigId, initialBestPath: bestPath)
 
             if selectedChatId == nil {
                 await MainActor.run { selectedChatId = chat.id }
@@ -199,27 +223,31 @@ extension TelegramStore {
         // MARK: - Current user (me) + profile photo
 
         if let (me, photoFileId, photoPath) = parseMeUserResponse(resp) {
-            await MainActor.run { myUserId = me.id }
-            userCache[me.id] = me
-            await databaseBatchWriter.enqueue(.upsertUser(me))
-
-            if let p = photoPath {
-                await MainActor.run { myProfilePhotoPath = p }
+            let myPhotoToDownload: Int32? = await MainActor.run {
+                myUserId = me.id
+                userCache[me.id] = me
+                if let p = photoPath {
+                    myProfilePhotoPath = p
+                }
+                if let fid = photoFileId {
+                    myPhotoFileId = fid
+                    return fid
+                }
+                return nil
             }
-
-            if let fid = photoFileId {
-                myPhotoFileId = fid
-                downloadMyPhotoIfNeeded(fileId: fid)
+            await databaseBatchWriter.enqueue(.upsertUser(me))
+            if let fid = myPhotoToDownload {
+                await downloadMyPhotoIfNeeded(fileId: fid)
             }
         }
 
         if let user = parseUserObject(resp) {
-            userCache[user.id] = user
+            await MainActor.run { userCache[user.id] = user }
             await databaseBatchWriter.enqueue(.upsertUser(user))
         }
 
         if let storage = parseStorageStatisticsAny(resp) {
-            applyStorageStatistics(storage)
+            await MainActor.run { applyStorageStatistics(storage) }
         }
 
         // Response message with @extra
@@ -253,8 +281,16 @@ extension TelegramStore {
                 debugLogMessageEvent(label: "getChatHistory", chatId: job.chatId, messageId: m.id)
                 assert(m.chatId == job.chatId, "TDLib history message chatId mismatch: expected \(job.chatId) got \(m.chatId)")
 #endif
-                await databaseBatchWriter.enqueue(.upsertMessage(m))
-                requestUserIfNeeded(m.senderUserId)
+                // Per-message debug logging only; DB writes are batched below.
+            }
+
+            if !res.messages.isEmpty {
+                await databaseBatchWriter.enqueue(.upsertMessages(res.messages))
+            }
+
+            let senderIds = Set(res.messages.compactMap(\.senderUserId))
+            for senderId in senderIds {
+                await requestUserIfNeeded(senderId)
             }
 
             if job.kind == .older && res.messages.isEmpty {
@@ -264,24 +300,36 @@ extension TelegramStore {
             historyJobs.removeValue(forKey: res.extra)
 
             if job.kind == .initialLocal {
-                let extra = "history:\(job.chatId):initial:remote:\(UUID().uuidString)"
-                historyJobs[extra] = HistoryJob(
-                    chatId: job.chatId,
-                    kind: .initialRemote,
-                    anchorMessageId: 0,
-                    requestedLimit: job.requestedLimit,
-                    windowLimit: job.windowLimit,
-                    onlyLocal: false,
-                    generation: job.generation
-                )
-                sendChatHistory(
-                    chatId: job.chatId,
-                    fromMessageId: 0,
-                    offset: 0,
-                    limit: job.requestedLimit,
-                    onlyLocal: false,
-                    extra: extra
-                )
+                let localCount = res.messages.count
+                let needMoreByCount = localCount < job.requestedLimit
+                let localMaxId = res.messages.map(\.id).max() ?? 0
+                let chatLastId = databaseRepository.fetchChat(chatId: job.chatId)?.lastMessageId ?? 0
+                let needMoreById = chatLastId > 0 && localMaxId < chatLastId
+
+                if needMoreByCount || needMoreById {
+                    let extra = "history:\(job.chatId):initial:remote:\(UUID().uuidString)"
+                    historyJobs[extra] = HistoryJob(
+                        chatId: job.chatId,
+                        kind: .initialRemote,
+                        anchorMessageId: 0,
+                        requestedLimit: job.requestedLimit,
+                        windowLimit: job.windowLimit,
+                        onlyLocal: false,
+                        generation: job.generation
+                    )
+                    sendChatHistory(
+                        chatId: job.chatId,
+                        fromMessageId: 0,
+                        offset: 0,
+                        limit: job.requestedLimit,
+                        onlyLocal: false,
+                        extra: extra
+                    )
+                }
+            }
+
+            if job.kind == .initialLocal || job.kind == .initialRemote {
+                await databaseBatchWriter.flushNow()
             }
 
             if selectedChatId == job.chatId {

@@ -18,9 +18,10 @@ extension TelegramStore {
         )
     }
 
-    func requestUserIfNeeded(_ userId: Int64?) {
+    func requestUserIfNeeded(_ userId: Int64?) async {
         guard let id = userId else { return }
-        guard userCache[id] == nil else { return }
+        let needsRequest = await MainActor.run { userCache[id] == nil }
+        guard needsRequest else { return }
         td.send(#"{"@type":"getUser","user_id":\#(id)}"#)
     }
 }

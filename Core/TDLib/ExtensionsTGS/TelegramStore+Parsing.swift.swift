@@ -316,6 +316,7 @@ extension TelegramStore {
         return (user, photoFileId, photoPath)
     }
 
+    @MainActor
     func downloadMyPhotoIfNeeded(fileId: Int32) {
         if let p = myProfilePhotoPath,
            !p.isEmpty,
@@ -335,63 +336,63 @@ extension TelegramStore {
         sendJSON(req)
     }
 
-    func parseUpdateFilePathIfMyPhoto(_ upd: String) -> String? {
+    func parseUpdateFilePathIfMyPhoto(_ upd: String) -> (Int32, String)? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "updateFile" else { return nil }
         guard let file = obj["file"] as? [String: Any] else { return nil }
         guard let idNum = file["id"] as? NSNumber else { return nil }
 
         let fid = idNum.int32Value
-        guard let target = myPhotoFileId, fid == target else { return nil }
-
         guard let local = file["local"] as? [String: Any] else { return nil }
         let done = (local["is_downloading_completed"] as? Bool) ?? false
         let path = (local["path"] as? String) ?? ""
 
         guard !path.isEmpty else { return nil }
 
-        if done { return path }
-        if FileManager.default.fileExists(atPath: path) { return path }
+        if done { return (fid, path) }
+        if FileManager.default.fileExists(atPath: path) { return (fid, path) }
         return nil
     }
 
-    func parseUpdateFilePathIfChatAvatar(_ upd: String) -> (Int64, Int32, String)? {
+    func parseUpdateFilePathIfChatAvatar(_ upd: String) -> (Int32, String)? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "updateFile" else { return nil }
         guard let file = obj["file"] as? [String: Any] else { return nil }
         guard let idNum = file["id"] as? NSNumber else { return nil }
 
         let fid = idNum.int32Value
-        guard let chatId = chatIdByAvatarFileId[fid] else { return nil }
-
         guard let local = file["local"] as? [String: Any] else { return nil }
         let done = (local["is_downloading_completed"] as? Bool) ?? false
         let path = (local["path"] as? String) ?? ""
 
         guard !path.isEmpty else { return nil }
 
-        if FileManager.default.fileExists(atPath: path) {
-            return (chatId, fid, path)
-        }
+        if FileManager.default.fileExists(atPath: path) { return (fid, path) }
 
         guard done else { return nil }
-        return (chatId, fid, path)
+        return (fid, path)
     }
 
-    func parseUpdateChatPhoto(_ upd: String) -> (Int64, Int32?, Int32?, String?)? {
+    struct ChatPhotoUpdate {
+        let chatId: Int64
+        let smallId: Int32?
+        let bigId: Int32?
+        let bestPath: String?
+        let hasPhoto: Bool
+    }
+
+    func parseUpdateChatPhoto(_ upd: String) -> ChatPhotoUpdate? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "updateChatPhoto" else { return nil }
         guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
 
         guard let photo = obj["photo"] as? [String: Any] else {
-            chatAvatarPathByChatId.removeValue(forKey: chatId)
-            chatAvatarMetaByChatId.removeValue(forKey: chatId)
-            return (chatId, nil, nil, nil)
+            return ChatPhotoUpdate(chatId: chatId, smallId: nil, bigId: nil, bestPath: nil, hasPhoto: false)
         }
 
         let extracted = extractChatPhotoIdsAndPaths(photo)
         let best = extracted.smallPath ?? extracted.bigPath
-        return (chatId, extracted.smallId, extracted.bigId, best)
+        return ChatPhotoUpdate(chatId: chatId, smallId: extracted.smallId, bigId: extracted.bigId, bestPath: best, hasPhoto: true)
     }
 
     // MARK: - Messages / history

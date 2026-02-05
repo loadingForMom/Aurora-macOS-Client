@@ -35,9 +35,9 @@ struct MessagesPane: View {
     @State private var windowMessages: [TGMessage] = []
     @State private var windowApplyToken = UUID()
     @State private var viewedMessageIds = Set<Int64>()
+    @State private var visibleGroupIds = Set<String>()
     @State private var lastVisibleGroupIds = Set<String>()
     @State private var viewMessagesDebouncer = ViewMessagesDebouncer()
-    @State private var frameUpdateState = GroupFrameUpdateState()
 
     @State private var topVisibleGroupId: String? = nil
     @State private var topVisibleMessageId: Int64? = nil
@@ -52,7 +52,6 @@ struct MessagesPane: View {
 
     // Jelly / springy scrolling (macOS-safe)
     @State private var jellyScrollImpulse: CGFloat = 0
-    @State private var jellyContainerHeight: CGFloat = 0
     @State private var lastScrollOffsetY: CGFloat = 0
     @State private var jellyDecayTask: Task<Void, Never>? = nil
 
@@ -117,14 +116,27 @@ struct MessagesPane: View {
             log.debug("filtered out all rows chatId=\(expectedChatId, privacy: .public)")
 #endif
         }
-        DispatchQueue.main.async { [token, expectedChatId, filtered] in
+        Task { @MainActor [token, expectedChatId, filtered] in
             guard windowApplyToken == token else { return }
             guard chat.id == expectedChatId else { return }
             if let anchorGroupId {
                 restoreAnchorGroupId = anchorGroupId
             }
             windowMessages = filtered
-            cachedRows = buildRows(filtered)
+            let rows = buildRows(filtered)
+            cachedRows = rows
+
+            let groupIdsOrdered: [String] = rows.compactMap {
+                if case .group(let g) = $0 { return g.id }
+                return nil
+            }
+            let (bounds, ids) = buildGroupMaps(rows: rows)
+            updateVisibleState(
+                groupIdsOrdered: groupIdsOrdered,
+                groupMessageBounds: bounds,
+                groupMessageIds: ids,
+                forceViewMessages: true
+            )
         }
     }
 
@@ -133,63 +145,55 @@ struct MessagesPane: View {
         guard !unseen.isEmpty else { return }
         viewMessagesDebouncer.schedule(delay: 0.2) { [chatId = chat.id, unseen] in
             store.viewMessages(chatId: chatId, messageIds: Array(unseen), forceRead: false)
-            viewMessagesDebouncer.schedule(delay: 0.2) { [chatId = chat.id, unseen] in
-                store.viewMessages(chatId: chatId, messageIds: Array(unseen), forceRead: false)
-                DispatchQueue.main.async {
-                    viewedMessageIds.formUnion(unseen)
-                }
+            Task { @MainActor in
+                viewedMessageIds.formUnion(unseen)
             }
         }
     }
 
-    @MainActor
-    private func updateVisibleGroups(
-        frames: [String: CGRect],
-        groupMessageBounds: [String: (min: Int64, max: Int64)],
-        groupMessageIds: [String: [Int64]]
-    ) {
-        let visibleGroups = frames.filter { $0.value.maxY >= 0 && $0.value.minY <= jellyContainerHeight }
-        let visibleGroupIds = Set(visibleGroups.keys)
-        let visibleBounds = visibleGroups.compactMap { groupMessageBounds[$0.key] }
+    private func scheduleViewMessagesFromVisible(groupMessageIds: [String: [Int64]]) {
+        let groupIds = visibleGroupIds
+        guard !groupIds.isEmpty else { return }
 
+        let messageIds = groupIds
+            .compactMap { groupMessageIds[$0] }
+            .flatMap { $0 }
+
+        guard !messageIds.isEmpty else { return }
+        scheduleViewMessages(Set(messageIds))
+    }
+
+    @MainActor
+    private func updateVisibleState(
+        groupIdsOrdered: [String],
+        groupMessageBounds: [String: (min: Int64, max: Int64)],
+        groupMessageIds: [String: [Int64]],
+        forceViewMessages: Bool = false
+    ) {
+        let currentVisible = visibleGroupIds
+        let visibilityChanged = currentVisible != lastVisibleGroupIds
+        if visibilityChanged {
+            lastVisibleGroupIds = currentVisible
+        }
+
+        let visibleBounds = currentVisible.compactMap { groupMessageBounds[$0] }
         let newMin = visibleBounds.map(\.min).min()
         let newMax = visibleBounds.map(\.max).max()
-        let newTopGroup = visibleGroups.min(by: { $0.value.minY < $1.value.minY })?.key
+        let newTopGroup = groupIdsOrdered.first(where: { currentVisible.contains($0) })
         let newTopMessageId = newTopGroup.flatMap { groupMessageBounds[$0]?.min }
 
-        let visibilityChanged = visibleGroupIds != lastVisibleGroupIds
         let boundsChanged = newMin != visibleMinMessageId || newMax != visibleMaxMessageId
         let anchorChanged = newTopGroup != topVisibleGroupId || newTopMessageId != topVisibleMessageId
 
-        guard visibilityChanged || boundsChanged || anchorChanged else { return }
+        if boundsChanged || anchorChanged {
+            visibleMinMessageId = newMin
+            visibleMaxMessageId = newMax
+            topVisibleGroupId = newTopGroup
+            topVisibleMessageId = newTopMessageId
+        }
 
-        lastVisibleGroupIds = visibleGroupIds
-        visibleMinMessageId = newMin
-        visibleMaxMessageId = newMax
-        topVisibleGroupId = newTopGroup
-        topVisibleMessageId = newTopMessageId
-
-        let visibleMessageIds = Set(visibleGroupIds.flatMap { groupMessageIds[$0] ?? [] })
-        scheduleViewMessages(visibleMessageIds)
-    }
-
-    private func scheduleVisibleGroupsUpdate(
-        frames: [String: CGRect],
-        groupMessageBounds: [String: (min: Int64, max: Int64)],
-        groupMessageIds: [String: [Int64]]
-    ) {
-        // Coalesce preference updates off the render pass to avoid SwiftUI "publishing during update" warnings.
-        frameUpdateState.pendingTask?.cancel()
-        let snapshotFrames = frames
-        let snapshotBounds = groupMessageBounds
-        let snapshotIds = groupMessageIds
-        frameUpdateState.pendingTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 16_000_000) // coalesce per-frame updates
-            updateVisibleGroups(
-                frames: snapshotFrames,
-                groupMessageBounds: snapshotBounds,
-                groupMessageIds: snapshotIds
-            )
+        if visibilityChanged || forceViewMessages {
+            scheduleViewMessagesFromVisible(groupMessageIds: groupMessageIds)
         }
     }
 
@@ -292,7 +296,13 @@ struct MessagesPane: View {
     // MARK: - Row rendering (helps compiler + performance)
 
     @ViewBuilder
-    private func rowView(_ row: Row, firstGroupId: String?) -> some View {
+    private func rowView(
+        _ row: Row,
+        firstGroupId: String?,
+        groupIdsOrdered: [String],
+        groupMessageBounds: [String: (min: Int64, max: Int64)],
+        groupMessageIds: [String: [Int64]]
+    ) -> some View {
         switch row {
         case .dayHeader(_, let day):
             DayHeaderView(day: day)
@@ -306,19 +316,17 @@ struct MessagesPane: View {
                 chat: chat,
                 group: g,
                 revealTimeX: revealTimeX,
-                jellyScrollImpulse: jellyScrollImpulse,
-                jellyContainerHeight: jellyContainerHeight
+                jellyScrollImpulse: jellyScrollImpulse
             )
             .id(g.id)
-            .background(
-                GeometryReader { geo in
-                    Color.clear.preference(
-                        key: GroupFrameKey.self,
-                        value: [g.id: geo.frame(in: .named(MessagesPane.scrollSpaceName))]
-                    )
-                }
-            )
             .onAppear {
+                visibleGroupIds.insert(g.id)
+                updateVisibleState(
+                    groupIdsOrdered: groupIdsOrdered,
+                    groupMessageBounds: groupMessageBounds,
+                    groupMessageIds: groupMessageIds
+                )
+
                 // Trigger paging only when we actually reach the top of what's loaded.
                 guard pagingEnabled, !pagingInFlight, !store.isLoadingHistory else { return }
 
@@ -332,6 +340,14 @@ struct MessagesPane: View {
                 let anchorGroupId = topVisibleGroupId ?? g.id
                 let anchorMessageId = topVisibleMessageId ?? g.messages.first?.id
                 requestOlderHistory(anchorGroupId: anchorGroupId, anchorMessageId: anchorMessageId)
+            }
+            .onDisappear {
+                visibleGroupIds.remove(g.id)
+                updateVisibleState(
+                    groupIdsOrdered: groupIdsOrdered,
+                    groupMessageBounds: groupMessageBounds,
+                    groupMessageIds: groupMessageIds
+                )
             }
         }
     }
@@ -357,15 +373,20 @@ struct MessagesPane: View {
         let (groupMessageBounds, groupMessageIds) = buildGroupMaps(rows: rows)
 
         ScrollViewReader { proxy in
-            GeometryReader { containerGeo in
-                ScrollView {
+            ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         // Scroll offset reader (macOS-safe).
                         ScrollOffsetReader()
                             .frame(height: 0)
 
                         ForEach(rows) { row in
-                            rowView(row, firstGroupId: firstGroupId)
+                            rowView(
+                                row,
+                                firstGroupId: firstGroupId,
+                                groupIdsOrdered: groupIds,
+                                groupMessageBounds: groupMessageBounds,
+                                groupMessageIds: groupMessageIds
+                            )
                         }
 
                         Color.clear
@@ -392,24 +413,8 @@ struct MessagesPane: View {
                     guard !isLiveResizing else { return }
                     pushJellyImpulse(delta: delta)
                 }
-                .onPreferenceChange(GroupFrameKey.self) { frames in
-                    guard !isLiveResizing else { return }
-                    scheduleVisibleGroupsUpdate(
-                        frames: frames,
-                        groupMessageBounds: groupMessageBounds,
-                        groupMessageIds: groupMessageIds
-                    )
-                }
-                .onAppear {
-                    jellyContainerHeight = containerGeo.size.height
-                }
-                .onChange(of: containerGeo.size.height) { _, newH in
-                    jellyContainerHeight = newH
-                }
                 .onChange(of: isLiveResizing) { _, live in
                     if live {
-                        frameUpdateState.pendingTask?.cancel()
-                        frameUpdateState.pendingTask = nil
                         jellyDecayTask?.cancel()
                         jellyDecayTask = nil
                     }
@@ -479,6 +484,8 @@ struct MessagesPane: View {
                     topVisibleMessageId = nil
                     visibleMinMessageId = nil
                     visibleMaxMessageId = nil
+                    visibleGroupIds = []
+                    lastVisibleGroupIds = []
                 }
                 .onChange(of: chat.id) { _, _ in
                     pagingEnabled = false
@@ -490,12 +497,11 @@ struct MessagesPane: View {
                     cachedRows = []
                     windowMessages = []
                     windowApplyToken = UUID()
-                    frameUpdateState.pendingTask?.cancel()
-                    frameUpdateState.pendingTask = nil
                     jellyDecayTask?.cancel()
                     jellyDecayTask = nil
                     viewMessagesDebouncer.cancel()
                     viewedMessageIds = []
+                    visibleGroupIds = []
                     lastVisibleGroupIds = []
 
                     isAtBottom = true
@@ -578,7 +584,6 @@ struct MessagesPane: View {
                         showAfterInitialJump = true
                     }
                 }
-            }
         }
         .id(chat.id)
         .background(Color(nsColor: .textBackgroundColor))
@@ -719,13 +724,6 @@ private struct ScrollOffsetKey: PreferenceKey {
     }
 }
 
-private struct GroupFrameKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { $1 })
-    }
-}
-
 private struct ScrollOffsetReader: View {
     var body: some View {
         GeometryReader { geo in
@@ -773,10 +771,6 @@ private struct DayHeaderView: View {
         if cal.isDateInYesterday(d) { return "Yesterday" }
         return ChatFormatters.dayFormatter.string(from: d)
     }
-}
-
-private final class GroupFrameUpdateState {
-    var pendingTask: Task<Void, Never>?
 }
 
 private struct TimeSeparatorView: View {

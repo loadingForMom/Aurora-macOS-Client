@@ -172,6 +172,7 @@ final class TelegramStore: ObservableObject {
     }
     // MARK: - Computed
 
+    @MainActor
     var myDisplayName: String {
         guard let id = myUserId else { return "" }
         if let cached = userCache[id] {
@@ -206,6 +207,7 @@ final class TelegramStore: ObservableObject {
         }
     }
 
+    @MainActor
     func userDisplayName(_ userId: Int64?) -> String {
         guard let id = userId else { return "" }
         if let cached = userCache[id] {
@@ -267,12 +269,18 @@ final class TelegramStore: ObservableObject {
         Task { await databaseBatchWriter.enqueue(.upsertChat(chat)) }
     }
 
+    func flushDatabaseNow() {
+        Task { await databaseBatchWriter.flushNow() }
+    }
+
     func persistChatLastMessage(chatId: Int64, messageId: Int64, preview: String, date: Int) {
         Task { await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chatId, messageId: messageId, preview: preview, date: date)) }
     }
 
     func persistUser(_ user: TGUser) {
-        userCache[user.id] = user
+        Task { @MainActor [weak self] in
+            self?.userCache[user.id] = user
+        }
         Task { await databaseBatchWriter.enqueue(.upsertUser(user)) }
     }
 
@@ -348,12 +356,14 @@ final class TelegramStore: ObservableObject {
         sendJSON(req)
     }
 
+    @MainActor
     func logOut() {
         authState = "authorizationStateLoggingOut"
         resetSessionState()
         sendJSON(["@type": "logOut"])
     }
 
+    @MainActor
     func resetSessionState() {
         userCache = [:]
         selectedChatId = nil
