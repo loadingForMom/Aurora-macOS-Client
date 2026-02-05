@@ -32,12 +32,21 @@ extension TelegramStore {
 
     func requestUserIfNeeded(_ userId: Int64?) async {
         guard let id = userId else { return }
-        let (needsRequest, authorized) = await MainActor.run { (userCache[id] == nil, isAuthorized) }
-        guard needsRequest else { return }
-        guard authorized else {
+        if requestedUserIds.contains(id) { return }
+        if databaseRepository.fetchUser(userId: id) != nil {
+            return
+        }
+        guard isRequestAuthorizedSnapshot() else {
             log.info("Blocked TDLib request (not authorized yet): getUser")
             return
         }
-        td.send(#"{"@type":"getUser","user_id":\#(id)}"#)
+        requestedUserIds.insert(id)
+        enqueueTDLibRequest(
+            [
+                "@type": "getUser",
+                "user_id": id
+            ],
+            typeOverride: "getUser"
+        )
     }
 }

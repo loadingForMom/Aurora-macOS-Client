@@ -31,7 +31,7 @@ extension TelegramStore {
         maxClamp: Int?,
         kindOverride: String?
     ) -> NSImage? {
-        avatarService.chatAvatarNSImage(
+        let image = avatarService.chatAvatarNSImage(
             chatId: chatId,
             pointSize: pointSize,
             preferHiRes: preferHiRes,
@@ -40,6 +40,14 @@ extension TelegramStore {
             chatAvatarMetaByChatId: chatAvatarMetaByChatId,
             chatAvatarPathByChatId: chatAvatarPathByChatId
         )
+        if image == nil, let meta = chatAvatarMetaByChatId[chatId] {
+            if preferHiRes, let bigId = meta.bigFileId {
+                scheduleDownloadFile(fileId: bigId, priority: 10, reason: "visible-avatar-hires:\(chatId)")
+            } else if let smallId = meta.smallFileId ?? meta.bigFileId {
+                scheduleDownloadFile(fileId: smallId, priority: 16, reason: "visible-avatar:\(chatId)")
+            }
+        }
+        return image
     }
 
     func _prefetchChatAvatarHiResIfNeeded_impl(chatId: Int64) {
@@ -62,10 +70,6 @@ extension TelegramStore {
             chatAvatarMetaByChatId: &chatAvatarMetaByChatId,
             chatIdByAvatarFileId: &chatIdByAvatarFileId
         )
-
-        if let sid = smallFileId {
-            downloadFileIfNeeded(fileId: sid, priority: 16)
-        }
     }
 
     @MainActor
@@ -81,15 +85,7 @@ extension TelegramStore {
 
     @MainActor
     func downloadFileIfNeeded(fileId: Int32, priority: Int) {
-        avatarService.downloadFileIfNeeded(
-            fileId: fileId,
-            priority: priority,
-            requestedAvatarFileIds: &requestedAvatarFileIds,
-            sendJSON: { [weak self] req in
-                guard let self else { return }
-                _ = self.sendIfAuthorized(req)
-            }
-        )
+        scheduleDownloadFile(fileId: fileId, priority: priority, reason: "avatar-manual:\(fileId)")
     }
 
     // MARK: - Thumbnail load/make

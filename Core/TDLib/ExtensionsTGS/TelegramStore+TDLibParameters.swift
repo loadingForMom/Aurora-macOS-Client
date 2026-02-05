@@ -9,7 +9,7 @@ import os
 extension TelegramStore {
 
     func sendTdlibParametersIfPossible() -> Bool {
-        guard authState == "authorizationStateWaitTdlibParameters" else { return false }
+        guard currentAuthorizationStateSnapshot() == "authorizationStateWaitTdlibParameters" else { return false }
         let apiId = Config.apiId
         let apiHash = Config.apiHash
         guard apiId != 0, !apiHash.isEmpty else {

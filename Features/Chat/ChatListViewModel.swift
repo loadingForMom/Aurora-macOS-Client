@@ -14,6 +14,7 @@ final class ChatListViewModel: ObservableObject {
 
     private let log = Logger(subsystem: "com.aurora.app", category: "chat.list.vm")
     private let observationQueue = DispatchQueue(label: "com.aurora.app.chat.list.observation", qos: .utility)
+    private let publishDebouncer = MainThreadPublishDebouncer<[TGChat]>(delay: 0.033)
     private var cancellable: AnyCancellable?
     private var applyCount = 0
 
@@ -34,15 +35,16 @@ final class ChatListViewModel: ObservableObject {
             .publisher(in: dbPool, scheduling: .async(onQueue: observationQueue))
             .map { rows in rows.map(TGChat.init(row:)) }
             .removeDuplicates()
-            .debounce(for: .milliseconds(40), scheduler: observationQueue)
-            .receive(on: DispatchQueue.main)
+            .debounce(for: .milliseconds(50), scheduler: observationQueue)
             .sink(
                 receiveCompletion: { _ in },
                 receiveValue: { [weak self] newChats in
-                    DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.publishDebouncer.schedule(value: newChats) { [weak self] snapshot in
                         guard let self else { return }
                         self.applyCount += 1
-                        self.chats = newChats
+                        self.chats = snapshot
+                        AuroraRuntimeMetrics.shared.incrementPublish("chatList")
 #if DEBUG
                         if self.applyCount == 1 || self.applyCount % 20 == 0 {
                             self.log.debug("chat list applies=\(self.applyCount, privacy: .public) count=\(self.chats.count, privacy: .public)")

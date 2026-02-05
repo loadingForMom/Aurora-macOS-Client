@@ -34,10 +34,8 @@ struct MessagesPane: View {
     @State private var cachedRows: [Row] = []
     @State private var windowMessages: [TGMessage] = []
     @State private var windowApplyToken = UUID()
-    @State private var viewedMessageIds = Set<Int64>()
     @State private var visibleGroupIds = Set<String>()
     @State private var lastVisibleGroupIds = Set<String>()
-    @State private var viewMessagesDebouncer = ViewMessagesDebouncer()
 
     @State private var topVisibleGroupId: String? = nil
     @State private var topVisibleMessageId: Int64? = nil
@@ -127,6 +125,7 @@ struct MessagesPane: View {
             if let anchorGroupId {
                 restoreAnchorGroupId = anchorGroupId
             }
+            let shouldForceViewMessages = windowMessages.isEmpty
             windowMessages = filtered
             let rows = buildRows(filtered)
             cachedRows = rows
@@ -140,24 +139,16 @@ struct MessagesPane: View {
                 groupIdsOrdered: groupIdsOrdered,
                 groupMessageBounds: bounds,
                 groupMessageIds: ids,
-                forceViewMessages: true
+                forceViewMessages: shouldForceViewMessages
             )
         }
     }
 
-    private func scheduleViewMessages(_ messageIds: Set<Int64>) {
-        let unseen = messageIds.subtracting(viewedMessageIds)
-        guard !unseen.isEmpty else { return }
-        viewMessagesDebouncer.schedule(delay: 0.2) { [chatId = chat.id, unseen] in
-            Task { @MainActor in
-                await Task.yield()
-                store.viewMessages(chatId: chatId, messageIds: Array(unseen), forceRead: false)
-                viewedMessageIds.formUnion(unseen)
-            }
-        }
-    }
-
-    private func scheduleViewMessagesFromVisible(groupMessageIds: [String: [Int64]]) {
+    private func reportVisibleRange(
+        minMessageId: Int64?,
+        maxMessageId: Int64?,
+        groupMessageIds: [String: [Int64]]
+    ) {
         let groupIds = visibleGroupIds
         guard !groupIds.isEmpty else { return }
 
@@ -166,7 +157,12 @@ struct MessagesPane: View {
             .flatMap { $0 }
 
         guard !messageIds.isEmpty else { return }
-        scheduleViewMessages(Set(messageIds))
+        store.reportVisibleMessages(
+            chatId: chat.id,
+            minMessageId: minMessageId,
+            maxMessageId: maxMessageId,
+            messageIds: messageIds
+        )
     }
 
     @MainActor
@@ -198,8 +194,12 @@ struct MessagesPane: View {
             topVisibleMessageId = newTopMessageId
         }
 
-        if visibilityChanged || forceViewMessages {
-            scheduleViewMessagesFromVisible(groupMessageIds: groupMessageIds)
+        if boundsChanged || forceViewMessages {
+            reportVisibleRange(
+                minMessageId: newMin,
+                maxMessageId: newMax,
+                groupMessageIds: groupMessageIds
+            )
         }
     }
 
@@ -493,7 +493,7 @@ struct MessagesPane: View {
                     visibleGroupIds = []
                     lastVisibleGroupIds = []
                 }
-                .onChange(of: chat.id) { _, _ in
+                .onChange(of: chat.id) { oldChatId, _ in
                     pagingEnabled = false
                     pagingInFlight = false
                     restoreAnchorGroupId = nil
@@ -505,10 +505,9 @@ struct MessagesPane: View {
                     windowApplyToken = UUID()
                     jellyDecayTask?.cancel()
                     jellyDecayTask = nil
-                    viewMessagesDebouncer.cancel()
-                    viewedMessageIds = []
                     visibleGroupIds = []
                     lastVisibleGroupIds = []
+                    store.resetVisibleMessageTracking(chatId: oldChatId)
 
                     isAtBottom = true
                     newIncomingCount = 0
@@ -521,6 +520,9 @@ struct MessagesPane: View {
                     topVisibleMessageId = nil
                     visibleMinMessageId = nil
                     visibleMaxMessageId = nil
+                }
+                .onDisappear {
+                    store.resetVisibleMessageTracking(chatId: chat.id)
                 }
                 .onChange(of: viewModel.messages) { _, newMessages in
                     applyWindowMessages(newMessages, anchorGroupId: restoreAnchorGroupId)
@@ -699,22 +701,6 @@ struct MessagesPane: View {
         let cal = Calendar.current
         let c = cal.dateComponents([.year, .month, .day], from: d)
         return "\(c.year ?? 0)-\(c.month ?? 0)-\(c.day ?? 0)"
-    }
-}
-
-private final class ViewMessagesDebouncer {
-    private var workItem: DispatchWorkItem?
-
-    func schedule(delay: TimeInterval, action: @escaping () -> Void) {
-        workItem?.cancel()
-        let item = DispatchWorkItem(block: action)
-        workItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
-    }
-
-    func cancel() {
-        workItem?.cancel()
-        workItem = nil
     }
 }
 

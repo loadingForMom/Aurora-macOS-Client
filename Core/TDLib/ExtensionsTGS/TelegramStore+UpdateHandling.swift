@@ -25,6 +25,11 @@ extension TelegramStore {
 #if DEBUG
                 debugLogMessageEvent(label: "updateChatLastMessage", chatId: chatId, messageId: lastMessage.id)
 #endif
+                _ = await messageStore.mergeMessages(
+                    chatId: chatId,
+                    messages: [lastMessage],
+                    windowLimit: historyWindowLimitByChatId[chatId] ?? 160
+                )
                 await applyChatLastMessageUpdate(chatId: chatId, lastMessageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
                 await databaseBatchWriter.enqueue(.upsertMessage(lastMessage))
                 await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chatId, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date))
@@ -39,7 +44,7 @@ extension TelegramStore {
             await applyChatReadInboxUpdate(chatId: chatId, lastReadInboxMessageId: lastReadInboxMessageId, unreadCount: unreadCount)
         }
 
-        let currentAuthState = await MainActor.run { authState }
+        let currentAuthState = currentAuthorizationStateSnapshot()
 
         if currentAuthState == "authorizationStateWaitTdlibParameters", !didSendTdlibParameters {
             if sendTdlibParametersIfPossible() {
@@ -80,6 +85,7 @@ extension TelegramStore {
         }
 
         if let (u, photoFileId, photoPath) = parseUpdateUser(upt: upd) {
+            requestedUserIds.remove(u.id)
             let myPhotoToDownload: Int32? = await MainActor.run {
                 userCache[u.id] = u
                 guard let meId = myUserId, meId == u.id else { return nil }
@@ -95,11 +101,12 @@ extension TelegramStore {
             await databaseBatchWriter.enqueue(.upsertUser(u))
 
             if let fid = myPhotoToDownload {
-                await MainActor.run { downloadMyPhotoIfNeeded(fileId: fid) }
+                scheduleDownloadFile(fileId: fid, priority: 32, reason: "profile-photo")
             }
         }
 
         if let (fileId, path) = parseUpdateFilePathIfMyPhoto(upd) {
+            markDownloadCompleted(fileId: fileId)
             await MainActor.run {
                 guard let target = myPhotoFileId, target == fileId else { return }
                 myProfilePhotoPath = path
@@ -108,6 +115,7 @@ extension TelegramStore {
         }
 
         if let (fileId, path) = parseUpdateFilePathIfChatAvatar(upd) {
+            markDownloadCompleted(fileId: fileId)
             await MainActor.run {
                 guard let chatId = chatIdByAvatarFileId[fileId] else { return }
                 applyChatAvatarFileUpdate(chatId: chatId, fileId: fileId, path: path)
@@ -134,6 +142,7 @@ extension TelegramStore {
         }
 
         if let user = parseUserObject(upd) {
+            requestedUserIds.remove(user.id)
             await MainActor.run { userCache[user.id] = user }
             await databaseBatchWriter.enqueue(.upsertUser(user))
         }
@@ -203,6 +212,11 @@ extension TelegramStore {
                 log.debug("updateNewMessage reconciled -> skip append")
 #endif
             } else {
+                _ = await messageStore.mergeMessages(
+                    chatId: chatId,
+                    messages: [msg],
+                    windowLimit: historyWindowLimitByChatId[chatId] ?? 160
+                )
                 await databaseBatchWriter.enqueue(.upsertMessage(msg))
             }
 
@@ -238,6 +252,11 @@ extension TelegramStore {
             pendingChatInfoRequests.remove(chat.id)
             await databaseBatchWriter.enqueue(.upsertChat(chat))
             if let lastMessage {
+                _ = await messageStore.mergeMessages(
+                    chatId: chat.id,
+                    messages: [lastMessage],
+                    windowLimit: historyWindowLimitByChatId[chat.id] ?? 160
+                )
                 await databaseBatchWriter.enqueue(.upsertMessage(lastMessage))
                 await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chat.id, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date))
             }
@@ -251,7 +270,10 @@ extension TelegramStore {
 
             let shouldAutoSelect = await MainActor.run { selectedChatId == nil }
             if shouldAutoSelect {
-                await MainActor.run { selectedChatId = chat.id }
+                await MainActor.run {
+                    selectedChatId = chat.id
+                    AuroraRuntimeMetrics.shared.incrementPublish("storeSelectedChat")
+                }
                 loadInitialHistory(chatId: chat.id)
             }
         }
@@ -259,6 +281,7 @@ extension TelegramStore {
         // MARK: - Current user (me) + profile photo
 
         if let (me, photoFileId, photoPath) = parseMeUserResponse(resp) {
+            requestedUserIds.remove(me.id)
             let myPhotoToDownload: Int32? = await MainActor.run {
                 myUserId = me.id
                 userCache[me.id] = me
@@ -273,11 +296,12 @@ extension TelegramStore {
             }
             await databaseBatchWriter.enqueue(.upsertUser(me))
             if let fid = myPhotoToDownload {
-                await MainActor.run { downloadMyPhotoIfNeeded(fileId: fid) }
+                scheduleDownloadFile(fileId: fid, priority: 32, reason: "profile-photo")
             }
         }
 
         if let user = parseUserObject(resp) {
+            requestedUserIds.remove(user.id)
             await MainActor.run { userCache[user.id] = user }
             await databaseBatchWriter.enqueue(.upsertUser(user))
         }
@@ -345,6 +369,11 @@ extension TelegramStore {
             }
 
             if !messagesToMerge.isEmpty {
+                _ = await messageStore.mergeMessages(
+                    chatId: job.chatId,
+                    messages: messagesToMerge,
+                    windowLimit: job.windowLimit
+                )
                 await databaseBatchWriter.enqueue(.upsertMessages(messagesToMerge))
             }
 

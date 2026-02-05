@@ -27,19 +27,31 @@ extension TelegramStore {
     }
 
     private func replaceMessage(chatId: Int64, oldId: Int64, newMessage: TGMessage) async {
+        _ = await messageStore.mergeMessages(
+            chatId: chatId,
+            messages: [newMessage],
+            windowLimit: historyWindowLimitByChatId[chatId] ?? 160
+        )
         await databaseBatchWriter.enqueue(.upsertMessage(newMessage))
         if oldId != newMessage.id {
+            _ = await messageStore.applyDelete(chatId: chatId, messageIds: [oldId])
             await databaseBatchWriter.enqueue(.deleteMessages(chatId: chatId, messageIds: [oldId]))
         }
     }
 
     private func replaceMessageIfExists(chatId: Int64, id: Int64, newMessage: TGMessage) async -> Bool {
         guard databaseRepository.messageExists(chatId: chatId, messageId: id) else { return false }
+        _ = await messageStore.mergeMessages(
+            chatId: chatId,
+            messages: [newMessage],
+            windowLimit: historyWindowLimitByChatId[chatId] ?? 160
+        )
         await databaseBatchWriter.enqueue(.upsertMessage(newMessage))
         return true
     }
 
     private func removeMessageById(chatId: Int64, id: Int64) async {
+        _ = await messageStore.applyDelete(chatId: chatId, messageIds: [id])
         await databaseBatchWriter.enqueue(.deleteMessages(chatId: chatId, messageIds: [id]))
     }
 
@@ -227,9 +239,7 @@ extension TelegramStore {
                 "clear_draft": true
             ]
         ]
-        Task { @MainActor in
-            _ = sendIfAuthorized(req)
-        }
+        enqueueTDLibRequest(req, typeOverride: "sendMessage")
         markMessageSending(localId: localId)
     }
 
@@ -272,9 +282,7 @@ extension TelegramStore {
                 "clear_draft": true
             ]
         ]
-        Task { @MainActor in
-            _ = sendIfAuthorized(req)
-        }
+        enqueueTDLibRequest(req, typeOverride: "sendMessage")
         markMessageSending(localId: localId)
     }
 
@@ -302,9 +310,7 @@ extension TelegramStore {
                 "chat_id": message.chatId,
                 "message_ids": [message.id]
             ]
-            Task { @MainActor in
-                _ = sendIfAuthorized(req)
-            }
+            enqueueTDLibRequest(req, typeOverride: "resendMessages")
             return
         }
 
@@ -330,9 +336,7 @@ extension TelegramStore {
             "message_ids": messageIds,
             "revoke": revoke
         ]
-        Task { @MainActor in
-            _ = sendIfAuthorized(req)
-        }
+        enqueueTDLibRequest(req, typeOverride: "deleteMessages")
     }
 
     func _editMessageText_impl(chatId: Int64, messageId: Int64, newText: String) {
@@ -355,13 +359,16 @@ extension TelegramStore {
                 "clear_draft": false
             ]
         ]
-        Task { @MainActor in
-            _ = sendIfAuthorized(req)
-        }
+        enqueueTDLibRequest(req, typeOverride: "editMessageText")
     }
 
     func optimisticInsertMessage(_ msg: TGMessage) {
         Task {
+            _ = await messageStore.mergeMessages(
+                chatId: msg.chatId,
+                messages: [msg],
+                windowLimit: historyWindowLimitByChatId[msg.chatId] ?? 160
+            )
             await databaseBatchWriter.enqueue(.upsertMessage(msg))
             await enqueueChatLastUpdate(for: msg)
         }
@@ -372,6 +379,11 @@ extension TelegramStore {
             guard var m = databaseRepository.fetchMessage(chatId: chatId, messageId: id) else { return }
             m.sendState = .pending
             m.canRetry = false
+            _ = await messageStore.mergeMessages(
+                chatId: chatId,
+                messages: [m],
+                windowLimit: historyWindowLimitByChatId[chatId] ?? 160
+            )
             await databaseBatchWriter.enqueue(.upsertMessage(m))
             await enqueueChatLastUpdate(for: m)
         }
@@ -388,6 +400,11 @@ extension TelegramStore {
                 m.retryCount = link.retryCount
                 m.nextRetryAt = link.nextRetryAt
             }
+            _ = await messageStore.mergeMessages(
+                chatId: chatId,
+                messages: [m],
+                windowLimit: historyWindowLimitByChatId[chatId] ?? 160
+            )
             await databaseBatchWriter.enqueue(.upsertMessage(m))
             await enqueueChatLastUpdate(for: m)
             if let localId, let link = pendingByLocalId[localId] {

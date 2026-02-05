@@ -14,6 +14,7 @@ extension TelegramStore {
 
     func loadInitialHistory(chatId: Int64) {
         reachedHistoryStart.remove(chatId)
+        setMessageWindow(chatId: chatId, windowSize: initialHistoryWindowLimit)
 
         // Bump generation so stale history responses can't overwrite a newer timeline.
         let generation = (historyGenerationByChatId[chatId] ?? 0) + 1
@@ -55,6 +56,7 @@ extension TelegramStore {
 
         let target = min(maxHistoryWindowLimit, currentLimit + pageSize)
         historyWindowLimitByChatId[chatId] = target
+        setMessageWindow(chatId: chatId, windowSize: target)
         let tdLimit = min(maxTdlibHistoryLimit, max(1, pageSize + 1))
 
         let extra = "history:\(chatId):older:\(UUID().uuidString)"
@@ -96,11 +98,13 @@ extension TelegramStore {
             historyJobs.values.contains(where: { $0.chatId == chatId })
         } ?? false
 
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
+            await Task.yield()
             guard let self else { return }
             guard self.selectedChatId == selected else { return }
             if self.isLoadingHistory != loading {
                 self.isLoadingHistory = loading
+                AuroraRuntimeMetrics.shared.incrementPublish("storeHistoryLoading")
             }
         }
     }
@@ -115,11 +119,8 @@ extension TelegramStore {
         historyMetrics.maxInFlightJobs = max(historyMetrics.maxInFlightJobs, historyJobs.count)
 
 #if DEBUG
-        let queueLabel = String(cString: __dispatch_queue_get_label(nil))
         let inFlightCount = historyJobs.count
-        log.debug(
-            "history request chatId=\(chatId, privacy: .public) from=\(fromMessageId, privacy: .public) offset=\(offset, privacy: .public) limit=\(limit, privacy: .public) local=\(onlyLocal, privacy: .public) inFlight=\(inFlightCount, privacy: .public) queue=\(queueLabel, privacy: .public) main=\(Thread.isMainThread, privacy: .public)"
-        )
+        log.debug("history request queued chatId=\(chatId, privacy: .public) from=\(fromMessageId, privacy: .public) offset=\(offset, privacy: .public) limit=\(limit, privacy: .public) local=\(onlyLocal, privacy: .public) inFlight=\(inFlightCount, privacy: .public)")
 #endif
 
         let req: [String: Any] = [
@@ -131,9 +132,7 @@ extension TelegramStore {
             "limit": limit,
             "only_local": onlyLocal
         ]
-        Task { @MainActor in
-            _ = sendIfAuthorized(req)
-        }
+        enqueueTDLibRequest(req, typeOverride: "getChatHistory")
     }
 
 }

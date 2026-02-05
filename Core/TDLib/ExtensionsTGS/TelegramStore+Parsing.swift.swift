@@ -28,13 +28,12 @@ extension TelegramStore {
         }
     }
 
-    @MainActor
     @discardableResult
     func sendIfAuthorized(_ obj: Any, typeOverride: String? = nil) -> Bool {
         let type = typeOverride
             ?? (obj as? [String: Any])?["@type"] as? String
             ?? "unknown"
-        guard isAuthorized else {
+        guard isRequestAuthorizedSnapshot() else {
             log.info("Blocked TDLib request (not authorized yet): \(type, privacy: .public)")
             return false
         }

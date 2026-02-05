@@ -22,6 +22,7 @@ extension TelegramStore {
     }
 
     func applyMessageEdited(chatId: Int64, messageId: Int64, editDate: Int) async {
+        _ = await messageStore.applyEdit(chatId: chatId, messageId: messageId, editDate: editDate)
         await databaseBatchWriter.enqueue(.updateMessageEdited(chatId: chatId, messageId: messageId, editDate: editDate))
     }
 
@@ -42,6 +43,7 @@ extension TelegramStore {
 
     func applyMessageContentChanged(chatId: Int64, messageId: Int64, newContent: [String: Any]) async {
         let newText = renderPreviewTextFromContent(newContent)
+        _ = await messageStore.applyContent(chatId: chatId, messageId: messageId, text: newText)
         await databaseBatchWriter.enqueue(.updateMessageText(chatId: chatId, messageId: messageId, text: newText))
 
         if let latest = databaseRepository.fetchLatestMessage(chatId: chatId), latest.id == messageId {
@@ -74,6 +76,7 @@ extension TelegramStore {
     }
 
     func applyMessagesDeleted(chatId: Int64, messageIds: [Int64]) async {
+        _ = await messageStore.applyDelete(chatId: chatId, messageIds: messageIds)
         for id in messageIds {
             if let localId = localIdByTempMessageId[id] {
                 if pendingByLocalId[localId] != nil {

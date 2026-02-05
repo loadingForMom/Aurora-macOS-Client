@@ -17,7 +17,7 @@ struct ChatScreen: View {
     init(store: TelegramStore, chat: TGChat) {
         self.store = store
         self.chat = chat
-        _messagesViewModel = StateObject(wrappedValue: ChatMessagesViewModel(dbPool: store.dbPool, chatId: chat.id))
+        _messagesViewModel = StateObject(wrappedValue: ChatMessagesViewModel(store: store, chatId: chat.id))
     }
 
     var body: some View {
