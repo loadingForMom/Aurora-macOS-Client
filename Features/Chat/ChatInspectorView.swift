@@ -214,6 +214,16 @@ struct ChatInspectorView: View {
         hasBaseline = true
     }
 
+    private func shouldAcceptScrollMetricUpdate(previous: CGFloat, next: CGFloat, epsilon: CGFloat = 0.35) -> Bool {
+        if previous.isNaN || next.isNaN {
+            return previous.isNaN != next.isNaN
+        }
+        if !previous.isFinite || !next.isFinite {
+            return previous.isFinite != next.isFinite
+        }
+        return abs(previous - next) >= epsilon
+    }
+
     var body: some View {
         GeometryReader { geo in
             let width = geo.size.width
@@ -275,6 +285,7 @@ struct ChatInspectorView: View {
                 .onPreferenceChange(_HeroTitleMinYKey.self) {
                     let value = $0
                     DispatchQueue.main.async {
+                        guard shouldAcceptScrollMetricUpdate(previous: heroTitleScrollMinY, next: value) else { return }
                         heroTitleScrollMinY = value
                         updateBaseline()
                     }
@@ -282,6 +293,7 @@ struct ChatInspectorView: View {
                 .onPreferenceChange(_PinnedTitleMinYKey.self) {
                     let value = $0
                     DispatchQueue.main.async {
+                        guard shouldAcceptScrollMetricUpdate(previous: pinnedTitleScrollMinY, next: value) else { return }
                         pinnedTitleScrollMinY = value
                         updateBaseline()
                     }
@@ -289,15 +301,17 @@ struct ChatInspectorView: View {
                 .onAppear {
                     // Important: попросим hi-res у TDLib только когда инспектор реально открыт
                     store.prefetchChatAvatarHiResIfNeeded(chatId: chat.id)
-
-                    resetBaseline()
-                    DispatchQueue.main.async { updateBaseline() }
+                    DispatchQueue.main.async {
+                        resetBaseline()
+                        updateBaseline()
+                    }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { updateBaseline() }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { updateBaseline() }
                 }
                 .onPreferenceChange(_ScrollTopMinYKey.self) {
                     let value = $0
                     DispatchQueue.main.async {
+                        guard shouldAcceptScrollMetricUpdate(previous: scrollTopMinY, next: value) else { return }
                         scrollTopMinY = value
 
                         if !baselineScrollTopMinY.isFinite, value.isFinite {

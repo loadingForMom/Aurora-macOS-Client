@@ -14,6 +14,7 @@ struct ContentView: View {
 
     @State private var searchText: String = ""
     @State private var inspectorShown: Bool = true
+    @State private var listSelection: Int64? = nil
 
     private func filteredChats(_ base: [TGChat], query: String) -> [TGChat] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -36,8 +37,12 @@ struct ContentView: View {
         store.chatAvatarPathByChatId[chatId]
     }
 
+    private var selectedChatIdForUI: Int64? {
+        listSelection ?? store.selectedChatId
+    }
+
     private var selectedChat: TGChat? {
-        guard let chatId = store.selectedChatId else { return nil }
+        guard let chatId = selectedChatIdForUI else { return nil }
         return chatListViewModel.chats.first(where: { $0.id == chatId })
     }
 
@@ -52,7 +57,7 @@ struct ContentView: View {
 
         ZStack {
             NavigationSplitView {
-                List(selection: $store.selectedChatId) {
+                List(selection: $listSelection) {
                     ForEach(chats) { chat in
                         ChatRow(
                             chat: chat,
@@ -99,17 +104,22 @@ struct ContentView: View {
                 }
             }
             .task {
-                if let id = store.selectedChatId {
+                if listSelection == nil, let storeSelection = store.selectedChatId {
+                    listSelection = storeSelection
+                }
+                if let id = listSelection ?? store.selectedChatId {
                     SwiftUIPublishTrace.uiEvent(
                         name: "task_restoreSelectedChat",
                         chatId: id,
                         payload: "chatId=\(id)",
                         reason: "fromSelectionChange"
                     )
-                    store.selectChat(id, forceReload: false)
+                    DispatchQueue.main.async {
+                        store.selectChat(id, forceReload: false)
+                    }
                 }
             }
-            .onChange(of: store.selectedChatId) { oldChatId, newChatId in
+            .onChange(of: listSelection) { oldChatId, newChatId in
                 SwiftUIPublishTrace.uiEvent(
                     name: "onChange_selectedChat",
                     chatId: newChatId ?? oldChatId,
@@ -117,7 +127,15 @@ struct ContentView: View {
                     reason: "fromSelectionChange"
                 )
                 guard let id = newChatId else { return }
-                store.selectChat(id)
+                DispatchQueue.main.async {
+                    store.selectChat(id)
+                }
+            }
+            .onChange(of: store.selectedChatId) { _, newChatId in
+                guard listSelection != newChatId else { return }
+                DispatchQueue.main.async {
+                    listSelection = newChatId
+                }
             }
 
             if !store.isAuthorized {

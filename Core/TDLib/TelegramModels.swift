@@ -184,8 +184,13 @@ struct TGMessage: Identifiable, Hashable {
     var previewText: String { text }
 
     var textForRendering: String? {
-        guard contentType == "messageText" else { return nil }
-        return rawText ?? text
+        if contentType == "messageText" {
+            return rawText ?? text
+        }
+        if text.isEmpty {
+            return nil
+        }
+        return text
     }
 
     var messageKey: MessageKey {

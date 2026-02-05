@@ -22,8 +22,36 @@ extension EnvironmentValues {
 }
 
 final class LiveResizeState: ObservableObject {
-    @Published var isLiveResizing: Bool = false
-    @Published var frozenSnapshot: NSImage? = nil
+    @Published private(set) var isLiveResizing: Bool = false
+    @Published private(set) var frozenSnapshot: NSImage? = nil
+
+    func setLiveResizing(_ value: Bool) {
+        if Thread.isMainThread {
+            guard isLiveResizing != value else { return }
+            isLiveResizing = value
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.setLiveResizing(value)
+            }
+        }
+    }
+
+    func setFrozenSnapshot(_ image: NSImage?) {
+        if Thread.isMainThread {
+            if frozenSnapshot == nil && image == nil { return }
+            if let old = frozenSnapshot, let image, old === image { return }
+            frozenSnapshot = image
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.setFrozenSnapshot(image)
+            }
+        }
+    }
+
+    func reset() {
+        setLiveResizing(false)
+        setFrozenSnapshot(nil)
+    }
 }
 
 /// Injects `EnvironmentValues.isLiveResizing` and freezes rendering during live resize by overlaying a snapshot.
@@ -105,16 +133,16 @@ private struct WindowLiveResizeTracker: NSViewRepresentable {
             observers.append(
                 nc.addObserver(forName: NSWindow.willStartLiveResizeNotification, object: window, queue: .main) { [weak self] _ in
                     guard let self else { return }
-                    self.state?.frozenSnapshot = window.contentView.flatMap { self.snapshot(of: $0) }
-                    self.state?.isLiveResizing = true
+                    self.state?.setFrozenSnapshot(window.contentView.flatMap { self.snapshot(of: $0) })
+                    self.state?.setLiveResizing(true)
                 }
             )
             observers.append(
                 nc.addObserver(forName: NSWindow.didEndLiveResizeNotification, object: window, queue: .main) { [weak self] _ in
                     guard let self else { return }
-                    self.state?.isLiveResizing = false
                     DispatchQueue.main.async { [weak self] in
-                        self?.state?.frozenSnapshot = nil
+                        self?.state?.setLiveResizing(false)
+                        self?.state?.setFrozenSnapshot(nil)
                     }
                 }
             )
@@ -135,8 +163,9 @@ private struct WindowLiveResizeTracker: NSViewRepresentable {
             observers.forEach { nc.removeObserver($0) }
             observers.removeAll(keepingCapacity: true)
             observedWindow = nil
-            state?.isLiveResizing = false
-            state?.frozenSnapshot = nil
+            DispatchQueue.main.async { [weak self] in
+                self?.state?.reset()
+            }
         }
 
         deinit {

@@ -756,8 +756,9 @@ final class AuroraRuntimeMetrics {
 final class MainThreadPublishDebouncer<Value: Equatable> {
     private let queue = DispatchQueue(label: "com.aurora.app.main.publish.debouncer")
     private let delay: TimeInterval
-    private let maxViewUpdateDeferrals = 8
-    private let viewUpdateRetryDelay: TimeInterval = 0.008
+    private let maxViewUpdateDeferrals = 12
+    private let viewUpdateRetryDelay: TimeInterval = 0.010
+    private let postPublishDelayNs: UInt64 = 6_000_000
     private var pendingValue: Value?
     private var workItem: DispatchWorkItem?
 
@@ -840,6 +841,8 @@ final class MainThreadPublishDebouncer<Value: Equatable> {
         )
         DispatchQueue.main.async {
             Task { @MainActor in
+                try? await Task.sleep(nanoseconds: self.postPublishDelayNs)
+                await Task.yield()
                 publish(value)
             }
         }

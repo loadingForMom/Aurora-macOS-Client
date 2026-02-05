@@ -32,6 +32,9 @@ struct MessagesPane: View {
 
     // Cache rows so scroll-driven state updates don't force regrouping work.
     @State private var cachedRows: [Row] = []
+    @State private var cachedGroupIdsOrdered: [String] = []
+    @State private var cachedGroupMessageBounds: [String: (min: Int64, max: Int64)] = [:]
+    @State private var cachedGroupMessageIds: [String: [Int64]] = [:]
     @State private var windowMessages: [TGMessage] = []
     @State private var windowApplyToken = UUID()
     @State private var visibleGroupIds = Set<String>()
@@ -120,6 +123,7 @@ struct MessagesPane: View {
 #endif
         }
         Task { @MainActor [token, expectedChatId, filtered] in
+            await Task.yield()
             guard windowApplyToken == token else { return }
             guard chat.id == expectedChatId else { return }
             if let anchorGroupId {
@@ -135,6 +139,9 @@ struct MessagesPane: View {
                 return nil
             }
             let (bounds, ids) = buildGroupMaps(rows: rows)
+            cachedGroupIdsOrdered = groupIdsOrdered
+            cachedGroupMessageBounds = bounds
+            cachedGroupMessageIds = ids
             updateVisibleState(
                 groupIdsOrdered: groupIdsOrdered,
                 groupMessageBounds: bounds,
@@ -355,26 +362,28 @@ struct MessagesPane: View {
                     payload: "groupId=\(g.id) count=\(g.messages.count)",
                     reason: "messageGroupVisibility"
                 )
-                visibleGroupIds.insert(g.id)
-                updateVisibleState(
-                    groupIdsOrdered: groupIdsOrdered,
-                    groupMessageBounds: groupMessageBounds,
-                    groupMessageIds: groupMessageIds
-                )
+                DispatchQueue.main.async {
+                    visibleGroupIds.insert(g.id)
+                    updateVisibleState(
+                        groupIdsOrdered: groupIdsOrdered,
+                        groupMessageBounds: groupMessageBounds,
+                        groupMessageIds: groupMessageIds
+                    )
 
-                // Trigger paging only when we actually reach the top of what's loaded.
-                guard pagingEnabled, !pagingInFlight, !store.isLoadingHistory else { return }
+                    // Trigger paging only when we actually reach the top of what's loaded.
+                    guard pagingEnabled, !pagingInFlight, !store.isLoadingHistory else { return }
 
-                // Never page during the initial hidden render / jump-to-bottom sequence.
-                guard didInitialScrollToBottom, showAfterInitialJump else { return }
+                    // Never page during the initial hidden render / jump-to-bottom sequence.
+                    guard didInitialScrollToBottom, showAfterInitialJump else { return }
 
-                guard let firstGroupId, g.id == firstGroupId else { return }
-                // Don't page while user is already at the bottom (initial open / reading newest).
-                guard !isAtBottom else { return }
+                    guard let firstGroupId, g.id == firstGroupId else { return }
+                    // Don't page while user is already at the bottom (initial open / reading newest).
+                    guard !isAtBottom else { return }
 
-                let anchorGroupId = topVisibleGroupId ?? g.id
-                let anchorMessageId = topVisibleMessageId ?? g.messages.first?.id
-                requestOlderHistory(anchorGroupId: anchorGroupId, anchorMessageId: anchorMessageId)
+                    let anchorGroupId = topVisibleGroupId ?? g.id
+                    let anchorMessageId = topVisibleMessageId ?? g.messages.first?.id
+                    requestOlderHistory(anchorGroupId: anchorGroupId, anchorMessageId: anchorMessageId)
+                }
             }
             .onDisappear {
                 SwiftUIPublishTrace.uiEvent(
@@ -383,12 +392,14 @@ struct MessagesPane: View {
                     payload: "groupId=\(g.id) count=\(g.messages.count)",
                     reason: "messageGroupVisibility"
                 )
-                visibleGroupIds.remove(g.id)
-                updateVisibleState(
-                    groupIdsOrdered: groupIdsOrdered,
-                    groupMessageBounds: groupMessageBounds,
-                    groupMessageIds: groupMessageIds
-                )
+                DispatchQueue.main.async {
+                    visibleGroupIds.remove(g.id)
+                    updateVisibleState(
+                        groupIdsOrdered: groupIdsOrdered,
+                        groupMessageBounds: groupMessageBounds,
+                        groupMessageIds: groupMessageIds
+                    )
+                }
             }
         }
     }
@@ -400,18 +411,36 @@ struct MessagesPane: View {
     var body: some View {
         let messages = windowMessages
         let rows = cachedRows.isEmpty ? buildRows(messages) : cachedRows
+        let computedGroupIds: [String] = rows.compactMap {
+            if case .group(let g) = $0 { return g.id }
+            return nil
+        }
+        let computedMaps = buildGroupMaps(rows: rows)
 
 #if DEBUG
         let _ = debugAssertUniqueMessageKeys(messages)
 #endif
 
-        let groupIds: [String] = rows.compactMap {
-            if case .group(let g) = $0 { return g.id }
-            return nil
-        }
+        let groupIds: [String] = {
+            if cachedRows.isEmpty || cachedGroupIdsOrdered.isEmpty {
+                return computedGroupIds
+            }
+            return cachedGroupIdsOrdered
+        }()
         let firstGroupId = groupIds.first
         let _ = groupIds.last
-        let (groupMessageBounds, groupMessageIds) = buildGroupMaps(rows: rows)
+        let groupMessageBounds: [String: (min: Int64, max: Int64)] = {
+            if cachedRows.isEmpty || cachedGroupMessageBounds.isEmpty {
+                return computedMaps.0
+            }
+            return cachedGroupMessageBounds
+        }()
+        let groupMessageIds: [String: [Int64]] = {
+            if cachedRows.isEmpty || cachedGroupMessageIds.isEmpty {
+                return computedMaps.1
+            }
+            return cachedGroupMessageIds
+        }()
 
         ScrollViewReader { proxy in
             ScrollView {
@@ -440,8 +469,10 @@ struct MessagesPane: View {
                                     payload: "isAtBottom=true incomingCount=\(newIncomingCount)",
                                     reason: "scrollPosition"
                                 )
-                                isAtBottom = true
-                                if newIncomingCount != 0 { newIncomingCount = 0 }
+                                DispatchQueue.main.async {
+                                    isAtBottom = true
+                                    if newIncomingCount != 0 { newIncomingCount = 0 }
+                                }
                             }
                             .onDisappear {
                                 SwiftUIPublishTrace.uiEvent(
@@ -450,7 +481,9 @@ struct MessagesPane: View {
                                     payload: "isAtBottom=false",
                                     reason: "scrollPosition"
                                 )
-                                isAtBottom = false
+                                DispatchQueue.main.async {
+                                    isAtBottom = false
+                                }
                             }
                     }
                     .padding(.horizontal, 18)
@@ -463,16 +496,18 @@ struct MessagesPane: View {
                 .simultaneousGesture(revealGesture)
                 .onPreferenceChange(ScrollOffsetKey.self) { minY in
                     let offsetY = -minY
-                    let delta = offsetY - lastScrollOffsetY
-                    lastScrollOffsetY = offsetY
-                    SwiftUIPublishTrace.uiEvent(
-                        name: "onPreferenceChange_scrollOffset",
-                        chatId: chat.id,
-                        payload: "offsetY=\(Int(offsetY.rounded())) delta=\(Int(delta.rounded()))",
-                        reason: "scrollGeometryPreference"
-                    )
-                    guard !isLiveResizing else { return }
-                    pushJellyImpulse(delta: delta)
+                    DispatchQueue.main.async {
+                        let delta = offsetY - lastScrollOffsetY
+                        lastScrollOffsetY = offsetY
+                        SwiftUIPublishTrace.uiEvent(
+                            name: "onPreferenceChange_scrollOffset",
+                            chatId: chat.id,
+                            payload: "offsetY=\(Int(offsetY.rounded())) delta=\(Int(delta.rounded()))",
+                            reason: "scrollGeometryPreference"
+                        )
+                        guard !isLiveResizing else { return }
+                        pushJellyImpulse(delta: delta)
+                    }
                 }
                 .onChange(of: isLiveResizing) { _, live in
                     if live {
@@ -535,24 +570,25 @@ struct MessagesPane: View {
                     )
                     // Build once; after that, scrolling should not re-run grouping.
                     applyWindowMessages(viewModel.messages, anchorGroupId: nil)
+                    DispatchQueue.main.async {
+                        lastKnownMessageCount = messages.count
+                        newIncomingCount = 0
 
-                    lastKnownMessageCount = messages.count
-                    newIncomingCount = 0
+                        // Reset paging state for this chat. We enable paging only after we jump to bottom.
+                        pagingEnabled = false
+                        didInitialScrollToBottom = false
+                        showAfterInitialJump = false
+                        lastPagingAnchorKey = nil
+                        restoreAnchorGroupId = nil
+                        pagingInFlight = false
 
-                    // Reset paging state for this chat. We enable paging only after we jump to bottom.
-                    pagingEnabled = false
-                    didInitialScrollToBottom = false
-                    showAfterInitialJump = false
-                    lastPagingAnchorKey = nil
-                    restoreAnchorGroupId = nil
-                    pagingInFlight = false
-
-                    topVisibleGroupId = nil
-                    topVisibleMessageId = nil
-                    visibleMinMessageId = nil
-                    visibleMaxMessageId = nil
-                    visibleGroupIds = []
-                    lastVisibleGroupIds = []
+                        topVisibleGroupId = nil
+                        topVisibleMessageId = nil
+                        visibleMinMessageId = nil
+                        visibleMaxMessageId = nil
+                        visibleGroupIds = []
+                        lastVisibleGroupIds = []
+                    }
                 }
                 .onChange(of: chat.id) { oldChatId, _ in
                     SwiftUIPublishTrace.uiEvent(
@@ -561,32 +597,37 @@ struct MessagesPane: View {
                         payload: "oldChatId=\(oldChatId) newChatId=\(chat.id)",
                         reason: "fromSelectionChange"
                     )
-                    pagingEnabled = false
-                    pagingInFlight = false
-                    restoreAnchorGroupId = nil
-                    lastPagingAnchorKey = nil
-                    didInitialScrollToBottom = false
-                    showAfterInitialJump = false
-                    cachedRows = []
-                    windowMessages = []
-                    windowApplyToken = UUID()
-                    jellyDecayTask?.cancel()
-                    jellyDecayTask = nil
-                    visibleGroupIds = []
-                    lastVisibleGroupIds = []
-                    store.resetVisibleMessageTracking(chatId: oldChatId)
+                    DispatchQueue.main.async {
+                        pagingEnabled = false
+                        pagingInFlight = false
+                        restoreAnchorGroupId = nil
+                        lastPagingAnchorKey = nil
+                        didInitialScrollToBottom = false
+                        showAfterInitialJump = false
+                        cachedRows = []
+                        cachedGroupIdsOrdered = []
+                        cachedGroupMessageBounds = [:]
+                        cachedGroupMessageIds = [:]
+                        windowMessages = []
+                        windowApplyToken = UUID()
+                        jellyDecayTask?.cancel()
+                        jellyDecayTask = nil
+                        visibleGroupIds = []
+                        lastVisibleGroupIds = []
+                        store.resetVisibleMessageTracking(chatId: oldChatId)
 
-                    isAtBottom = true
-                    newIncomingCount = 0
-                    lastKnownMessageCount = 0
+                        isAtBottom = true
+                        newIncomingCount = 0
+                        lastKnownMessageCount = 0
 
-                    revealTimeX = 0
-                    revealGestureEngaged = false
+                        revealTimeX = 0
+                        revealGestureEngaged = false
 
-                    topVisibleGroupId = nil
-                    topVisibleMessageId = nil
-                    visibleMinMessageId = nil
-                    visibleMaxMessageId = nil
+                        topVisibleGroupId = nil
+                        topVisibleMessageId = nil
+                        visibleMinMessageId = nil
+                        visibleMaxMessageId = nil
+                    }
                 }
                 .onDisappear {
                     SwiftUIPublishTrace.uiEvent(
@@ -607,39 +648,40 @@ struct MessagesPane: View {
                     applyWindowMessages(newMessages, anchorGroupId: restoreAnchorGroupId)
                 }
                 .onChange(of: messages.count) { _, newCount in
-                    // During the initial hidden render + jump-to-bottom, do not auto-show or auto-scroll.
-                    guard didInitialScrollToBottom else {
+                    let snapshot = messages
+                    DispatchQueue.main.async {
+                        // During the initial hidden render + jump-to-bottom, do not auto-show or auto-scroll.
+                        guard didInitialScrollToBottom else {
+                            lastKnownMessageCount = newCount
+                            newIncomingCount = 0
+                            return
+                        }
+
+                        if newCount < lastKnownMessageCount {
+                            lastKnownMessageCount = newCount
+                            newIncomingCount = 0
+                            return
+                        }
+
+                        if pagingInFlight, let anchorId = restoreAnchorGroupId {
+                            scrollToAnchorTop(proxy, anchorId: anchorId)
+                            restoreAnchorGroupId = nil
+                            pagingInFlight = false
+                            lastKnownMessageCount = newCount
+                            return
+                        }
+
+                        let delta = newCount - lastKnownMessageCount
                         lastKnownMessageCount = newCount
-                        newIncomingCount = 0
-                        return
-                    }
+                        guard delta > 0 else { return }
 
-                    if newCount < lastKnownMessageCount {
-                        lastKnownMessageCount = newCount
-                        newIncomingCount = 0
-                        return
-                    }
+                        let lastIsOutgoing = snapshot.last?.isOutgoing ?? false
+                        let shouldAutoScroll = (!pagingEnabled) || isAtBottom || lastIsOutgoing
 
-                    if pagingInFlight, let anchorId = restoreAnchorGroupId {
-                        scrollToAnchorTop(proxy, anchorId: anchorId)
-                        restoreAnchorGroupId = nil
-                        pagingInFlight = false
-                        lastKnownMessageCount = newCount
-                        return
-                    }
-
-                    let delta = newCount - lastKnownMessageCount
-                    lastKnownMessageCount = newCount
-                    guard delta > 0 else { return }
-
-                    let lastIsOutgoing = messages.last?.isOutgoing ?? false
-                    let shouldAutoScroll = (!pagingEnabled) || isAtBottom || lastIsOutgoing
-
-                    if shouldAutoScroll {
-                        scrollToBottomSentinel(proxy, animated: pagingEnabled)
-                        newIncomingCount = 0
-                    } else {
-                        if !lastIsOutgoing {
+                        if shouldAutoScroll {
+                            scrollToBottomSentinel(proxy, animated: pagingEnabled)
+                            newIncomingCount = 0
+                        } else if !lastIsOutgoing {
                             newIncomingCount += delta
                         }
                     }

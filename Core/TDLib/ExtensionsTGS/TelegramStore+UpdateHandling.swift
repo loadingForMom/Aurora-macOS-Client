@@ -186,7 +186,21 @@ extension TelegramStore {
                 "updateDeleteMessages chatId=\(del.chatId, privacy: .public) ids=\(del.messageIds.count, privacy: .public) first=\(firstMessageId, privacy: .public) last=\(lastMessageId, privacy: .public) from_cache=\(del.fromCache, privacy: .public) is_permanent=\(del.isPermanent, privacy: .public)"
             )
 #if DEBUG
-            del.messageIds.forEach { debugLogMessageEvent(label: "updateDeleteMessages", chatId: del.chatId, messageId: $0) }
+            if del.messageIds.count <= 8 {
+                del.messageIds.forEach { debugLogMessageEvent(label: "updateDeleteMessages", chatId: del.chatId, messageId: $0) }
+            } else {
+                let prefixIds = del.messageIds.prefix(3)
+                let suffixIds = del.messageIds.suffix(3)
+                for id in prefixIds {
+                    debugLogMessageEvent(label: "updateDeleteMessages", chatId: del.chatId, messageId: id)
+                }
+                for id in suffixIds {
+                    debugLogMessageEvent(label: "updateDeleteMessages", chatId: del.chatId, messageId: id)
+                }
+                log.debug(
+                    "updateDeleteMessages chatId=\(del.chatId, privacy: .public) omitted_middle_ids=\(del.messageIds.count - 6, privacy: .public)"
+                )
+            }
 #endif
             // TDLib can emit from_cache=true when unloading memory cache; keep persistent rows.
             if del.fromCache {
