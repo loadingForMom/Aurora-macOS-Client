@@ -196,7 +196,10 @@ final class TelegramStore: ObservableObject {
 
         Task { @MainActor [weak self] in
             guard let self else { return }
-            if !forceReload, self.databaseRepository.hasMessages(chatId: chatId) {
+            if !forceReload, self.historyWindowLimitByChatId[chatId] != nil {
+                return
+            }
+            if !forceReload, self.databaseRepository.messageCount(chatId: chatId) > 1 {
                 return
             }
             self.loadInitialHistory(chatId: chatId)

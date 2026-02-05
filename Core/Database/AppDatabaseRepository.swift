@@ -766,6 +766,22 @@ final class AppDatabaseRepository {
         }
     }
 
+    func messageCount(chatId: Int64) -> Int {
+        do {
+            return try dbWriter.read { db in
+                let count = try Int.fetchOne(
+                    db,
+                    sql: "SELECT COUNT(*) FROM messages WHERE chat_id = ?",
+                    arguments: [chatId]
+                ) ?? 0
+                return count
+            }
+        } catch {
+            log.error("messageCount failed: \(String(describing: error), privacy: .public)")
+            return 0
+        }
+    }
+
     func fetchStats() -> DatabaseStats {
         do {
             return try dbWriter.read { db in

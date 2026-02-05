@@ -37,7 +37,7 @@ struct MessagesPane: View {
     @State private var viewedMessageIds = Set<Int64>()
     @State private var lastVisibleGroupIds = Set<String>()
     @State private var viewMessagesDebouncer = ViewMessagesDebouncer()
-    @State private var pendingGroupFrameUpdate: Task<Void, Never>? = nil
+    @State private var frameUpdateState = GroupFrameUpdateState()
 
     @State private var topVisibleGroupId: String? = nil
     @State private var topVisibleMessageId: Int64? = nil
@@ -179,13 +179,13 @@ struct MessagesPane: View {
         groupMessageIds: [String: [Int64]]
     ) {
         // Coalesce preference updates off the render pass to avoid SwiftUI "publishing during update" warnings.
-        pendingGroupFrameUpdate?.cancel()
+        frameUpdateState.pendingTask?.cancel()
         let snapshotFrames = frames
         let snapshotBounds = groupMessageBounds
         let snapshotIds = groupMessageIds
-        pendingGroupFrameUpdate = Task { @MainActor in
+        frameUpdateState.pendingTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 16_000_000) // coalesce per-frame updates
-                updateVisibleGroups(
+            updateVisibleGroups(
                 frames: snapshotFrames,
                 groupMessageBounds: snapshotBounds,
                 groupMessageIds: snapshotIds
@@ -354,20 +354,7 @@ struct MessagesPane: View {
         }
         let firstGroupId = groupIds.first
         let _ = groupIds.last
-        let groupMessageBounds: [String: (min: Int64, max: Int64)] = Dictionary(
-            uniqueKeysWithValues: rows.compactMap { row in
-                guard case let .group(g) = row else { return nil }
-                guard let minId = g.messages.min(by: { $0.id < $1.id })?.id else { return nil }
-                guard let maxId = g.messages.max(by: { $0.id < $1.id })?.id else { return nil }
-                return (g.id, (minId, maxId))
-            }
-        )
-        let groupMessageIds: [String: [Int64]] = Dictionary(
-            uniqueKeysWithValues: rows.compactMap { row in
-                guard case let .group(g) = row else { return nil }
-                return (g.id, g.messages.map { $0.id })
-            }
-        )
+        let (groupMessageBounds, groupMessageIds) = buildGroupMaps(rows: rows)
 
         ScrollViewReader { proxy in
             GeometryReader { containerGeo in
@@ -421,8 +408,8 @@ struct MessagesPane: View {
                 }
                 .onChange(of: isLiveResizing) { _, live in
                     if live {
-                        pendingGroupFrameUpdate?.cancel()
-                        pendingGroupFrameUpdate = nil
+                        frameUpdateState.pendingTask?.cancel()
+                        frameUpdateState.pendingTask = nil
                         jellyDecayTask?.cancel()
                         jellyDecayTask = nil
                     }
@@ -503,8 +490,8 @@ struct MessagesPane: View {
                     cachedRows = []
                     windowMessages = []
                     windowApplyToken = UUID()
-                    pendingGroupFrameUpdate?.cancel()
-                    pendingGroupFrameUpdate = nil
+                    frameUpdateState.pendingTask?.cancel()
+                    frameUpdateState.pendingTask = nil
                     jellyDecayTask?.cancel()
                     jellyDecayTask = nil
                     viewMessagesDebouncer.cancel()
@@ -527,6 +514,13 @@ struct MessagesPane: View {
                     applyWindowMessages(newMessages, anchorGroupId: restoreAnchorGroupId)
                 }
                 .onChange(of: messages.count) { _, newCount in
+                    // During the initial hidden render + jump-to-bottom, do not auto-show or auto-scroll.
+                    guard didInitialScrollToBottom else {
+                        lastKnownMessageCount = newCount
+                        newIncomingCount = 0
+                        return
+                    }
+
                     if newCount < lastKnownMessageCount {
                         lastKnownMessageCount = newCount
                         newIncomingCount = 0
@@ -551,14 +545,6 @@ struct MessagesPane: View {
                     if shouldAutoScroll {
                         scrollToBottomSentinel(proxy, animated: pagingEnabled)
                         newIncomingCount = 0
-                        if !pagingEnabled {
-                            pagingEnabled = true
-                            didInitialScrollToBottom = true
-                        }
-                        // If we got here during initial load, ensure the list becomes visible.
-                        if !showAfterInitialJump {
-                            showAfterInitialJump = true
-                        }
                     } else {
                         if !lastIsOutgoing {
                             newIncomingCount += delta
@@ -573,7 +559,6 @@ struct MessagesPane: View {
                     
                     // Kick off an initial load for this chat (local + remote).
                     viewModel.loadOlder(pageSize: 80)
-                    store.loadMoreHistory(chatId: chat.id, anchorMessageId: 0)
 
                     // Let SwiftUI finish initial layout passes.
                     await Task.yield()
@@ -687,6 +672,21 @@ struct MessagesPane: View {
         return rows
     }
 
+    private func buildGroupMaps(rows: [Row]) -> ([String: (min: Int64, max: Int64)], [String: [Int64]]) {
+        var bounds: [String: (min: Int64, max: Int64)] = [:]
+        var ids: [String: [Int64]] = [:]
+        bounds.reserveCapacity(rows.count)
+        ids.reserveCapacity(rows.count)
+        for row in rows {
+            guard case let .group(g) = row else { continue }
+            let messageIds = g.messages.map { $0.id }
+            guard let minId = messageIds.min(), let maxId = messageIds.max() else { continue }
+            bounds[g.id] = (minId, maxId)
+            ids[g.id] = messageIds
+        }
+        return (bounds, ids)
+    }
+
     private func dayKey(_ d: Date) -> String {
         let cal = Calendar.current
         let c = cal.dateComponents([.year, .month, .day], from: d)
@@ -773,6 +773,10 @@ private struct DayHeaderView: View {
         if cal.isDateInYesterday(d) { return "Yesterday" }
         return ChatFormatters.dayFormatter.string(from: d)
     }
+}
+
+private final class GroupFrameUpdateState {
+    var pendingTask: Task<Void, Never>?
 }
 
 private struct TimeSeparatorView: View {

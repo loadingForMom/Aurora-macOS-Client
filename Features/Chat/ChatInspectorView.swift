@@ -273,12 +273,18 @@ struct ChatInspectorView: View {
                 }
                 .scrollEdgeEffectStyle(.soft, for: .top)
                 .onPreferenceChange(_HeroTitleMinYKey.self) {
-                    heroTitleScrollMinY = $0
-                    updateBaseline()
+                    let value = $0
+                    DispatchQueue.main.async {
+                        heroTitleScrollMinY = value
+                        updateBaseline()
+                    }
                 }
                 .onPreferenceChange(_PinnedTitleMinYKey.self) {
-                    pinnedTitleScrollMinY = $0
-                    updateBaseline()
+                    let value = $0
+                    DispatchQueue.main.async {
+                        pinnedTitleScrollMinY = value
+                        updateBaseline()
+                    }
                 }
                 .onAppear {
                     // Important: попросим hi-res у TDLib только когда инспектор реально открыт
@@ -290,14 +296,17 @@ struct ChatInspectorView: View {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { updateBaseline() }
                 }
                 .onPreferenceChange(_ScrollTopMinYKey.self) {
-                    scrollTopMinY = $0
+                    let value = $0
+                    DispatchQueue.main.async {
+                        scrollTopMinY = value
 
-                    if !baselineScrollTopMinY.isFinite, $0.isFinite {
-                        baselineScrollTopMinY = $0
+                        if !baselineScrollTopMinY.isFinite, value.isFinite {
+                            baselineScrollTopMinY = value
+                        }
+
+                        updateBaseline()
+                        scheduleBaselineSettleCheck()
                     }
-
-                    updateBaseline()
-                    scheduleBaselineSettleCheck()
                 }
 
                 PinnedHeaderChrome(
