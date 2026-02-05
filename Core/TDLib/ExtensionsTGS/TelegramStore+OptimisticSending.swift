@@ -239,7 +239,7 @@ extension TelegramStore {
                 "clear_draft": true
             ]
         ]
-        enqueueTDLibRequest(req, typeOverride: "sendMessage")
+        enqueueTDLibRequest(req, typeOverride: "sendMessage", priority: .high)
         markMessageSending(localId: localId)
     }
 
@@ -282,7 +282,7 @@ extension TelegramStore {
                 "clear_draft": true
             ]
         ]
-        enqueueTDLibRequest(req, typeOverride: "sendMessage")
+        enqueueTDLibRequest(req, typeOverride: "sendMessage", priority: .high)
         markMessageSending(localId: localId)
     }
 

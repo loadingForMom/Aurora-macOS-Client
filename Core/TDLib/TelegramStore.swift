@@ -14,7 +14,10 @@ final class TelegramStore: ObservableObject {
     let td = TDLibClient()
     private lazy var updateProcessor: TDLibUpdateProcessor = TDLibUpdateProcessor(store: self)
     private let receiver: TDLibReceiver
-    private let tdlibRequestQueue = DispatchQueue(label: "com.aurora.app.tdlib.request.queue", qos: .userInitiated)
+    private let tdlibHighPriorityRequestQueue = DispatchQueue(label: "com.aurora.app.tdlib.request.high.queue", qos: .userInitiated)
+    private let tdlibLowPriorityRequestQueue = DispatchQueue(label: "com.aurora.app.tdlib.request.low.queue", qos: .utility)
+    private let userPrefetchQueue = DispatchQueue(label: "com.aurora.app.user.prefetch.queue", qos: .utility)
+    private let chatLastMessageWatermarkQueue = DispatchQueue(label: "com.aurora.app.chat.lastmessage.watermark.queue")
     private let authSnapshotQueue = DispatchQueue(label: "com.aurora.app.auth.snapshot.queue", attributes: .concurrent)
     private var authStateSnapshot: String = "unknown"
     private var isAuthorizedSnapshot: Bool = false
@@ -129,9 +132,18 @@ final class TelegramStore: ObservableObject {
     var pendingChatInfoRequests: Set<Int64> = []
     var requestedUserIds: Set<Int64> = []
 
+    struct ChatLastMessageWatermark: Equatable {
+        let messageId: Int64
+        let preview: String
+        let date: Int
+    }
+
+    var chatLastMessageWatermarkByChatId: [Int64: ChatLastMessageWatermark] = [:]
+
     // MARK: - User cache (non-authoritative)
     // Нужно из extensions в других файлах
     var userCache: [Int64: TGUser] = [:]
+    var userPrefetchInFlight: Set<Int64> = []
 
     // MARK: - History jobs
 
@@ -208,10 +220,7 @@ final class TelegramStore: ObservableObject {
         if let cached = userCache[id] {
             return cached.displayName
         }
-        if let user = databaseRepository.fetchUser(userId: id) {
-            userCache[id] = user
-            return user.displayName
-        }
+        prefetchUserIfNeeded(userId: id)
         return ""
     }
 
@@ -258,11 +267,38 @@ final class TelegramStore: ObservableObject {
         if let cached = userCache[id] {
             return cached.displayName
         }
-        if let user = databaseRepository.fetchUser(userId: id) {
-            userCache[id] = user
-            return user.displayName
-        }
+        prefetchUserIfNeeded(userId: id)
         return "User \(id)"
+    }
+
+    @MainActor
+    private func prefetchUserIfNeeded(userId: Int64) {
+        guard userId > 0 else { return }
+        guard userCache[userId] == nil else { return }
+        guard !userPrefetchInFlight.contains(userId) else { return }
+        userPrefetchInFlight.insert(userId)
+
+        let repository = databaseRepository
+        userPrefetchQueue.async { [weak self] in
+            let persisted = repository.fetchUser(userId: userId)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.userPrefetchInFlight.remove(userId)
+
+                if let persisted {
+                    let changed = self.userCache[userId] != persisted
+                    self.userCache[userId] = persisted
+                    if changed {
+                        self.objectWillChange.send()
+                    }
+                    return
+                }
+
+                Task { [weak self] in
+                    await self?.requestUserIfNeeded(userId)
+                }
+            }
+        }
     }
 
     // Read/viewed
@@ -333,7 +369,7 @@ final class TelegramStore: ObservableObject {
             "message_ids": messageIds,
             "force_read": forceRead
         ]
-        enqueueTDLibRequest(req, typeOverride: "viewMessages")
+        enqueueTDLibRequest(req, typeOverride: "viewMessages", priority: .low)
     }
 
     func markChatAsReadToLatestIfNeeded(chatId: Int64) {
@@ -393,7 +429,34 @@ final class TelegramStore: ObservableObject {
     }
 
     func persistChatLastMessage(chatId: Int64, messageId: Int64, preview: String, date: Int) {
+        recordChatLastMessageWatermark(chatId: chatId, messageId: messageId, preview: preview, date: date)
         Task { await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chatId, messageId: messageId, preview: preview, date: date)) }
+    }
+
+    func shouldEnqueueChatLastMessageUpdate(chatId: Int64, messageId: Int64, preview: String, date: Int) -> Bool {
+        chatLastMessageWatermarkQueue.sync {
+            let incoming = ChatLastMessageWatermark(messageId: messageId, preview: preview, date: date)
+            if let current = chatLastMessageWatermarkByChatId[chatId] {
+                if current.messageId > incoming.messageId {
+                    return false
+                }
+                if current == incoming {
+                    return false
+                }
+            }
+            chatLastMessageWatermarkByChatId[chatId] = incoming
+            return true
+        }
+    }
+
+    func recordChatLastMessageWatermark(chatId: Int64, messageId: Int64, preview: String, date: Int) {
+        chatLastMessageWatermarkQueue.sync {
+            chatLastMessageWatermarkByChatId[chatId] = ChatLastMessageWatermark(
+                messageId: messageId,
+                preview: preview,
+                date: date
+            )
+        }
     }
 
     func persistUser(_ user: TGUser) {
@@ -537,7 +600,11 @@ final class TelegramStore: ObservableObject {
         isAuthorized = false
         updateAuthorizationSnapshot(state: authState, authorized: isAuthorized)
         userCache = [:]
+        userPrefetchInFlight = []
         requestedUserIds = []
+        chatLastMessageWatermarkQueue.sync {
+            chatLastMessageWatermarkByChatId.removeAll(keepingCapacity: false)
+        }
         selectedChatId = nil
         isLoadingHistory = false
 
@@ -613,17 +680,27 @@ final class TelegramStore: ObservableObject {
         authorizationSnapshot().isAuthorized
     }
 
-    func enqueueTDLibRequest(_ req: [String: Any], typeOverride: String? = nil) {
-        tdlibRequestQueue.async { [weak self] in
+    func enqueueTDLibRequest(
+        _ req: [String: Any],
+        typeOverride: String? = nil,
+        priority: TDLibClient.SendPriority = .high
+    ) {
+        let queue: DispatchQueue = {
+            switch priority {
+            case .high: return tdlibHighPriorityRequestQueue
+            case .low: return tdlibLowPriorityRequestQueue
+            }
+        }()
+        queue.async { [weak self] in
             guard let self else { return }
 #if DEBUG
             let queueLabel = String(cString: __dispatch_queue_get_label(nil))
             let type = typeOverride
                 ?? (req["@type"] as? String)
                 ?? "unknown"
-            self.log.debug("tdlib request type=\(type, privacy: .public) queue=\(queueLabel, privacy: .public) main=\(Thread.isMainThread, privacy: .public)")
+            self.log.debug("tdlib request type=\(type, privacy: .public) priority=\(priority.rawValue, privacy: .public) queue=\(queueLabel, privacy: .public) main=\(Thread.isMainThread, privacy: .public)")
 #endif
-            if self.sendIfAuthorized(req, typeOverride: typeOverride) {
+            if self.sendIfAuthorized(req, typeOverride: typeOverride, priority: priority) {
                 let type = typeOverride
                     ?? (req["@type"] as? String)
                     ?? "unknown"

@@ -9,9 +9,47 @@ import Foundation
 import OSLog
 
 final class TDLibClient {
+    enum SendPriority: String {
+        case high
+        case low
+    }
+
+    private struct PendingSendQueue {
+        private var storage: [String] = []
+        private var head: Int = 0
+
+        var isEmpty: Bool { head >= storage.count }
+
+        mutating func enqueue(_ json: String) {
+            storage.append(json)
+        }
+
+        mutating func dequeue() -> String? {
+            guard head < storage.count else {
+                storage.removeAll(keepingCapacity: false)
+                head = 0
+                return nil
+            }
+            let json = storage[head]
+            head += 1
+            if head > 64, head * 2 >= storage.count {
+                storage.removeFirst(head)
+                head = 0
+            }
+            return json
+        }
+
+        mutating func removeAll() {
+            storage.removeAll(keepingCapacity: false)
+            head = 0
+        }
+    }
+
     private let log = Logger(subsystem: "com.aurora.app", category: "tdlib.client")
-    // Send is lightweight; keep it off the receive loop so it doesn't get starved.
+    // Keep send isolated from receive loop and arbitrate high/low channels explicitly.
     private let sendQueue = DispatchQueue(label: "tdlib.send.queue")
+    private var pendingHigh = PendingSendQueue()
+    private var pendingLow = PendingSendQueue()
 
     private var client: UnsafeMutableRawPointer?
 
@@ -24,12 +62,12 @@ final class TDLibClient {
         stop()
     }
 
-    func send(function: [String: Any]) {
+    func send(function: [String: Any], priority: SendPriority = .high) {
         guard JSONSerialization.isValidJSONObject(function),
               let data = try? JSONSerialization.data(withJSONObject: function),
               let json = String(data: data, encoding: .utf8)
         else { return }
-        send(json)
+        send(json, priority: priority)
     }
 
     func makeReceiver() -> TDLibReceiver? {
@@ -37,17 +75,35 @@ final class TDLibClient {
         return TDLibReceiver(client: client)
     }
 
-    func send(_ json: String) {
+    func send(_ json: String, priority: SendPriority = .high) {
         sendQueue.async { [weak self] in
             guard let self, let client = self.client else { return }
-            json.withCString { td_json_client_send(client, $0) }
+            switch priority {
+            case .high:
+                self.pendingHigh.enqueue(json)
+            case .low:
+                self.pendingLow.enqueue(json)
+            }
+            self.drainPendingSends(client: client)
         }
     }
 
     func stop() {
-        guard let client else { return }
-        log.info("destroying tdlib client")
-        td_json_client_destroy(client)
-        self.client = nil
+        sendQueue.sync { [weak self] in
+            guard let self, let client = self.client else { return }
+            log.info("destroying tdlib client")
+            self.pendingHigh.removeAll()
+            self.pendingLow.removeAll()
+            td_json_client_destroy(client)
+            self.client = nil
+        }
+    }
+
+    private func drainPendingSends(client: UnsafeMutableRawPointer) {
+        while true {
+            let next = pendingHigh.dequeue() ?? pendingLow.dequeue()
+            guard let next else { return }
+            next.withCString { td_json_client_send(client, $0) }
+        }
     }
 }

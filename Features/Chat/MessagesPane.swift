@@ -34,6 +34,7 @@ struct MessagesPane: View {
     @State private var cachedGroupMessageBounds: [String: (min: Int64, max: Int64)] = [:]
     @State private var cachedGroupMessageIds: [String: [Int64]] = [:]
     @State private var windowMessages: [TGMessage] = []
+    @State private var rowBuildTask: Task<Void, Never>? = nil
     @State private var windowApplyToken = UUID()
     @State private var visibleGroupIds = Set<String>()
     @State private var lastVisibleGroupIds = Set<String>()
@@ -62,12 +63,13 @@ struct MessagesPane: View {
     // Grouping knobs
     private let groupGap: Int = 5 * 60
     private let majorGap: Int = 60 * 60
+    private static let rowBuildWorker = RowsBuildWorker()
 
     private var bottomSentinelId: String { "bottom:\(chat.id)" }
 
     // MARK: - Rows
 
-    private enum Row: Identifiable, Hashable {
+    private enum Row: Identifiable, Hashable, Sendable {
         case dayHeader(id: String, date: Date)
         case timeSeparator(id: String, date: Date)
         case group(MessageGroup)
@@ -78,6 +80,150 @@ struct MessagesPane: View {
             case .timeSeparator(let id, _): return id
             case .group(let g): return g.id
             }
+        }
+    }
+
+    private struct PreparedRows: Sendable {
+        let rows: [Row]
+        let groupIdsOrdered: [String]
+        let groupMessageBounds: [String: (min: Int64, max: Int64)]
+        let groupMessageIds: [String: [Int64]]
+    }
+
+    private actor RowsBuildWorker {
+        private let emptyPreparedRows = PreparedRows(
+            rows: [],
+            groupIdsOrdered: [],
+            groupMessageBounds: [:],
+            groupMessageIds: [:]
+        )
+
+        func build(
+            chatId: Int64,
+            messages: [TGMessage],
+            groupGap: Int,
+            majorGap: Int
+        ) -> PreparedRows {
+            guard !Task.isCancelled else { return emptyPreparedRows }
+            let rows = buildRows(chatId: chatId, messages: messages, groupGap: groupGap, majorGap: majorGap)
+            guard !Task.isCancelled else { return emptyPreparedRows }
+            let groupIdsOrdered: [String] = rows.compactMap {
+                if case .group(let g) = $0 { return g.id }
+                return nil
+            }
+            let maps = buildGroupMaps(rows: rows)
+            return PreparedRows(
+                rows: rows,
+                groupIdsOrdered: groupIdsOrdered,
+                groupMessageBounds: maps.0,
+                groupMessageIds: maps.1
+            )
+        }
+
+        private func buildRows(
+            chatId: Int64,
+            messages: [TGMessage],
+            groupGap: Int,
+            majorGap: Int
+        ) -> [Row] {
+            guard !messages.isEmpty else { return [] }
+
+            let calendar = Calendar.current
+            var rows: [Row] = []
+            var currentDay: Date? = nil
+
+            var bucket: [TGMessage] = []
+            var curSender: Int64? = nil
+            var curOutgoing: Bool = false
+            var lastUnix: Int? = nil
+
+            func flushBucket() {
+                guard let first = bucket.first else { return }
+                let group = MessageGroup(
+                    id: "\(chatId):g:\(first.chatId):\(first.id):\(first.localId?.uuidString ?? "nil")",
+                    isOutgoing: curOutgoing,
+                    senderUserId: curSender,
+                    messages: bucket
+                )
+                rows.append(.group(group))
+                bucket.removeAll(keepingCapacity: true)
+            }
+
+            func ensureDayHeader(unix: Int) {
+                let date = Date(timeIntervalSince1970: TimeInterval(unix))
+                let day = calendar.startOfDay(for: date)
+                if currentDay == nil || currentDay != day {
+                    flushBucket()
+                    currentDay = day
+                    let key = dayKey(day, calendar: calendar)
+                    rows.append(.dayHeader(id: "\(chatId):day:\(key)", date: day))
+                    lastUnix = nil
+                }
+            }
+
+            func maybeInsertMajorGap(prev: Int, next: Int) {
+                let gap = abs(next - prev)
+                guard gap >= majorGap else { return }
+                rows.append(.timeSeparator(id: "\(chatId):time:\(next)", date: Date(timeIntervalSince1970: TimeInterval(next))))
+            }
+
+            for message in messages {
+                if Task.isCancelled { return [] }
+                ensureDayHeader(unix: message.date)
+
+                if let prev = lastUnix {
+                    maybeInsertMajorGap(prev: prev, next: message.date)
+                }
+
+                if bucket.isEmpty {
+                    bucket = [message]
+                    curSender = message.senderUserId
+                    curOutgoing = message.isOutgoing
+                    lastUnix = message.date
+                    continue
+                }
+
+                let sameSender = (message.senderUserId == curSender)
+                let sameDirection = (message.isOutgoing == curOutgoing)
+                let close = abs(message.date - (bucket.last?.date ?? message.date)) <= groupGap
+
+                if sameSender && sameDirection && close {
+                    bucket.append(message)
+                } else {
+                    flushBucket()
+                    bucket = [message]
+                    curSender = message.senderUserId
+                    curOutgoing = message.isOutgoing
+                }
+
+                lastUnix = message.date
+            }
+
+            flushBucket()
+            return rows
+        }
+
+        private func buildGroupMaps(rows: [Row]) -> ([String: (min: Int64, max: Int64)], [String: [Int64]]) {
+            var bounds: [String: (min: Int64, max: Int64)] = [:]
+            var ids: [String: [Int64]] = [:]
+            bounds.reserveCapacity(rows.count)
+            ids.reserveCapacity(rows.count)
+            for row in rows {
+                if Task.isCancelled {
+                    return ([:], [:])
+                }
+                guard case let .group(group) = row else { continue }
+                let messageIds = group.messages.map(\.id)
+                guard let minId = messageIds.min(), let maxId = messageIds.max() else { continue }
+                bounds[group.id] = (minId, maxId)
+                ids[group.id] = messageIds
+            }
+            return (bounds, ids)
+        }
+
+        private func dayKey(_ day: Date, calendar: Calendar) -> String {
+            let components = calendar.dateComponents([.year, .month, .day], from: day)
+            return "\(components.year ?? 0)-\(components.month ?? 0)-\(components.day ?? 0)"
         }
     }
 
@@ -120,30 +266,30 @@ struct MessagesPane: View {
             log.debug("filtered out all rows chatId=\(expectedChatId, privacy: .public)")
 #endif
         }
-        Task { @MainActor [token, expectedChatId, filtered] in
-            await Task.yield()
+        let shouldForceViewMessages = windowMessages.isEmpty
+        rowBuildTask?.cancel()
+        rowBuildTask = Task { @MainActor [token, expectedChatId, filtered, anchorGroupId, shouldForceViewMessages] in
+            let prepared = await Self.rowBuildWorker.build(
+                chatId: expectedChatId,
+                messages: filtered,
+                groupGap: groupGap,
+                majorGap: majorGap
+            )
+            guard !Task.isCancelled else { return }
             guard windowApplyToken == token else { return }
             guard chat.id == expectedChatId else { return }
             if let anchorGroupId {
                 restoreAnchorGroupId = anchorGroupId
             }
-            let shouldForceViewMessages = windowMessages.isEmpty
             windowMessages = filtered
-            let rows = buildRows(filtered)
-            cachedRows = rows
-
-            let groupIdsOrdered: [String] = rows.compactMap {
-                if case .group(let g) = $0 { return g.id }
-                return nil
-            }
-            let (bounds, ids) = buildGroupMaps(rows: rows)
-            cachedGroupIdsOrdered = groupIdsOrdered
-            cachedGroupMessageBounds = bounds
-            cachedGroupMessageIds = ids
+            cachedRows = prepared.rows
+            cachedGroupIdsOrdered = prepared.groupIdsOrdered
+            cachedGroupMessageBounds = prepared.groupMessageBounds
+            cachedGroupMessageIds = prepared.groupMessageIds
             updateVisibleState(
-                groupIdsOrdered: groupIdsOrdered,
-                groupMessageBounds: bounds,
-                groupMessageIds: ids,
+                groupIdsOrdered: prepared.groupIdsOrdered,
+                groupMessageBounds: prepared.groupMessageBounds,
+                groupMessageIds: prepared.groupMessageIds,
                 forceViewMessages: shouldForceViewMessages
             )
         }
@@ -406,37 +552,16 @@ struct MessagesPane: View {
 
     var body: some View {
         let messages = windowMessages
-        let rows = cachedRows.isEmpty ? buildRows(messages) : cachedRows
-        let computedGroupIds: [String] = rows.compactMap {
-            if case .group(let g) = $0 { return g.id }
-            return nil
-        }
-        let computedMaps = buildGroupMaps(rows: rows)
+        let rows = cachedRows
 
 #if DEBUG
         let _ = debugAssertUniqueMessageKeys(messages)
 #endif
 
-        let groupIds: [String] = {
-            if cachedRows.isEmpty || cachedGroupIdsOrdered.isEmpty {
-                return computedGroupIds
-            }
-            return cachedGroupIdsOrdered
-        }()
+        let groupIds = cachedGroupIdsOrdered
         let firstGroupId = groupIds.first
-        let _ = groupIds.last
-        let groupMessageBounds: [String: (min: Int64, max: Int64)] = {
-            if cachedRows.isEmpty || cachedGroupMessageBounds.isEmpty {
-                return computedMaps.0
-            }
-            return cachedGroupMessageBounds
-        }()
-        let groupMessageIds: [String: [Int64]] = {
-            if cachedRows.isEmpty || cachedGroupMessageIds.isEmpty {
-                return computedMaps.1
-            }
-            return cachedGroupMessageIds
-        }()
+        let groupMessageBounds = cachedGroupMessageBounds
+        let groupMessageIds = cachedGroupMessageIds
 
         ScrollViewReader { proxy in
             ScrollView {
@@ -598,6 +723,8 @@ struct MessagesPane: View {
                         cachedGroupMessageBounds = [:]
                         cachedGroupMessageIds = [:]
                         windowMessages = []
+                        rowBuildTask?.cancel()
+                        rowBuildTask = nil
                         windowApplyToken = UUID()
                         jellyDecayTask?.cancel()
                         jellyDecayTask = nil
@@ -625,6 +752,8 @@ struct MessagesPane: View {
                         payload: "visibleRange=\(debugId(visibleMinMessageId))..\(debugId(visibleMaxMessageId))",
                         reason: "viewLifecycle"
                     )
+                    rowBuildTask?.cancel()
+                    rowBuildTask = nil
                     store.resetVisibleMessageTracking(chatId: chat.id)
                 }
                 .onChange(of: viewModel.messages) { _, newMessages in
@@ -714,107 +843,6 @@ struct MessagesPane: View {
         assert(unique.count == keys.count, "[MessagesPane] duplicate message keys in chat \(chat.id)")
     }
 #endif
-
-    // MARK: - Grouping into rows (day headers + time separators + bubble groups)
-
-    private func buildRows(_ msgs: [TGMessage]) -> [Row] {
-        guard !msgs.isEmpty else { return [] }
-
-        let cal = Calendar.current
-        var rows: [Row] = []
-
-        var currentDay: Date? = nil
-
-        var bucket: [TGMessage] = []
-        var curSender: Int64? = nil
-        var curOutgoing: Bool = false
-        var lastUnix: Int? = nil
-
-        func flushBucket() {
-            guard let first = bucket.first else { return }
-            let group = MessageGroup(
-                id: "\(chat.id):g:\(first.chatId):\(first.id):\(first.localId?.uuidString ?? "nil")",
-                isOutgoing: curOutgoing,
-                senderUserId: curSender,
-                messages: bucket
-            )
-            rows.append(.group(group))
-            bucket.removeAll(keepingCapacity: true)
-        }
-
-        func ensureDayHeader(unix: Int) {
-            let d = Date(timeIntervalSince1970: TimeInterval(unix))
-            let day = cal.startOfDay(for: d)
-            if currentDay == nil || currentDay != day {
-                flushBucket()
-                currentDay = day
-                let key = dayKey(day)
-                rows.append(.dayHeader(id: "\(chat.id):day:\(key)", date: day))
-                lastUnix = nil
-            }
-        }
-
-        func maybeInsertMajorGap(prev: Int, next: Int) {
-            let gap = abs(next - prev)
-            guard gap >= majorGap else { return }
-            rows.append(.timeSeparator(id: "\(chat.id):time:\(next)", date: Date(timeIntervalSince1970: TimeInterval(next))))
-        }
-
-        for m in msgs {
-            ensureDayHeader(unix: m.date)
-
-            if let prev = lastUnix {
-                maybeInsertMajorGap(prev: prev, next: m.date)
-            }
-
-            if bucket.isEmpty {
-                bucket = [m]
-                curSender = m.senderUserId
-                curOutgoing = m.isOutgoing
-                lastUnix = m.date
-                continue
-            }
-
-            let sameSender = (m.senderUserId == curSender)
-            let sameDir = (m.isOutgoing == curOutgoing)
-            let close = abs(m.date - (bucket.last?.date ?? m.date)) <= groupGap
-
-            if sameSender && sameDir && close {
-                bucket.append(m)
-            } else {
-                flushBucket()
-                bucket = [m]
-                curSender = m.senderUserId
-                curOutgoing = m.isOutgoing
-            }
-
-            lastUnix = m.date
-        }
-
-        flushBucket()
-        return rows
-    }
-
-    private func buildGroupMaps(rows: [Row]) -> ([String: (min: Int64, max: Int64)], [String: [Int64]]) {
-        var bounds: [String: (min: Int64, max: Int64)] = [:]
-        var ids: [String: [Int64]] = [:]
-        bounds.reserveCapacity(rows.count)
-        ids.reserveCapacity(rows.count)
-        for row in rows {
-            guard case let .group(g) = row else { continue }
-            let messageIds = g.messages.map { $0.id }
-            guard let minId = messageIds.min(), let maxId = messageIds.max() else { continue }
-            bounds[g.id] = (minId, maxId)
-            ids[g.id] = messageIds
-        }
-        return (bounds, ids)
-    }
-
-    private func dayKey(_ d: Date) -> String {
-        let cal = Calendar.current
-        let c = cal.dateComponents([.year, .month, .day], from: d)
-        return "\(c.year ?? 0)-\(c.month ?? 0)-\(c.day ?? 0)"
-    }
 }
 
 // MARK: - Scroll tracking (macOS-safe)
@@ -887,7 +915,7 @@ private struct TimeSeparatorView: View {
     }
 }
 
-struct MessageGroup: Identifiable, Hashable {
+struct MessageGroup: Identifiable, Hashable, Sendable {
     let id: String
     let isOutgoing: Bool
     let senderUserId: Int64?

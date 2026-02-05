@@ -76,14 +76,6 @@ extension TelegramStore {
             onlyLocal: true,
             extra: extra
         )
-
-        // Fire remote initial history in parallel with local, so chat open doesn't stall on local DB latency.
-        requestInitialRemoteHistoryIfNeeded(
-            chatId: chatId,
-            generation: generation,
-            requestedLimit: tdLimit,
-            windowLimit: windowLimit
-        )
     }
 
     func _loadMoreHistory_impl(chatId: Int64, anchorMessageId: Int64, pageSize: Int) {
@@ -173,7 +165,7 @@ extension TelegramStore {
             "limit": limit,
             "only_local": onlyLocal
         ]
-        enqueueTDLibRequest(req, typeOverride: "getChatHistory")
+        enqueueTDLibRequest(req, typeOverride: "getChatHistory", priority: .high)
     }
 
 }

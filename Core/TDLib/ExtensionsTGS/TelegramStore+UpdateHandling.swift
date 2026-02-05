@@ -267,6 +267,12 @@ extension TelegramStore {
             pendingChatInfoRequests.remove(chat.id)
             await databaseBatchWriter.enqueue(.upsertChat(chat))
             if let lastMessage {
+                recordChatLastMessageWatermark(
+                    chatId: chat.id,
+                    messageId: lastMessage.id,
+                    preview: lastMessage.previewText,
+                    date: lastMessage.date
+                )
                 _ = await messageStore.mergeMessages(
                     chatId: chat.id,
                     messages: [lastMessage],

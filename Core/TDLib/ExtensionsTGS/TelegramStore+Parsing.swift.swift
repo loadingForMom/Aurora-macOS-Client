@@ -9,7 +9,7 @@ extension TelegramStore {
 
     // MARK: - JSON helpers
 
-    func sendJSON(_ obj: Any) {
+    func sendJSON(_ obj: Any, priority: TDLibClient.SendPriority = .high) {
         guard JSONSerialization.isValidJSONObject(obj) else {
             log.error("tdlib invalid json: \(String(describing: obj), privacy: .public)")
             return
@@ -19,7 +19,7 @@ extension TelegramStore {
             let data = try JSONSerialization.data(withJSONObject: obj)
             if let str = String(data: data, encoding: .utf8) {
                 log.debug("tdlib send \(str, privacy: .public)")
-                td.send(str)
+                td.send(str, priority: priority)
             } else {
                 log.error("tdlib encode error: invalid utf8")
             }
@@ -29,7 +29,11 @@ extension TelegramStore {
     }
 
     @discardableResult
-    func sendIfAuthorized(_ obj: Any, typeOverride: String? = nil) -> Bool {
+    func sendIfAuthorized(
+        _ obj: Any,
+        typeOverride: String? = nil,
+        priority: TDLibClient.SendPriority = .high
+    ) -> Bool {
         let type = typeOverride
             ?? (obj as? [String: Any])?["@type"] as? String
             ?? "unknown"
@@ -37,7 +41,7 @@ extension TelegramStore {
             log.info("Blocked TDLib request (not authorized yet): \(type, privacy: .public)")
             return false
         }
-        sendJSON(obj)
+        sendJSON(obj, priority: priority)
         return true
     }
 
