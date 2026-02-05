@@ -15,7 +15,7 @@ struct AuroraApp: App {
         WindowGroup {
             ContentView(store: store)
                 .environmentObject(store)
-                .bitmapLiveResize()
+                
         }
         .commands {
             InspectorCommands()
