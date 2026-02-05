@@ -49,6 +49,8 @@ extension TelegramStore {
     struct UpdateDeleteMessagesParsed {
         let chatId: Int64
         let messageIds: [Int64]
+        let fromCache: Bool
+        let isPermanent: Bool
     }
 
     func parseUpdateDeleteMessages(_ upd: String) -> UpdateDeleteMessagesParsed? {
@@ -57,7 +59,14 @@ extension TelegramStore {
         guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
         let ids = (obj["message_ids"] as? [NSNumber])?.map { $0.int64Value } ?? []
         guard !ids.isEmpty else { return nil }
-        return UpdateDeleteMessagesParsed(chatId: chatId, messageIds: ids)
+        let fromCache = (obj["from_cache"] as? Bool) ?? ((obj["from_cache"] as? NSNumber)?.boolValue ?? false)
+        let isPermanent = (obj["is_permanent"] as? Bool) ?? ((obj["is_permanent"] as? NSNumber)?.boolValue ?? false)
+        return UpdateDeleteMessagesParsed(
+            chatId: chatId,
+            messageIds: ids,
+            fromCache: fromCache,
+            isPermanent: isPermanent
+        )
     }
 
     func applyMessagesDeleted(chatId: Int64, messageIds: [Int64]) async {

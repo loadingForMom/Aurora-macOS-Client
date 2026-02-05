@@ -98,8 +98,13 @@ struct MessagesPane: View {
         restoreAnchorGroupId = anchorGroupId
         pagingInFlight = true
 
-        viewModel.loadOlder(pageSize: 80)
-        store.loadMoreHistory(chatId: chat.id, anchorMessageId: anchorMessageId)
+        let targetChatId = chat.id
+        Task { @MainActor [targetChatId, anchorMessageId] in
+            await Task.yield()
+            guard chat.id == targetChatId else { return }
+            viewModel.loadOlder(pageSize: 80)
+            store.loadMoreHistory(chatId: targetChatId, anchorMessageId: anchorMessageId)
+        }
     }
 
     private func applyWindowMessages(_ messages: [TGMessage], anchorGroupId: String?) {
@@ -144,8 +149,9 @@ struct MessagesPane: View {
         let unseen = messageIds.subtracting(viewedMessageIds)
         guard !unseen.isEmpty else { return }
         viewMessagesDebouncer.schedule(delay: 0.2) { [chatId = chat.id, unseen] in
-            store.viewMessages(chatId: chatId, messageIds: Array(unseen), forceRead: false)
             Task { @MainActor in
+                await Task.yield()
+                store.viewMessages(chatId: chatId, messageIds: Array(unseen), forceRead: false)
                 viewedMessageIds.formUnion(unseen)
             }
         }

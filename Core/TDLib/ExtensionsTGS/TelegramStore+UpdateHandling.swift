@@ -157,9 +157,19 @@ extension TelegramStore {
 
         // Deletions
         if let del = parseUpdateDeleteMessages(upd) {
+            let firstMessageId = del.messageIds.first ?? 0
+            let lastMessageId = del.messageIds.last ?? 0
+            log.debug(
+                "updateDeleteMessages chatId=\(del.chatId, privacy: .public) ids=\(del.messageIds.count, privacy: .public) first=\(firstMessageId, privacy: .public) last=\(lastMessageId, privacy: .public) from_cache=\(del.fromCache, privacy: .public) is_permanent=\(del.isPermanent, privacy: .public)"
+            )
 #if DEBUG
             del.messageIds.forEach { debugLogMessageEvent(label: "updateDeleteMessages", chatId: del.chatId, messageId: $0) }
 #endif
+            // TDLib can emit from_cache=true when unloading memory cache; keep persistent rows.
+            if del.fromCache {
+                return
+            }
+
             await applyMessagesDeleted(chatId: del.chatId, messageIds: del.messageIds)
         }
 
