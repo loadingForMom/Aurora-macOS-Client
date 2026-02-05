@@ -60,9 +60,43 @@ actor TDLibUpdateProcessor {
     }
 
     private func extractType(_ json: String) -> String? {
+        if let fastType = extractTypeFast(json) {
+            return fastType
+        }
         guard let data = json.data(using: .utf8),
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let type = obj["@type"] as? String else { return nil }
         return type
+    }
+
+    private func extractTypeFast(_ json: String) -> String? {
+        guard let fieldRange = json.range(of: "\"@type\"") else { return nil }
+
+        var cursor = fieldRange.upperBound
+        while cursor < json.endIndex, json[cursor].isWhitespace {
+            cursor = json.index(after: cursor)
+        }
+        guard cursor < json.endIndex, json[cursor] == ":" else { return nil }
+
+        cursor = json.index(after: cursor)
+        while cursor < json.endIndex, json[cursor].isWhitespace {
+            cursor = json.index(after: cursor)
+        }
+        guard cursor < json.endIndex, json[cursor] == "\"" else { return nil }
+
+        cursor = json.index(after: cursor)
+        let valueStart = cursor
+        while cursor < json.endIndex {
+            let ch = json[cursor]
+            if ch == "\"" {
+                return String(json[valueStart..<cursor])
+            }
+            if ch == "\\" {
+                return nil
+            }
+            cursor = json.index(after: cursor)
+        }
+
+        return nil
     }
 }

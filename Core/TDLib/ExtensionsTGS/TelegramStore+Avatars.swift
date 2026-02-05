@@ -70,17 +70,18 @@ extension TelegramStore {
             chatAvatarMetaByChatId: &chatAvatarMetaByChatId,
             chatIdByAvatarFileId: &chatIdByAvatarFileId
         )
+        queueChatAvatarPathUpdate(chatId: chatId, path: initialBestPath)
     }
 
     @MainActor
     func applyChatAvatarFileUpdate(chatId: Int64, fileId: Int32, path: String) {
-        avatarService.applyChatAvatarFileUpdate(
+        let bestPath = avatarService.applyChatAvatarFileUpdate(
             chatId: chatId,
             fileId: fileId,
             path: path,
-            chatAvatarMetaByChatId: &chatAvatarMetaByChatId,
-            chatAvatarPathByChatId: &chatAvatarPathByChatId
+            chatAvatarMetaByChatId: &chatAvatarMetaByChatId
         )
+        queueChatAvatarPathUpdate(chatId: chatId, path: bestPath)
     }
 
     @MainActor

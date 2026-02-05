@@ -58,6 +58,9 @@ final class TelegramStore: ObservableObject {
     // MARK: - Chat avatars (paths)
 
     @Published var chatAvatarPathByChatId: [Int64: String] = [:]
+    private var pendingAvatarPathUpdates: [Int64: String?] = [:]
+    private var avatarPathPublishTask: Task<Void, Never>?
+    private let avatarPathPublishDelayNs: UInt64 = 40_000_000
 
     typealias ChatAvatarMeta = AvatarService.ChatAvatarMeta
 
@@ -160,6 +163,7 @@ final class TelegramStore: ObservableObject {
     var reachedHistoryStart: Set<Int64> = []
     var historyWindowLimitByChatId: [Int64: Int] = [:]
     var historyGenerationByChatId: [Int64: Int] = [:]
+    var initialRemoteRequestedGenerationByChatId: [Int64: Int] = [:]
     var historyRequestStartedAtNs: [String: UInt64] = [:]
     var historyMetrics = HistoryMetrics()
 
@@ -225,15 +229,26 @@ final class TelegramStore: ObservableObject {
             await self.primeMessageStore(chatId: chatId, limit: 160)
         }
 
-        Task { @MainActor [weak self] in
+        Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
-            if !forceReload, self.historyWindowLimitByChatId[chatId] != nil {
+
+            let hasWindow = await MainActor.run { [weak self] in
+                guard let self else { return false }
+                return !forceReload && self.historyWindowLimitByChatId[chatId] != nil
+            }
+            if hasWindow {
                 return
             }
+
             if !forceReload, self.databaseRepository.messageCount(chatId: chatId) > 0 {
                 return
             }
-            self.loadInitialHistory(chatId: chatId)
+
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                guard self.selectedChatId == chatId else { return }
+                self.loadInitialHistory(chatId: chatId)
+            }
         }
     }
 
@@ -535,6 +550,9 @@ final class TelegramStore: ObservableObject {
         myUserId = nil
         myProfilePhotoPath = nil
 
+        avatarPathPublishTask?.cancel()
+        avatarPathPublishTask = nil
+        pendingAvatarPathUpdates = [:]
         chatAvatarPathByChatId = [:]
         chatAvatarMetaByChatId = [:]
         chatIdByAvatarFileId = [:]
@@ -559,6 +577,7 @@ final class TelegramStore: ObservableObject {
         reachedHistoryStart = []
         historyWindowLimitByChatId = [:]
         historyGenerationByChatId = [:]
+        initialRemoteRequestedGenerationByChatId = [:]
         historyRequestStartedAtNs = [:]
         historyMetrics = HistoryMetrics()
 
@@ -622,6 +641,59 @@ final class TelegramStore: ObservableObject {
     func markDownloadCompleted(fileId: Int32) {
         downloadLimiter.markCompleted(fileId: fileId)
     }
+
+    @MainActor
+    func queueChatAvatarPathUpdate(chatId: Int64, path: String?) {
+        let normalized: String? = {
+            guard let path, !path.isEmpty else { return nil }
+            return path
+        }()
+        if pendingAvatarPathUpdates[chatId] == normalized,
+           chatAvatarPathByChatId[chatId] == normalized {
+            return
+        }
+        pendingAvatarPathUpdates[chatId] = normalized
+        scheduleAvatarPathPublishIfNeeded()
+    }
+
+    @MainActor
+    private func scheduleAvatarPathPublishIfNeeded() {
+        guard avatarPathPublishTask == nil else { return }
+        avatarPathPublishTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: self.avatarPathPublishDelayNs)
+            await self.flushQueuedAvatarPathUpdates(attempt: 0)
+        }
+    }
+
+    @MainActor
+    private func flushQueuedAvatarPathUpdates(attempt: Int) async {
+        guard !pendingAvatarPathUpdates.isEmpty else {
+            avatarPathPublishTask = nil
+            return
+        }
+
+        if ViewUpdatePhaseTracker.shared.isViewUpdating, attempt < 8 {
+            try? await Task.sleep(nanoseconds: 16_000_000)
+            await flushQueuedAvatarPathUpdates(attempt: attempt + 1)
+            return
+        }
+
+        var nextPaths = chatAvatarPathByChatId
+        for (chatId, path) in pendingAvatarPathUpdates {
+            if let path {
+                nextPaths[chatId] = path
+            } else {
+                nextPaths.removeValue(forKey: chatId)
+            }
+        }
+        pendingAvatarPathUpdates.removeAll(keepingCapacity: true)
+        avatarPathPublishTask = nil
+
+        if nextPaths != chatAvatarPathByChatId {
+            chatAvatarPathByChatId = nextPaths
+        }
+    }
 }
 
 final class AuroraRuntimeMetrics {
@@ -684,6 +756,8 @@ final class AuroraRuntimeMetrics {
 final class MainThreadPublishDebouncer<Value: Equatable> {
     private let queue = DispatchQueue(label: "com.aurora.app.main.publish.debouncer")
     private let delay: TimeInterval
+    private let maxViewUpdateDeferrals = 8
+    private let viewUpdateRetryDelay: TimeInterval = 0.008
     private var pendingValue: Value?
     private var workItem: DispatchWorkItem?
 
@@ -714,19 +788,60 @@ final class MainThreadPublishDebouncer<Value: Equatable> {
             let item = DispatchWorkItem { [weak self] in
                 guard let self, let snapshot = self.pendingValue else { return }
                 self.pendingValue = nil
-                Task { @MainActor in
-                    await Task.yield()
-                    SwiftUIPublishTrace.storeEvent(
-                        name: "publish_fire",
-                        chatId: chatId,
-                        details: "source=\(source) \(self.traceDetails(for: snapshot))",
-                        reason: "debouncer"
-                    )
-                    publish(snapshot)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    Task { @MainActor in
+                        await Task.yield()
+                        self.publishWhenSafe(
+                            value: snapshot,
+                            chatId: chatId,
+                            source: source,
+                            attempt: 0,
+                            publish: publish
+                        )
+                    }
                 }
             }
             self.workItem = item
             self.queue.asyncAfter(deadline: .now() + self.delay, execute: item)
+        }
+    }
+
+    @MainActor
+    private func publishWhenSafe(
+        value: Value,
+        chatId: Int64?,
+        source: String,
+        attempt: Int,
+        publish: @escaping @MainActor (Value) -> Void
+    ) {
+        if ViewUpdatePhaseTracker.shared.isViewUpdating, attempt < maxViewUpdateDeferrals {
+            let delay = viewUpdateRetryDelay * Double(attempt + 1)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                Task { @MainActor in
+                    self.publishWhenSafe(
+                        value: value,
+                        chatId: chatId,
+                        source: source,
+                        attempt: attempt + 1,
+                        publish: publish
+                    )
+                }
+            }
+            return
+        }
+
+        SwiftUIPublishTrace.storeEvent(
+            name: "publish_fire",
+            chatId: chatId,
+            details: "source=\(source) deferred=\(attempt) \(traceDetails(for: value))",
+            reason: "debouncer"
+        )
+        DispatchQueue.main.async {
+            Task { @MainActor in
+                publish(value)
+            }
         }
     }
 
@@ -1029,8 +1144,10 @@ actor MessageStore {
 
         var changed = 0
         for message in messages where message.chatId == chatId {
-            chat.messagesById[message.id] = message
-            changed += 1
+            if chat.messagesById[message.id] != message {
+                chat.messagesById[message.id] = message
+                changed += 1
+            }
         }
 
         if changed > 0 {
@@ -1082,27 +1199,25 @@ actor MessageStore {
         let canRetry = message.canRetry
         let retryCount = message.retryCount
         let nextRetryAt = message.nextRetryAt
-        let newMessage = await MainActor.run {
-            TGMessage(
-                id: id,
-                chatId: chatId,
-                date: date,
-                isOutgoing: isOutgoing,
-                senderUserId: senderUserId,
-                text: text,
-                contentType: contentType,
-                rawText: rawText,
-                entities: entities,
-                sendState: sendState,
-                replyToMessageId: replyToMessageId,
-                localId: localId,
-                sendingId: sendingId,
-                editedAt: editedAt,
-                canRetry: canRetry,
-                retryCount: retryCount,
-                nextRetryAt: nextRetryAt
-            )
-        }
+        let newMessage = TGMessage(
+            id: id,
+            chatId: chatId,
+            date: date,
+            isOutgoing: isOutgoing,
+            senderUserId: senderUserId,
+            text: text,
+            contentType: contentType,
+            rawText: rawText,
+            entities: entities,
+            sendState: sendState,
+            replyToMessageId: replyToMessageId,
+            localId: localId,
+            sendingId: sendingId,
+            editedAt: editedAt,
+            canRetry: canRetry,
+            retryCount: retryCount,
+            nextRetryAt: nextRetryAt
+        )
         message = newMessage
         chat.messagesById[messageId] = message
         chatStateById[chatId] = chat
@@ -1155,6 +1270,12 @@ actor MessageStore {
 
     private func schedulePublish(chatId: Int64) {
         guard var chat = chatStateById[chatId] else { return }
+        guard !chat.continuations.isEmpty else {
+            chat.publishTask?.cancel()
+            chat.publishTask = nil
+            chatStateById[chatId] = chat
+            return
+        }
         chat.publishTask?.cancel()
         SwiftUIPublishTrace.storeEvent(
             name: "publish_scheduled",

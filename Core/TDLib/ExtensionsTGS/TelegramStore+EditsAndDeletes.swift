@@ -47,8 +47,12 @@ extension TelegramStore {
         await databaseBatchWriter.enqueue(.updateMessageText(chatId: chatId, messageId: messageId, text: newText))
 
         if let latest = databaseRepository.fetchLatestMessage(chatId: chatId), latest.id == messageId {
-            await applyChatLastMessageUpdate(chatId: chatId, lastMessageId: messageId, preview: newText, date: latest.date)
-            await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chatId, messageId: messageId, preview: newText, date: latest.date))
+            await databaseBatchWriter.enqueue(
+                [
+                    .updateChatLastMessage(chatId: chatId, messageId: messageId, preview: newText, date: latest.date),
+                    .upsertChatLastMessage(chatId: chatId, messageId: messageId, preview: newText, date: latest.date)
+                ]
+            )
         }
     }
 

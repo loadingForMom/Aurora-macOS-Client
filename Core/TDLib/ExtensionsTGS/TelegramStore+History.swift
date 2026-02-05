@@ -12,6 +12,38 @@ extension TelegramStore {
     private var maxHistoryWindowLimit: Int { 5_000 }
     private var maxTdlibHistoryLimit: Int { 100 }
 
+    func requestInitialRemoteHistoryIfNeeded(
+        chatId: Int64,
+        generation: Int,
+        requestedLimit: Int,
+        windowLimit: Int
+    ) {
+        if initialRemoteRequestedGenerationByChatId[chatId] == generation {
+            return
+        }
+        initialRemoteRequestedGenerationByChatId[chatId] = generation
+
+        let extra = "history:\(chatId):initial:remote:\(UUID().uuidString)"
+        historyJobs[extra] = HistoryJob(
+            chatId: chatId,
+            kind: .initialRemote,
+            anchorMessageId: 0,
+            requestedLimit: requestedLimit,
+            windowLimit: windowLimit,
+            onlyLocal: false,
+            generation: generation
+        )
+        syncHistoryLoadingFlagForSelectedChat()
+        sendChatHistory(
+            chatId: chatId,
+            fromMessageId: 0,
+            offset: 0,
+            limit: requestedLimit,
+            onlyLocal: false,
+            extra: extra
+        )
+    }
+
     func loadInitialHistory(chatId: Int64) {
         reachedHistoryStart.remove(chatId)
         setMessageWindow(chatId: chatId, windowSize: initialHistoryWindowLimit)
@@ -43,6 +75,14 @@ extension TelegramStore {
             limit: tdLimit,
             onlyLocal: true,
             extra: extra
+        )
+
+        // Fire remote initial history in parallel with local, so chat open doesn't stall on local DB latency.
+        requestInitialRemoteHistoryIfNeeded(
+            chatId: chatId,
+            generation: generation,
+            requestedLimit: tdLimit,
+            windowLimit: windowLimit
         )
     }
 
@@ -89,6 +129,7 @@ extension TelegramStore {
             historyJobs.removeValue(forKey: k)
             historyRequestStartedAtNs.removeValue(forKey: k)
         }
+        initialRemoteRequestedGenerationByChatId.removeValue(forKey: chatId)
         syncHistoryLoadingFlagForSelectedChat()
     }
 

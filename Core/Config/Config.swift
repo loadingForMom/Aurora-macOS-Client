@@ -180,7 +180,6 @@ final class ViewUpdatePhaseTracker {
 
     func markUpdating(source: String) {
 #if DEBUG
-        guard SwiftUIPublishTrace.isEnabled else { return }
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self] in
                 self?.markUpdating(source: source)

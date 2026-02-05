@@ -10,13 +10,19 @@ actor DatabaseBatchWriter {
     private let log = Logger(subsystem: "com.aurora.app", category: "db.batch")
     private let repository: AppDatabaseRepository
     private let coalesceDelay: UInt64
+    private let maxPendingBeforeImmediateFlush: Int
 
     private var pending: [DatabaseOperation] = []
     private var flushTask: Task<Void, Never>?
 
-    init(repository: AppDatabaseRepository, coalesceDelay: UInt64 = 30_000_000) {
+    init(
+        repository: AppDatabaseRepository,
+        coalesceDelay: UInt64 = 30_000_000,
+        maxPendingBeforeImmediateFlush: Int = 160
+    ) {
         self.repository = repository
         self.coalesceDelay = coalesceDelay
+        self.maxPendingBeforeImmediateFlush = max(32, maxPendingBeforeImmediateFlush)
     }
 
     func enqueue(_ operation: DatabaseOperation) {
@@ -31,8 +37,17 @@ actor DatabaseBatchWriter {
     }
 
     private func scheduleFlush() {
+        if pending.count >= maxPendingBeforeImmediateFlush {
+            flushTask?.cancel()
+            flushTask = nil
+            Task(priority: .utility) { [weak self] in
+                await self?.flush()
+            }
+            return
+        }
+
         guard flushTask == nil else { return }
-        flushTask = Task.detached(priority: .utility) { [weak self] in
+        flushTask = Task(priority: .utility) { [weak self] in
             guard let self else { return }
             try? await Task.sleep(nanoseconds: self.coalesceDelay)
             await self.flush()
@@ -50,9 +65,104 @@ actor DatabaseBatchWriter {
         let operations = pending
         pending.removeAll(keepingCapacity: true)
         guard !operations.isEmpty else { return }
+        let compacted = compact(operations)
+        repository.apply(operations: compacted)
+        if compacted.count == operations.count {
+            log.debug("flushed \(compacted.count, privacy: .public) db operations")
+        } else {
+            log.debug(
+                "flushed \(compacted.count, privacy: .public) db operations (from \(operations.count, privacy: .public))"
+            )
+        }
+    }
 
-        await repository.apply(operations: operations)
-        log.debug("flushed \(operations.count, privacy: .public) db operations")
+    private enum CoalesceKey: Hashable {
+        case upsertChat(Int64)
+        case upsertUser(Int64)
+        case upsertMessage(chatId: Int64, messageId: Int64)
+        case upsertChatLastMessage(Int64)
+        case updateMessageText(chatId: Int64, messageId: Int64)
+        case updateMessageEdited(chatId: Int64, messageId: Int64)
+        case updateChatTitle(Int64)
+        case updateChatOrder(Int64)
+        case updateChatReadInbox(Int64)
+        case updateChatLastMessage(Int64)
+    }
+
+    private struct IndexedOperation {
+        let index: Int
+        let operation: DatabaseOperation
+    }
+
+    private func compact(_ operations: [DatabaseOperation]) -> [DatabaseOperation] {
+        var passthrough: [IndexedOperation] = []
+        var coalesced: [CoalesceKey: IndexedOperation] = [:]
+        var index = 0
+
+        func addLeafOperation(_ operation: DatabaseOperation) {
+            defer { index += 1 }
+
+            switch operation {
+            case .upsertChat(let chat):
+                coalesced[.upsertChat(chat.id)] = IndexedOperation(index: index, operation: operation)
+
+            case .upsertUser(let user):
+                coalesced[.upsertUser(user.id)] = IndexedOperation(index: index, operation: operation)
+
+            case .upsertMessage(let message):
+                let key = CoalesceKey.upsertMessage(chatId: message.chatId, messageId: message.id)
+                coalesced[key] = IndexedOperation(index: index, operation: operation)
+
+            case .upsertChatLastMessage(let chatId, _, _, _):
+                coalesced[.upsertChatLastMessage(chatId)] = IndexedOperation(index: index, operation: operation)
+
+            case .updateMessageText(let chatId, let messageId, _):
+                let key = CoalesceKey.updateMessageText(chatId: chatId, messageId: messageId)
+                coalesced[key] = IndexedOperation(index: index, operation: operation)
+
+            case .updateMessageEdited(let chatId, let messageId, _):
+                let key = CoalesceKey.updateMessageEdited(chatId: chatId, messageId: messageId)
+                coalesced[key] = IndexedOperation(index: index, operation: operation)
+
+            case .updateChatTitle(let chatId, _):
+                coalesced[.updateChatTitle(chatId)] = IndexedOperation(index: index, operation: operation)
+
+            case .updateChatOrder(let chatId, _):
+                coalesced[.updateChatOrder(chatId)] = IndexedOperation(index: index, operation: operation)
+
+            case .updateChatReadInbox(let chatId, _, _):
+                coalesced[.updateChatReadInbox(chatId)] = IndexedOperation(index: index, operation: operation)
+
+            case .updateChatLastMessage(let chatId, _, _, _):
+                coalesced[.updateChatLastMessage(chatId)] = IndexedOperation(index: index, operation: operation)
+
+            case .deleteMessages, .deleteMessagesByLocalId:
+                passthrough.append(IndexedOperation(index: index, operation: operation))
+
+            case .upsertChats, .upsertMessages:
+                passthrough.append(IndexedOperation(index: index, operation: operation))
+            }
+        }
+
+        for operation in operations {
+            switch operation {
+            case .upsertChats(let chats):
+                for chat in chats {
+                    addLeafOperation(.upsertChat(chat))
+                }
+            case .upsertMessages(let messages):
+                for message in messages {
+                    addLeafOperation(.upsertMessage(message))
+                }
+            default:
+                addLeafOperation(operation)
+            }
+        }
+
+        let merged = passthrough + coalesced.values
+        return merged
+            .sorted { $0.index < $1.index }
+            .map(\.operation)
     }
 }
 

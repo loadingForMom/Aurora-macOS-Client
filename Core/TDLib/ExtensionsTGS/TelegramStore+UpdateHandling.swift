@@ -31,8 +31,12 @@ extension TelegramStore {
                     windowLimit: historyWindowLimitByChatId[chatId] ?? 160
                 )
                 await applyChatLastMessageUpdate(chatId: chatId, lastMessageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
-                await databaseBatchWriter.enqueue(.upsertMessage(lastMessage))
-                await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chatId, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date))
+                await databaseBatchWriter.enqueue(
+                    [
+                        .upsertMessage(lastMessage),
+                        .upsertChatLastMessage(chatId: chatId, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
+                    ]
+                )
                 await keepOptimisticChatPreviewIfNeeded(chatId: chatId)
             } else if !pendingChatInfoRequests.contains(chatId) {
                 pendingChatInfoRequests.insert(chatId)
@@ -125,9 +129,6 @@ extension TelegramStore {
         if let update = parseUpdateChatPhoto(upd) {
             await MainActor.run {
                 if update.hasPhoto {
-                    if let p = update.bestPath {
-                        chatAvatarPathByChatId[update.chatId] = p
-                    }
                     registerChatAvatar(
                         chatId: update.chatId,
                         smallFileId: update.smallId,
@@ -135,7 +136,7 @@ extension TelegramStore {
                         initialBestPath: update.bestPath
                     )
                 } else {
-                    chatAvatarPathByChatId.removeValue(forKey: update.chatId)
+                    queueChatAvatarPathUpdate(chatId: update.chatId, path: nil)
                     chatAvatarMetaByChatId.removeValue(forKey: update.chatId)
                 }
             }
@@ -257,14 +258,15 @@ extension TelegramStore {
                     messages: [lastMessage],
                     windowLimit: historyWindowLimitByChatId[chat.id] ?? 160
                 )
-                await databaseBatchWriter.enqueue(.upsertMessage(lastMessage))
-                await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chat.id, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date))
+                await databaseBatchWriter.enqueue(
+                    [
+                        .upsertMessage(lastMessage),
+                        .upsertChatLastMessage(chatId: chat.id, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
+                    ]
+                )
             }
 
             await MainActor.run {
-                if let p = bestPath {
-                    chatAvatarPathByChatId[chat.id] = p
-                }
                 registerChatAvatar(chatId: chat.id, smallFileId: smallId, bigFileId: bigId, initialBestPath: bestPath)
             }
 
@@ -353,13 +355,11 @@ extension TelegramStore {
             let maxId = res.messages.max(by: { $0.id < $1.id })?.id
             log.debug("getChatHistory chatId=\(job.chatId, privacy: .public) anchorMessageId=\(job.anchorMessageId, privacy: .public) limit=\(job.requestedLimit, privacy: .public) returned=\(res.messages.count, privacy: .public) minId=\(minId ?? 0, privacy: .public) maxId=\(maxId ?? 0, privacy: .public) latencyMs=\(latencyMs ?? -1, privacy: .public)")
 #endif
-            for m in res.messages {
 #if DEBUG
-                debugLogMessageEvent(label: "getChatHistory", chatId: job.chatId, messageId: m.id)
-                assert(m.chatId == job.chatId, "TDLib history message chatId mismatch: expected \(job.chatId) got \(m.chatId)")
-#endif
-                // Per-message debug logging only; DB writes are batched below.
+            if let mismatch = res.messages.first(where: { $0.chatId != job.chatId }) {
+                assertionFailure("TDLib history message chatId mismatch: expected \(job.chatId) got \(mismatch.chatId)")
             }
+#endif
 
             let messagesToMerge: [TGMessage]
             if job.kind == .older {
@@ -399,29 +399,13 @@ extension TelegramStore {
                 let needMoreById = chatLastId > 0 && localMaxId < chatLastId
 
                 if needMoreByCount || needMoreById {
-                    let extra = "history:\(job.chatId):initial:remote:\(UUID().uuidString)"
-                    historyJobs[extra] = HistoryJob(
+                    requestInitialRemoteHistoryIfNeeded(
                         chatId: job.chatId,
-                        kind: .initialRemote,
-                        anchorMessageId: 0,
+                        generation: job.generation,
                         requestedLimit: job.requestedLimit,
-                        windowLimit: job.windowLimit,
-                        onlyLocal: false,
-                        generation: job.generation
-                    )
-                    sendChatHistory(
-                        chatId: job.chatId,
-                        fromMessageId: 0,
-                        offset: 0,
-                        limit: job.requestedLimit,
-                        onlyLocal: false,
-                        extra: extra
+                        windowLimit: job.windowLimit
                     )
                 }
-            }
-
-            if job.kind == .initialLocal || job.kind == .initialRemote {
-                await databaseBatchWriter.flushNow()
             }
 
 #if DEBUG

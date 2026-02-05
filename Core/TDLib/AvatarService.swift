@@ -154,9 +154,8 @@ final class AvatarService {
         chatId: Int64,
         fileId: Int32,
         path: String,
-        chatAvatarMetaByChatId: inout [Int64: ChatAvatarMeta],
-        chatAvatarPathByChatId: inout [Int64: String]
-    ) {
+        chatAvatarMetaByChatId: inout [Int64: ChatAvatarMeta]
+    ) -> String? {
         var meta = chatAvatarMetaByChatId[chatId] ?? ChatAvatarMeta()
 
         if meta.smallFileId == fileId {
@@ -171,9 +170,6 @@ final class AvatarService {
         chatAvatarMetaByChatId[chatId] = meta
 
         let best = (meta.smallPath?.isEmpty == false ? meta.smallPath : meta.bigPath)
-        if let best, !best.isEmpty {
-            chatAvatarPathByChatId[chatId] = best
-        }
 
         let isBig = (meta.bigFileId == fileId)
 
@@ -194,6 +190,8 @@ final class AvatarService {
                 jpegQuality: 0.95
             )
         }
+
+        return best
     }
 
     func downloadFileIfNeeded(

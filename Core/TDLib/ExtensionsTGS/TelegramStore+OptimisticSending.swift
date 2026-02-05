@@ -19,10 +19,10 @@ extension TelegramStore {
             preview = message.previewText
         }
         await databaseBatchWriter.enqueue(
-            .updateChatLastMessage(chatId: message.chatId, messageId: message.id, preview: preview, date: message.date)
-        )
-        await databaseBatchWriter.enqueue(
-            .upsertChatLastMessage(chatId: message.chatId, messageId: message.id, preview: preview, date: message.date)
+            [
+                .updateChatLastMessage(chatId: message.chatId, messageId: message.id, preview: preview, date: message.date),
+                .upsertChatLastMessage(chatId: message.chatId, messageId: message.id, preview: preview, date: message.date)
+            ]
         )
     }
 
