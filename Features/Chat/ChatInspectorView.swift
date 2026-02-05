@@ -289,12 +289,6 @@ struct ChatInspectorView: View {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { updateBaseline() }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { updateBaseline() }
                 }
-                .onChange(of: store.selectedChatId) { _, newChatId in
-                    guard let id = newChatId else { return }
-                    Task { @MainActor in
-                        store.selectChat(id)
-                    }
-                }
                 .onPreferenceChange(_ScrollTopMinYKey.self) {
                     scrollTopMinY = $0
 

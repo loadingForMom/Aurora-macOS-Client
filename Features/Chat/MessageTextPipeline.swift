@@ -15,6 +15,7 @@ struct MessageTextCacheKey: Hashable {
     let chatId: Int64
     let messageId: Int64
     let style: MessageTextStyle
+    let textFingerprint: Int
 }
 
 final class MessageTextCache {
@@ -70,7 +71,12 @@ enum MessageTextPipeline {
         entities: [TGTextEntity]?,
         style: MessageTextStyle
     ) -> AttributedString {
-        let cacheKey = MessageTextCacheKey(chatId: chatId, messageId: messageId, style: style)
+        let cacheKey = MessageTextCacheKey(
+            chatId: chatId,
+            messageId: messageId,
+            style: style,
+            textFingerprint: textFingerprint(rawText: rawText, entities: entities)
+        )
         if let cached = MessageTextCache.shared.value(for: cacheKey) {
             return cached
         }
@@ -106,6 +112,20 @@ enum MessageTextPipeline {
 
         MessageTextCache.shared.set(attributed, for: cacheKey)
         return attributed
+    }
+
+    private static func textFingerprint(rawText: String?, entities: [TGTextEntity]?) -> Int {
+        var hasher = Hasher()
+        hasher.combine(rawText != nil)
+        hasher.combine(rawText ?? "")
+        if let entities {
+            for entity in entities {
+                hasher.combine(entity)
+            }
+        } else {
+            hasher.combine(0)
+        }
+        return hasher.finalize()
     }
 
     private static func applyEntities(

@@ -44,7 +44,7 @@ final class ChatMessagesViewModel: ObservableObject {
                        can_retry, retry_count, next_retry_at, edited_at, sending_id
                 FROM messages
                 WHERE chat_id = ?
-                ORDER BY message_id DESC
+                ORDER BY date DESC, message_id DESC
                 LIMIT ?
                 """,
                 arguments: [chatId, limit]

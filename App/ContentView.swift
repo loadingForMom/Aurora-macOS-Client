@@ -68,6 +68,7 @@ struct ContentView: View {
                 Group {
                     if let chat = selectedChat {
                         ChatScreen(store: store, chat: chat)
+                            .id(chat.id)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .toolbar {
                                 ToolbarItem(placement: .principal) {

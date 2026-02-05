@@ -30,7 +30,7 @@ extension TelegramStore {
         }
 
 #if DEBUG
-        log.debug("setTdlibParameters database_directory=\(dbDir.path, privacy: .public) files_directory=\(filesDir.path, privacy: .public) use_message_database=false use_chat_info_database=false use_file_database=false")
+        log.debug("setTdlibParameters database_directory=\(dbDir.path, privacy: .public) files_directory=\(filesDir.path, privacy: .public) use_message_database=true use_chat_info_database=true use_file_database=false")
 #endif
 
         let req: [String: Any] = [
