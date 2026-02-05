@@ -9,14 +9,8 @@ extension TelegramStore {
 
     func handleUpdate(_ upd: String) async {
         if let st = parseAuthState(from: upd) {
-            let previous = authState
             await MainActor.run {
-                authState = st
-                if st == "authorizationStateClosed" {
-                    resetSessionState()
-                } else if previous == "authorizationStateReady", st != "authorizationStateReady" {
-                    resetSessionState()
-                }
+                applyAuthorizationState(st)
             }
             log.info("auth state changed to \(st, privacy: .public)")
         }
@@ -49,7 +43,7 @@ extension TelegramStore {
 
         if authState == "authorizationStateReady", !didRequestInitialStorageStats {
             didRequestInitialStorageStats = true
-            refreshStorageStatistics()
+            await MainActor.run { refreshStorageStatistics() }
         }
         
         if authState == "authorizationStateWaitEncryptionKey" {
@@ -88,7 +82,7 @@ extension TelegramStore {
             await databaseBatchWriter.enqueue(.upsertUser(u))
 
             if let fid = myPhotoToDownload {
-                await downloadMyPhotoIfNeeded(fileId: fid)
+                await MainActor.run { downloadMyPhotoIfNeeded(fileId: fid) }
             }
         }
 
@@ -237,7 +231,7 @@ extension TelegramStore {
             }
             await databaseBatchWriter.enqueue(.upsertUser(me))
             if let fid = myPhotoToDownload {
-                await downloadMyPhotoIfNeeded(fileId: fid)
+                await MainActor.run { downloadMyPhotoIfNeeded(fileId: fid) }
             }
         }
 
@@ -246,8 +240,10 @@ extension TelegramStore {
             await databaseBatchWriter.enqueue(.upsertUser(user))
         }
 
-        if let storage = parseStorageStatisticsAny(resp) {
-            await MainActor.run { applyStorageStatistics(storage) }
+        await MainActor.run {
+            if let storage = parseStorageStatisticsAny(resp) {
+                applyStorageStatistics(storage)
+            }
         }
 
         // Response message with @extra

@@ -227,7 +227,9 @@ extension TelegramStore {
                 "clear_draft": true
             ]
         ]
-        sendJSON(req)
+        Task { @MainActor in
+            _ = sendIfAuthorized(req)
+        }
         markMessageSending(localId: localId)
     }
 
@@ -270,7 +272,9 @@ extension TelegramStore {
                 "clear_draft": true
             ]
         ]
-        sendJSON(req)
+        Task { @MainActor in
+            _ = sendIfAuthorized(req)
+        }
         markMessageSending(localId: localId)
     }
 
@@ -298,7 +302,9 @@ extension TelegramStore {
                 "chat_id": message.chatId,
                 "message_ids": [message.id]
             ]
-            sendJSON(req)
+            Task { @MainActor in
+                _ = sendIfAuthorized(req)
+            }
             return
         }
 
@@ -324,7 +330,9 @@ extension TelegramStore {
             "message_ids": messageIds,
             "revoke": revoke
         ]
-        sendJSON(req)
+        Task { @MainActor in
+            _ = sendIfAuthorized(req)
+        }
     }
 
     func _editMessageText_impl(chatId: Int64, messageId: Int64, newText: String) {
@@ -347,7 +355,9 @@ extension TelegramStore {
                 "clear_draft": false
             ]
         ]
-        sendJSON(req)
+        Task { @MainActor in
+            _ = sendIfAuthorized(req)
+        }
     }
 
     func optimisticInsertMessage(_ msg: TGMessage) {

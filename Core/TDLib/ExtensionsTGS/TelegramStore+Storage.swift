@@ -6,14 +6,22 @@ import Foundation
 
 extension TelegramStore {
 
-    func _refreshStorageStatistics_impl() {
-        let extra = "storage:full:\(UUID().uuidString)"
-        storageExtrasInFlight.insert(extra)
-
-        let req = storageManager.makeStorageStatisticsRequest(extra: extra)
-        sendJSON(req)
+    @MainActor
+    func cancelStorageRefreshTasks() {
+        guard !storageRefreshTasks.isEmpty else { return }
+        storageRefreshTasks.forEach { $0.cancel() }
+        storageRefreshTasks.removeAll(keepingCapacity: false)
     }
 
+    @MainActor
+    func _refreshStorageStatistics_impl() {
+        let extra = "storage:full:\(UUID().uuidString)"
+        let req = storageManager.makeStorageStatisticsRequest(extra: extra)
+        guard sendIfAuthorized(req) else { return }
+        storageExtrasInFlight.insert(extra)
+    }
+
+    @MainActor
     func _applyCacheLimitBytes_impl(_ bytes: Int64) {
         let clamped = max(0, bytes)
         cacheLimitBytes = clamped
@@ -21,24 +29,31 @@ extension TelegramStore {
         optimizeStorage(maxBytes: clamped)
     }
 
+    @MainActor
     func _clearAllCache_impl() {
         optimizeStorage(maxBytes: 0)
     }
 
+    @MainActor
     func optimizeStorage(maxBytes: Int64) {
         let extra = "storage:optimize:\(UUID().uuidString)"
-        storageExtrasInFlight.insert(extra)
-
         let req = storageManager.makeOptimizeStorageRequest(extra: extra, maxBytes: maxBytes)
 
-        sendJSON(req)
+        guard sendIfAuthorized(req) else { return }
+        storageExtrasInFlight.insert(extra)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            self?.refreshStorageStatistics()
+        cancelStorageRefreshTasks()
+        let t1 = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard isAuthorized else { return }
+            refreshStorageStatistics()
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-            self?.refreshStorageStatistics()
+        let t2 = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard isAuthorized else { return }
+            refreshStorageStatistics()
         }
+        storageRefreshTasks.append(contentsOf: [t1, t2])
     }
 
     func parseStorageStatisticsAny(_ upd: String) -> StorageManager.ParsedStorageStatistics? {

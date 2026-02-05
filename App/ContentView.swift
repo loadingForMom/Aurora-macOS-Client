@@ -268,7 +268,7 @@ private struct TelegramLoginView: View {
                     submitCodeIfPossible()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(authCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(!canSubmitCode)
             }
         case .password:
             VStack(alignment: .leading, spacing: 12) {
@@ -315,14 +315,26 @@ private struct TelegramLoginView: View {
     }
 
     private func submitCodeIfPossible() {
-        let trimmed = authCode.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        store.submitAuthCode(trimmed)
+        guard let code = sanitizedAuthCode() else { return }
+        store.submitAuthCode(code)
     }
 
     private func submitPasswordIfPossible() {
         let trimmed = password.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         store.submitAuthPassword(trimmed)
+    }
+
+    private var canSubmitCode: Bool {
+        sanitizedAuthCode() != nil
+    }
+
+    private func sanitizedAuthCode() -> String? {
+        let trimmed = authCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let compact = trimmed.filter { !$0.isWhitespace }
+        guard compact.allSatisfy({ $0.isNumber }) else { return nil }
+        guard (3...8).contains(compact.count) else { return nil }
+        return compact
     }
 }

@@ -28,6 +28,20 @@ extension TelegramStore {
         }
     }
 
+    @MainActor
+    @discardableResult
+    func sendIfAuthorized(_ obj: Any, typeOverride: String? = nil) -> Bool {
+        let type = typeOverride
+            ?? (obj as? [String: Any])?["@type"] as? String
+            ?? "unknown"
+        guard isAuthorized else {
+            log.info("Blocked TDLib request (not authorized yet): \(type, privacy: .public)")
+            return false
+        }
+        sendJSON(obj)
+        return true
+    }
+
     func parseTdError(_ resp: String) -> (code: Int, message: String, extra: String?)? {
         guard let obj = parseJSON(resp) else { return nil }
         guard (obj["@type"] as? String) == "error" else { return nil }
@@ -333,7 +347,7 @@ extension TelegramStore {
             "limit": 0,
             "synchronous": false
         ]
-        sendJSON(req)
+        _ = sendIfAuthorized(req)
     }
 
     func parseUpdateFilePathIfMyPhoto(_ upd: String) -> (Int32, String)? {

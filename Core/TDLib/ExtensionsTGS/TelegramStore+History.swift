@@ -95,7 +95,9 @@ extension TelegramStore {
             "limit": limit,
             "only_local": onlyLocal
         ]
-        sendJSON(req)
+        Task { @MainActor in
+            _ = sendIfAuthorized(req)
+        }
     }
 
 }

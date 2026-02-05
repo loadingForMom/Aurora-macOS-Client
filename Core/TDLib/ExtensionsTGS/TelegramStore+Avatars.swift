@@ -85,7 +85,10 @@ extension TelegramStore {
             fileId: fileId,
             priority: priority,
             requestedAvatarFileIds: &requestedAvatarFileIds,
-            sendJSON: sendJSON
+            sendJSON: { [weak self] req in
+                guard let self else { return }
+                _ = self.sendIfAuthorized(req)
+            }
         )
     }
 

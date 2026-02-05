@@ -3,6 +3,7 @@
 //
 
 import Foundation
+import os
 
 extension TelegramStore {
 
@@ -20,8 +21,12 @@ extension TelegramStore {
 
     func requestUserIfNeeded(_ userId: Int64?) async {
         guard let id = userId else { return }
-        let needsRequest = await MainActor.run { userCache[id] == nil }
+        let (needsRequest, authorized) = await MainActor.run { (userCache[id] == nil, isAuthorized) }
         guard needsRequest else { return }
+        guard authorized else {
+            log.info("Blocked TDLib request (not authorized yet): getUser")
+            return
+        }
         td.send(#"{"@type":"getUser","user_id":\#(id)}"#)
     }
 }

@@ -17,6 +17,7 @@ final class TelegramStore: ObservableObject {
     // MARK: - Core published state
 
     @Published var authState: String = "unknown"
+    @Published private(set) var isAuthorized: Bool = false
 
     @Published var selectedChatId: Int64?
     @Published var isLoadingHistory: Bool = false
@@ -38,6 +39,7 @@ final class TelegramStore: ObservableObject {
 
     let cacheLimitBytesKey = "aurora.cache_limit_bytes"
     var storageExtrasInFlight: Set<String> = []
+    var storageRefreshTasks: [Task<Void, Never>] = []
     var didRequestInitialStorageStats = false
     let storageManager = StorageManager()
 
@@ -185,10 +187,6 @@ final class TelegramStore: ObservableObject {
         return ""
     }
 
-    var isAuthorized: Bool {
-        authState == "authorizationStateReady"
-    }
-
     // MARK: - Public API (UI calls)
 
     func selectChat(_ chatId: Int64, forceReload: Bool = false) {
@@ -235,7 +233,9 @@ final class TelegramStore: ObservableObject {
             "message_ids": filteredIds,
             "force_read": forceRead
         ]
-        sendJSON(req)
+        Task { @MainActor in
+            _ = sendIfAuthorized(req)
+        }
     }
 
     func markChatAsReadToLatestIfNeeded(chatId: Int64) {
@@ -305,9 +305,9 @@ final class TelegramStore: ObservableObject {
     }
 
     // Storage (implemented in +Storage)
-    func refreshStorageStatistics() { _refreshStorageStatistics_impl() }
-    func applyCacheLimitBytes(_ bytes: Int64) { _applyCacheLimitBytes_impl(bytes) }
-    func clearAllCache() { _clearAllCache_impl() }
+    @MainActor func refreshStorageStatistics() { _refreshStorageStatistics_impl() }
+    @MainActor func applyCacheLimitBytes(_ bytes: Int64) { _applyCacheLimitBytes_impl(bytes) }
+    @MainActor func clearAllCache() { _clearAllCache_impl() }
 
     // Avatars/images (implemented in +Avatars)
     var myProfileNSImage: NSImage? { myProfileNSImage(pointSize: 36) }
@@ -331,7 +331,26 @@ final class TelegramStore: ObservableObject {
 
     // MARK: - Authorization
 
+    @MainActor
+    func applyAuthorizationState(_ newState: String) {
+        let previous = authState
+        authState = newState
+        isAuthorized = (newState == "authorizationStateReady")
+        if newState == "authorizationStateClosed" {
+            resetSessionState()
+        } else if previous == "authorizationStateReady", newState != "authorizationStateReady" {
+            resetSessionState()
+        }
+        if !isAuthorized {
+            cancelStorageRefreshTasks()
+        }
+    }
+
     func submitPhoneNumber(_ phoneNumber: String) {
+        guard authState == "authorizationStateWaitPhoneNumber" else {
+            log.info("Blocked TDLib request (unexpected auth state): setAuthenticationPhoneNumber")
+            return
+        }
         let req: [String: Any] = [
             "@type": "setAuthenticationPhoneNumber",
             "phone_number": phoneNumber
@@ -340,15 +359,27 @@ final class TelegramStore: ObservableObject {
     }
 
     func submitAuthCode(_ code: String) {
+        guard authState == "authorizationStateWaitCode" else {
+            log.info("Blocked TDLib request (unexpected auth state): checkAuthenticationCode")
+            return
+        }
+        guard let cleanCode = sanitizeAuthCode(code) else {
+            log.info("Blocked TDLib request (invalid auth code format): checkAuthenticationCode")
+            return
+        }
         let req: [String: Any] = [
             "@type": "checkAuthenticationCode",
-            "code": code
+            "code": cleanCode
         ]
         log.info("submit auth code")
         sendJSON(req)
     }
 
     func submitAuthPassword(_ password: String) {
+        guard authState == "authorizationStateWaitPassword" else {
+            log.info("Blocked TDLib request (unexpected auth state): checkAuthenticationPassword")
+            return
+        }
         let req: [String: Any] = [
             "@type": "checkAuthenticationPassword",
             "password": password
@@ -356,15 +387,23 @@ final class TelegramStore: ObservableObject {
         sendJSON(req)
     }
 
+    private func sanitizeAuthCode(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let compact = trimmed.filter { !$0.isWhitespace }
+        guard compact.allSatisfy({ $0.isNumber }) else { return nil }
+        guard (3...8).contains(compact.count) else { return nil }
+        return compact
+    }
+
     @MainActor
     func logOut() {
-        authState = "authorizationStateLoggingOut"
-        resetSessionState()
         sendJSON(["@type": "logOut"])
     }
 
     @MainActor
     func resetSessionState() {
+        isAuthorized = false
         userCache = [:]
         selectedChatId = nil
         isLoadingHistory = false
