@@ -1,0 +1,17 @@
+Feb  5 16:49:56 MacBook-Air-admin com.apple.dt.xcodebuild[28262] <Error>: Unable to deliver request ({
+	    "developer_dir" = "/Applications/Xcode.app/Contents/Developer";
+	    request = "set_developer_dir";
+	}) because we are not connected to CoreSimulatorService.
+Feb  5 16:49:57 MacBook-Air-admin com.apple.dt.xcodebuild[28262] <Warning>: Unable to discover any Simulator runtimes. Developer Directory is /Applications/Xcode.app/Contents/Developer.
+Feb  5 16:49:57 MacBook-Air-admin com.apple.dt.xcodebuild[28262] <Error>: Could not kickstart simdiskimaged; SimDiskImageManager services will not be available: Error Domain=NSPOSIXErrorDomain Code=53 "Software caused connection abort" UserInfo={NSLocalizedDescription=Error returned in reply from CoreSimulatorService: Connection invalid}
+Feb  5 16:49:57 MacBook-Air-admin com.apple.dt.xcodebuild[28262] <Error>: simdiskimaged returned error (invalid), marking disconnected.
+Feb  5 16:49:57 MacBook-Air-admin com.apple.dt.xcodebuild[28262] <Error>: Unable to deliver request ({
+	    request = "notification_subscription";
+	    "set_path" = "/Users/admin/Library/Developer/CoreSimulator/Devices";
+	}) because we are not connected to CoreSimulatorService.
+Feb  5 16:49:57 MacBook-Air-admin com.apple.dt.xcodebuild[28262] <Error>: Could not get list of trusted mount directories: Error Domain=com.apple.CoreSimulator.SimError Code=410 "The service used to manage runtime disk images (simdiskimaged) crashed or is not responding" UserInfo={NSLocalizedDescription=The service used to manage runtime disk images (simdiskimaged) crashed or is not responding}
+Feb  5 16:49:57 MacBook-Air-admin com.apple.dt.xcodebuild[28262] <Error>: simdiskimaged returned error (invalid), marking disconnected.
+Feb  5 16:49:57 MacBook-Air-admin com.apple.dt.xcodebuild[28262] <Error>: Unable to deliver request ({
+	    request = "notification_subscription";
+	    "set_path" = "/Users/admin/Library/Developer/CoreSimulator/Devices";
+	}) because we are not connected to CoreSimulatorService.

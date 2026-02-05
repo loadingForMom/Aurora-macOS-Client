@@ -18,6 +18,8 @@ struct MessagesPane: View {
     let chat: TGChat
     @ObservedObject var viewModel: ChatMessagesViewModel
 
+    @Environment(\.isLiveResizing) private var isLiveResizing
+
     @State private var pagingEnabled: Bool = false
     @State private var pagingInFlight: Bool = false
     @State private var restoreAnchorGroupId: String? = nil
@@ -400,9 +402,11 @@ struct MessagesPane: View {
                     let offsetY = -minY
                     let delta = offsetY - lastScrollOffsetY
                     lastScrollOffsetY = offsetY
+                    guard !isLiveResizing else { return }
                     pushJellyImpulse(delta: delta)
                 }
                 .onPreferenceChange(GroupFrameKey.self) { frames in
+                    guard !isLiveResizing else { return }
                     scheduleVisibleGroupsUpdate(
                         frames: frames,
                         groupMessageBounds: groupMessageBounds,
@@ -414,6 +418,14 @@ struct MessagesPane: View {
                 }
                 .onChange(of: containerGeo.size.height) { _, newH in
                     jellyContainerHeight = newH
+                }
+                .onChange(of: isLiveResizing) { _, live in
+                    if live {
+                        pendingGroupFrameUpdate?.cancel()
+                        pendingGroupFrameUpdate = nil
+                        jellyDecayTask?.cancel()
+                        jellyDecayTask = nil
+                    }
                 }
                 .overlay(alignment: .bottomTrailing) {
                     if newIncomingCount > 0 && !isAtBottom {

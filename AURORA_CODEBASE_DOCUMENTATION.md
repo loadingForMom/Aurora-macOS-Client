@@ -348,6 +348,7 @@ Key features:
 **Coalescing/debouncing**:
 - Visible group frames are updated via preference keys. These updates are **coalesced** using a `Task` that sleeps 16ms to avoid SwiftUI “publishing during update” warnings.
 - `ViewMessagesDebouncer` debounces read receipts by 0.2s.
+- During window live resize, the app overlays a cached snapshot and `MessagesPane` suppresses geometry-driven updates to prevent message “jumping” while dragging.
 
 **State breakdown**:
 - `@State` in `MessagesPane` includes UI-only values such as paging flags, scrolling anchors, cached rows, and view visibility state. These are kept local to avoid churning `@Published` store state.

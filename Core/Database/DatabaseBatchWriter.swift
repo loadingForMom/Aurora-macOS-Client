@@ -45,7 +45,7 @@ actor DatabaseBatchWriter {
         pending.removeAll(keepingCapacity: true)
         guard !operations.isEmpty else { return }
 
-        repository.apply(operations: operations)
+        await repository.apply(operations: operations)
         log.debug("flushed \(operations.count, privacy: .public) db operations")
     }
 }
