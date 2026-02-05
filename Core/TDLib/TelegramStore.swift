@@ -259,17 +259,38 @@ final class TelegramStore: ObservableObject {
         }
 #endif
         guard !filteredIds.isEmpty else { return }
-        sendViewMessagesNow(chatId: chatId, messageIds: filteredIds, forceRead: forceRead)
+        sendViewMessagesNow(
+            chatId: chatId,
+            messageIds: filteredIds,
+            forceRead: forceRead,
+            reason: "fromDirectViewMessages"
+        )
     }
 
     func reportVisibleMessages(chatId: Int64, minMessageId: Int64?, maxMessageId: Int64?, messageIds: [Int64]) {
+        let sortedIds = messageIds.filter { $0 > 0 }.sorted()
+        let lo = minMessageId.map(String.init) ?? "n/a"
+        let hi = maxMessageId.map(String.init) ?? "n/a"
+        let firstId = sortedIds.first.map(String.init) ?? "n/a"
+        let lastId = sortedIds.last.map(String.init) ?? "n/a"
+        SwiftUIPublishTrace.storeEvent(
+            name: "viewMessages_requested",
+            chatId: chatId,
+            details: "range=\(lo)..\(hi) count=\(sortedIds.count) first=\(firstId) last=\(lastId)",
+            reason: "fromVisibleRange"
+        )
         viewMessagesCoordinator.schedule(
             chatId: chatId,
             minMessageId: minMessageId,
             maxMessageId: maxMessageId,
             messageIds: messageIds
         ) { [weak self] scheduledChatId, ids in
-            self?.sendViewMessagesNow(chatId: scheduledChatId, messageIds: ids, forceRead: false)
+            self?.sendViewMessagesNow(
+                chatId: scheduledChatId,
+                messageIds: ids,
+                forceRead: false,
+                reason: "fromVisibleRange"
+            )
         }
     }
 
@@ -281,7 +302,16 @@ final class TelegramStore: ObservableObject {
         viewMessagesCoordinator.resetAll()
     }
 
-    func sendViewMessagesNow(chatId: Int64, messageIds: [Int64], forceRead: Bool) {
+    func sendViewMessagesNow(chatId: Int64, messageIds: [Int64], forceRead: Bool, reason: String) {
+        let sortedIds = messageIds.filter { $0 > 0 }.sorted()
+        let firstId = sortedIds.first.map(String.init) ?? "n/a"
+        let lastId = sortedIds.last.map(String.init) ?? "n/a"
+        SwiftUIPublishTrace.storeEvent(
+            name: "viewMessages_sent",
+            chatId: chatId,
+            details: "count=\(sortedIds.count) first=\(firstId) last=\(lastId) forceRead=\(forceRead)",
+            reason: reason
+        )
         let req: [String: Any] = [
             "@type": "viewMessages",
             "chat_id": chatId,
@@ -661,25 +691,57 @@ final class MainThreadPublishDebouncer<Value: Equatable> {
         self.delay = delay
     }
 
-    func schedule(value: Value, publish: @escaping @MainActor (Value) -> Void) {
+    func schedule(
+        value: Value,
+        chatId: Int64? = nil,
+        source: String,
+        publish: @escaping @MainActor (Value) -> Void
+    ) {
         queue.async { [weak self] in
             guard let self else { return }
             if self.pendingValue == value {
                 return
             }
             self.pendingValue = value
+            let details = self.traceDetails(for: value)
+            SwiftUIPublishTrace.storeEvent(
+                name: "publish_scheduled",
+                chatId: chatId,
+                details: "source=\(source) delayMs=\(Int((self.delay * 1_000).rounded())) \(details)",
+                reason: "debouncer"
+            )
             self.workItem?.cancel()
             let item = DispatchWorkItem { [weak self] in
                 guard let self, let snapshot = self.pendingValue else { return }
                 self.pendingValue = nil
                 Task { @MainActor in
                     await Task.yield()
+                    SwiftUIPublishTrace.storeEvent(
+                        name: "publish_fire",
+                        chatId: chatId,
+                        details: "source=\(source) \(self.traceDetails(for: snapshot))",
+                        reason: "debouncer"
+                    )
                     publish(snapshot)
                 }
             }
             self.workItem = item
             self.queue.asyncAfter(deadline: .now() + self.delay, execute: item)
         }
+    }
+
+    private func traceDetails(for value: Value) -> String {
+        if let chats = value as? [TGChat] {
+            let firstId = chats.first.map(\.id).map(String.init) ?? "n/a"
+            let lastId = chats.last.map(\.id).map(String.init) ?? "n/a"
+            return "count=\(chats.count) first=\(firstId) last=\(lastId)"
+        }
+        if let messages = value as? [TGMessage] {
+            let firstId = messages.first.map(\.id).map(String.init) ?? "n/a"
+            let lastId = messages.last.map(\.id).map(String.init) ?? "n/a"
+            return "count=\(messages.count) first=\(firstId) last=\(lastId)"
+        }
+        return "valueType=\(String(describing: Value.self))"
     }
 
     func cancel() {
@@ -723,13 +785,26 @@ final class ViewMessagesCoordinator {
     ) {
         let filteredIds = messageIds.filter { $0 > 0 }
         guard !filteredIds.isEmpty else { return }
+        let sortedInputIds = filteredIds.sorted()
         let range: RangeSignature? = {
             guard let min = minMessageId, let max = maxMessageId, min > 0, max > 0 else { return nil }
             return RangeSignature(minId: min, maxId: max)
         }()
+        let inputRangeText: String = {
+            guard let range else { return "n/a..n/a" }
+            return "\(range.minId)..\(range.maxId)"
+        }()
 
         queue.async { [weak self] in
             guard let self else { return }
+            let inputFirst = sortedInputIds.first.map(String.init) ?? "n/a"
+            let inputLast = sortedInputIds.last.map(String.init) ?? "n/a"
+            SwiftUIPublishTrace.storeEvent(
+                name: "viewMessages_requested",
+                chatId: chatId,
+                details: "source=ViewMessagesCoordinator_enqueue range=\(inputRangeText) count=\(sortedInputIds.count) first=\(inputFirst) last=\(inputLast)",
+                reason: "fromVisibleRange"
+            )
             var state = self.pendingByChat[chatId] ?? PendingState(range: nil, messageIds: [], workItem: nil)
             state.range = range
             state.messageIds.formUnion(filteredIds)
@@ -757,6 +832,14 @@ final class ViewMessagesCoordinator {
 
                 let ids = unseen.sorted()
                 guard !ids.isEmpty else { return }
+                let firstId = ids.first.map(String.init) ?? "n/a"
+                let lastId = ids.last.map(String.init) ?? "n/a"
+                SwiftUIPublishTrace.storeEvent(
+                    name: "viewMessages_sent",
+                    chatId: chatId,
+                    details: "source=ViewMessagesCoordinator_fire rangeChanged=\(rangeChanged) count=\(ids.count) first=\(firstId) last=\(lastId)",
+                    reason: "fromVisibleRange"
+                )
                 send(chatId, ids)
             }
 
@@ -1073,6 +1156,12 @@ actor MessageStore {
     private func schedulePublish(chatId: Int64) {
         guard var chat = chatStateById[chatId] else { return }
         chat.publishTask?.cancel()
+        SwiftUIPublishTrace.storeEvent(
+            name: "publish_scheduled",
+            chatId: chatId,
+            details: "source=MessageStore delayMs=\(publishDebounceNs / 1_000_000) subscribers=\(chat.continuations.count)",
+            reason: "messageStore"
+        )
         chat.publishTask = Task { [weak self] in
             guard let self else { return }
             try? await Task.sleep(nanoseconds: self.publishDebounceNs)
@@ -1085,10 +1174,24 @@ actor MessageStore {
         guard var chat = chatStateById[chatId] else { return }
         chat.publishTask = nil
         let newSnapshot = snapshot(for: chat)
+        let firstId = newSnapshot.first.map(\.id).map(String.init) ?? "n/a"
+        let lastId = newSnapshot.last.map(\.id).map(String.init) ?? "n/a"
+        SwiftUIPublishTrace.storeEvent(
+            name: "snapshot_ready",
+            chatId: chatId,
+            details: "source=MessageStore count=\(newSnapshot.count) first=\(firstId) last=\(lastId) subscribers=\(chat.continuations.count)",
+            reason: "messageSnapshotStream"
+        )
         guard newSnapshot != chat.lastPublishedSnapshot else {
             chatStateById[chatId] = chat
             return
         }
+        SwiftUIPublishTrace.storeEvent(
+            name: "publish_fire",
+            chatId: chatId,
+            details: "source=MessageStore count=\(newSnapshot.count) subscribers=\(chat.continuations.count)",
+            reason: "messageSnapshotStream"
+        )
         chat.lastPublishedSnapshot = newSnapshot
         let continuations = chat.continuations.values
         chatStateById[chatId] = chat

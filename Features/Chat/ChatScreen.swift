@@ -31,6 +31,12 @@ struct ChatScreen: View {
                     onSend: {
                         let t = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !t.isEmpty else { return }
+                        SwiftUIPublishTrace.uiEvent(
+                            name: "onSend_composer",
+                            chatId: chat.id,
+                            payload: "textLength=\(t.count)",
+                            reason: "uiCallback_sendMessage"
+                        )
                         store.sendText(chatId: chat.id, text: t)
                         draft = ""
                     }
@@ -39,8 +45,33 @@ struct ChatScreen: View {
                 .padding(.vertical, 12)
                 .background(.clear)
             }
+            .onAppear {
+                SwiftUIPublishTrace.uiEvent(
+                    name: "onAppear_chatScreen",
+                    chatId: chat.id,
+                    payload: "draftLength=\(draft.count)",
+                    reason: "viewLifecycle"
+                )
+            }
+            .onDisappear {
+                SwiftUIPublishTrace.uiEvent(
+                    name: "onDisappear_chatScreen",
+                    chatId: chat.id,
+                    payload: "draftLength=\(draft.count)",
+                    reason: "viewLifecycle"
+                )
+            }
             .task(id: chat.id) {
+                SwiftUIPublishTrace.uiEvent(
+                    name: "onChange_selectedChat",
+                    chatId: chat.id,
+                    payload: "chatId=\(chat.id)",
+                    reason: "fromSelectionChange"
+                )
                 draft = ""
+            }
+            .transaction { _ in
+                ViewUpdatePhaseTracker.shared.markUpdating(source: "ChatScreen")
             }
     }
 }

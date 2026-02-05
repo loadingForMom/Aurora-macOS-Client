@@ -100,10 +100,22 @@ struct ContentView: View {
             }
             .task {
                 if let id = store.selectedChatId {
+                    SwiftUIPublishTrace.uiEvent(
+                        name: "task_restoreSelectedChat",
+                        chatId: id,
+                        payload: "chatId=\(id)",
+                        reason: "fromSelectionChange"
+                    )
                     store.selectChat(id, forceReload: false)
                 }
             }
-            .onChange(of: store.selectedChatId) { _, newChatId in
+            .onChange(of: store.selectedChatId) { oldChatId, newChatId in
+                SwiftUIPublishTrace.uiEvent(
+                    name: "onChange_selectedChat",
+                    chatId: newChatId ?? oldChatId,
+                    payload: "old=\(oldChatId.map(String.init) ?? "n/a") new=\(newChatId.map(String.init) ?? "n/a")",
+                    reason: "fromSelectionChange"
+                )
                 guard let id = newChatId else { return }
                 store.selectChat(id)
             }
@@ -117,9 +129,13 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             store.flushDatabaseNow()
+            SwiftUIPublishTrace.emitSummary()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { _ in
             store.flushDatabaseNow()
+        }
+        .transaction { _ in
+            ViewUpdatePhaseTracker.shared.markUpdating(source: "ContentView")
         }
     }
 }

@@ -61,6 +61,11 @@
             value = "bbfbf06d0895594a6a38ba0cd1c67949"
             isEnabled = "YES">
          </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "TRACE_SWIFTUI_PUBLISH"
+            value = "1"
+            isEnabled = "YES">
+         </EnvironmentVariable>
       </EnvironmentVariables>
    </LaunchAction>
    <ProfileAction

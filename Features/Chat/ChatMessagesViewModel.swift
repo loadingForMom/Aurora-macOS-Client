@@ -52,9 +52,28 @@ final class ChatMessagesViewModel: ObservableObject {
             let stream = await store.messageSnapshotStream(chatId: chatId, windowSize: initialWindow)
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
-                await debouncer.schedule(value: snapshot) { [weak self] debouncedSnapshot in
+                SwiftUIPublishTrace.storeEvent(
+                    name: "snapshot_ready",
+                    chatId: chatId,
+                    details: "source=messageSnapshotStream count=\(snapshot.count)",
+                    reason: "fromSnapshotStream"
+                )
+                await debouncer.schedule(
+                    value: snapshot,
+                    chatId: chatId,
+                    source: "ChatMessagesViewModel.messages"
+                ) { [weak self] debouncedSnapshot in
                     guard let self else { return }
                     self.applyCount += 1
+                    let isViewUpdating = ViewUpdatePhaseTracker.shared.isViewUpdating
+                    SwiftUIPublishTrace.publishVM(
+                        vm: "ChatMessagesViewModel",
+                        property: "messages",
+                        chatId: self.chatId,
+                        newCount: debouncedSnapshot.count,
+                        reason: "fromSnapshotStream",
+                        isViewUpdating: isViewUpdating
+                    )
                     self.messages = debouncedSnapshot
                     AuroraRuntimeMetrics.shared.incrementPublish("chatMessages")
 #if DEBUG

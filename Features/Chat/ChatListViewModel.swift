@@ -40,9 +40,28 @@ final class ChatListViewModel: ObservableObject {
                 receiveCompletion: { _ in },
                 receiveValue: { [weak self] newChats in
                     guard let self else { return }
-                    self.publishDebouncer.schedule(value: newChats) { [weak self] snapshot in
+                    SwiftUIPublishTrace.storeEvent(
+                        name: "snapshot_ready",
+                        chatId: nil,
+                        details: "source=chatListSnapshot count=\(newChats.count)",
+                        reason: "fromDBObserver"
+                    )
+                    self.publishDebouncer.schedule(
+                        value: newChats,
+                        chatId: nil,
+                        source: "ChatListViewModel.chats"
+                    ) { [weak self] snapshot in
                         guard let self else { return }
                         self.applyCount += 1
+                        let isViewUpdating = ViewUpdatePhaseTracker.shared.isViewUpdating
+                        SwiftUIPublishTrace.publishVM(
+                            vm: "ChatListViewModel",
+                            property: "chats",
+                            chatId: nil,
+                            newCount: snapshot.count,
+                            reason: "fromDBObserver",
+                            isViewUpdating: isViewUpdating
+                        )
                         self.chats = snapshot
                         AuroraRuntimeMetrics.shared.incrementPublish("chatList")
 #if DEBUG

@@ -157,6 +157,17 @@ struct MessagesPane: View {
             .flatMap { $0 }
 
         guard !messageIds.isEmpty else { return }
+        let sortedIds = messageIds.sorted()
+        let firstId = sortedIds.first.map(String.init) ?? "n/a"
+        let lastId = sortedIds.last.map(String.init) ?? "n/a"
+        let lo = minMessageId.map(String.init) ?? "n/a"
+        let hi = maxMessageId.map(String.init) ?? "n/a"
+        SwiftUIPublishTrace.uiEvent(
+            name: "onPreferenceChange_visibleRange",
+            chatId: chat.id,
+            payload: "range=\(lo)..\(hi) count=\(sortedIds.count) visibleIdsCount=\(sortedIds.count) first=\(firstId) last=\(lastId)",
+            reason: "fromVisibleRange"
+        )
         store.reportVisibleMessages(
             chatId: chat.id,
             minMessageId: minMessageId,
@@ -176,6 +187,18 @@ struct MessagesPane: View {
         let visibilityChanged = currentVisible != lastVisibleGroupIds
         if visibilityChanged {
             lastVisibleGroupIds = currentVisible
+            let visibleIds = currentVisible
+                .compactMap { groupMessageIds[$0] }
+                .flatMap { $0 }
+                .sorted()
+            let firstId = visibleIds.first.map(String.init) ?? "n/a"
+            let lastId = visibleIds.last.map(String.init) ?? "n/a"
+            SwiftUIPublishTrace.uiEvent(
+                name: "onChange_visibleMessageIds",
+                chatId: chat.id,
+                payload: "visibleIdsCount=\(visibleIds.count) first=\(firstId) last=\(lastId)",
+                reason: "fromVisibleRange"
+            )
         }
 
         let visibleBounds = currentVisible.compactMap { groupMessageBounds[$0] }
@@ -326,6 +349,12 @@ struct MessagesPane: View {
             )
             .id(g.id)
             .onAppear {
+                SwiftUIPublishTrace.uiEvent(
+                    name: "onAppear_messageGroup",
+                    chatId: chat.id,
+                    payload: "groupId=\(g.id) count=\(g.messages.count)",
+                    reason: "messageGroupVisibility"
+                )
                 visibleGroupIds.insert(g.id)
                 updateVisibleState(
                     groupIdsOrdered: groupIdsOrdered,
@@ -348,6 +377,12 @@ struct MessagesPane: View {
                 requestOlderHistory(anchorGroupId: anchorGroupId, anchorMessageId: anchorMessageId)
             }
             .onDisappear {
+                SwiftUIPublishTrace.uiEvent(
+                    name: "onDisappear_messageGroup",
+                    chatId: chat.id,
+                    payload: "groupId=\(g.id) count=\(g.messages.count)",
+                    reason: "messageGroupVisibility"
+                )
                 visibleGroupIds.remove(g.id)
                 updateVisibleState(
                     groupIdsOrdered: groupIdsOrdered,
@@ -399,10 +434,24 @@ struct MessagesPane: View {
                             .frame(height: 1)
                             .id(bottomSentinelId)
                             .onAppear {
+                                SwiftUIPublishTrace.uiEvent(
+                                    name: "onAppear_bottomSentinel",
+                                    chatId: chat.id,
+                                    payload: "isAtBottom=true incomingCount=\(newIncomingCount)",
+                                    reason: "scrollPosition"
+                                )
                                 isAtBottom = true
                                 if newIncomingCount != 0 { newIncomingCount = 0 }
                             }
-                            .onDisappear { isAtBottom = false }
+                            .onDisappear {
+                                SwiftUIPublishTrace.uiEvent(
+                                    name: "onDisappear_bottomSentinel",
+                                    chatId: chat.id,
+                                    payload: "isAtBottom=false",
+                                    reason: "scrollPosition"
+                                )
+                                isAtBottom = false
+                            }
                     }
                     .padding(.horizontal, 18)
                     .padding(.vertical, 14)
@@ -416,6 +465,12 @@ struct MessagesPane: View {
                     let offsetY = -minY
                     let delta = offsetY - lastScrollOffsetY
                     lastScrollOffsetY = offsetY
+                    SwiftUIPublishTrace.uiEvent(
+                        name: "onPreferenceChange_scrollOffset",
+                        chatId: chat.id,
+                        payload: "offsetY=\(Int(offsetY.rounded())) delta=\(Int(delta.rounded()))",
+                        reason: "scrollGeometryPreference"
+                    )
                     guard !isLiveResizing else { return }
                     pushJellyImpulse(delta: delta)
                 }
@@ -472,6 +527,12 @@ struct MessagesPane: View {
 #endif
                 }
                 .onAppear {
+                    SwiftUIPublishTrace.uiEvent(
+                        name: "onAppear_messagesPane",
+                        chatId: chat.id,
+                        payload: "initialCount=\(viewModel.messages.count)",
+                        reason: "viewLifecycle"
+                    )
                     // Build once; after that, scrolling should not re-run grouping.
                     applyWindowMessages(viewModel.messages, anchorGroupId: nil)
 
@@ -494,6 +555,12 @@ struct MessagesPane: View {
                     lastVisibleGroupIds = []
                 }
                 .onChange(of: chat.id) { oldChatId, _ in
+                    SwiftUIPublishTrace.uiEvent(
+                        name: "onChange_chatId",
+                        chatId: oldChatId,
+                        payload: "oldChatId=\(oldChatId) newChatId=\(chat.id)",
+                        reason: "fromSelectionChange"
+                    )
                     pagingEnabled = false
                     pagingInFlight = false
                     restoreAnchorGroupId = nil
@@ -522,9 +589,21 @@ struct MessagesPane: View {
                     visibleMaxMessageId = nil
                 }
                 .onDisappear {
+                    SwiftUIPublishTrace.uiEvent(
+                        name: "onDisappear_messagesPane",
+                        chatId: chat.id,
+                        payload: "visibleRange=\(debugId(visibleMinMessageId))..\(debugId(visibleMaxMessageId))",
+                        reason: "viewLifecycle"
+                    )
                     store.resetVisibleMessageTracking(chatId: chat.id)
                 }
                 .onChange(of: viewModel.messages) { _, newMessages in
+                    SwiftUIPublishTrace.uiEvent(
+                        name: "onChange_viewModelMessages",
+                        chatId: chat.id,
+                        payload: "count=\(newMessages.count)",
+                        reason: "fromSnapshotStream"
+                    )
                     applyWindowMessages(newMessages, anchorGroupId: restoreAnchorGroupId)
                 }
                 .onChange(of: messages.count) { _, newCount in
@@ -591,6 +670,9 @@ struct MessagesPane: View {
                 }
         }
         .id(chat.id)
+        .transaction { _ in
+            ViewUpdatePhaseTracker.shared.markUpdating(source: "MessagesPane")
+        }
         .background(Color(nsColor: .textBackgroundColor))
     }
 
