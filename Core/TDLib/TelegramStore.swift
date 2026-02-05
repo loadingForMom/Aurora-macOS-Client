@@ -116,6 +116,7 @@ final class TelegramStore: ObservableObject {
     }
 
     var pendingMetrics = PendingMetrics()
+    var pendingChatInfoRequests: Set<Int64> = []
 
     // MARK: - User cache (non-authoritative)
     // Нужно из extensions в других файлах
@@ -135,10 +136,24 @@ final class TelegramStore: ObservableObject {
         let generation: Int
     }
 
+    struct HistoryMetrics {
+        var requestsLocal = 0
+        var requestsRemote = 0
+        var responses = 0
+        var staleResponses = 0
+        var emptyResponses = 0
+        var olderResponsesWithoutOlder = 0
+        var accumulatedLatencyMs: Double = 0
+        var maxLatencyMs: Double = 0
+        var maxInFlightJobs = 0
+    }
+
     var historyJobs: [String: HistoryJob] = [:]
     var reachedHistoryStart: Set<Int64> = []
     var historyWindowLimitByChatId: [Int64: Int] = [:]
     var historyGenerationByChatId: [Int64: Int] = [:]
+    var historyRequestStartedAtNs: [String: UInt64] = [:]
+    var historyMetrics = HistoryMetrics()
 
     // MARK: - Init
 
@@ -192,13 +207,14 @@ final class TelegramStore: ObservableObject {
     func selectChat(_ chatId: Int64, forceReload: Bool = false) {
         let isSame = (selectedChatId == chatId)
         if !isSame { selectedChatId = chatId }
+        syncHistoryLoadingFlagForSelectedChat()
 
         Task { @MainActor [weak self] in
             guard let self else { return }
             if !forceReload, self.historyWindowLimitByChatId[chatId] != nil {
                 return
             }
-            if !forceReload, self.databaseRepository.messageCount(chatId: chatId) > 1 {
+            if !forceReload, self.databaseRepository.messageCount(chatId: chatId) > 0 {
                 return
             }
             self.loadInitialHistory(chatId: chatId)
@@ -432,6 +448,7 @@ final class TelegramStore: ObservableObject {
         serverMessageIdByLocalId = [:]
         nextLocalTempId = -1
         pendingMetrics = PendingMetrics()
+        pendingChatInfoRequests = []
 
         pendingCleanupTimer?.invalidate()
         pendingCleanupTimer = nil
@@ -440,6 +457,8 @@ final class TelegramStore: ObservableObject {
         reachedHistoryStart = []
         historyWindowLimitByChatId = [:]
         historyGenerationByChatId = [:]
+        historyRequestStartedAtNs = [:]
+        historyMetrics = HistoryMetrics()
 
         didLoadInitialData = false
         didSendTdlibParameters = false

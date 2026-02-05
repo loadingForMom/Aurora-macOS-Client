@@ -598,7 +598,7 @@ final class AppDatabaseRepository {
                            can_retry, retry_count, next_retry_at, edited_at, sending_id
                     FROM messages
                     WHERE chat_id = :chatId
-                    ORDER BY date DESC, message_id DESC
+                    ORDER BY (CASE WHEN message_id > 0 THEN message_id ELSE 9000000000000000000 + message_id END) DESC
                     LIMIT :limit
                     """,
                     arguments: StatementArguments([
@@ -636,19 +636,6 @@ final class AppDatabaseRepository {
     func fetchOlderMessages(chatId: Int64, beforeMessageId: Int64, limit: Int) -> [TGMessage] {
         do {
             return try dbWriter.read { db in
-                let beforeDate = try Int.fetchOne(
-                    db,
-                    sql: """
-                    SELECT date
-                    FROM messages
-                    WHERE chat_id = :chatId AND message_id = :before
-                    """,
-                    arguments: StatementArguments([
-                        "chatId": chatId,
-                        "before": beforeMessageId
-                    ])
-                )
-
                 let rows = try Row.fetchAll(
                     db,
                     sql: """
@@ -657,18 +644,14 @@ final class AppDatabaseRepository {
                            can_retry, retry_count, next_retry_at, edited_at, sending_id
                     FROM messages
                     WHERE chat_id = :chatId
-                    AND (
-                        (:beforeDate IS NULL AND message_id < :before)
-                        OR (date < :beforeDate)
-                        OR (date = :beforeDate AND message_id < :before)
-                    )
-                    ORDER BY date DESC, message_id DESC
+                    AND message_id > 0
+                    AND message_id < :before
+                    ORDER BY message_id DESC
                     LIMIT :limit
                     """,
                     arguments: StatementArguments([
                         "chatId": chatId,
                         "before": beforeMessageId,
-                        "beforeDate": beforeDate,
                         "limit": limit
                     ])
                 )
@@ -736,7 +719,7 @@ final class AppDatabaseRepository {
                            can_retry, retry_count, next_retry_at, edited_at, sending_id
                     FROM messages
                     WHERE chat_id = :chatId
-                    ORDER BY date DESC, message_id DESC
+                    ORDER BY (CASE WHEN message_id > 0 THEN message_id ELSE 9000000000000000000 + message_id END) DESC
                     LIMIT 1
                     """,
                     arguments: StatementArguments(["chatId": chatId])

@@ -15,38 +15,51 @@ extension TelegramStore {
             log.info("auth state changed to \(st, privacy: .public)")
         }
 
-        if let (chatId, lastMessage) = parseUpdateChatLastMessage(upd) {
+        if let update = parseUpdateChatLastMessage(upd) {
+            let chatId = update.chatId
+            if let order = update.order {
+                await databaseBatchWriter.enqueue(.updateChatOrder(chatId: chatId, order: order))
+            }
+
+            if let lastMessage = update.lastMessage {
 #if DEBUG
-            debugLogMessageEvent(label: "updateChatLastMessage", chatId: chatId, messageId: lastMessage.id)
+                debugLogMessageEvent(label: "updateChatLastMessage", chatId: chatId, messageId: lastMessage.id)
 #endif
-            await applyChatLastMessageUpdate(chatId: chatId, lastMessageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
-            await databaseBatchWriter.enqueue(.upsertMessage(lastMessage))
-            await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chatId, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date))
-            await keepOptimisticChatPreviewIfNeeded(chatId: chatId)
+                await applyChatLastMessageUpdate(chatId: chatId, lastMessageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date)
+                await databaseBatchWriter.enqueue(.upsertMessage(lastMessage))
+                await databaseBatchWriter.enqueue(.upsertChatLastMessage(chatId: chatId, messageId: lastMessage.id, preview: lastMessage.previewText, date: lastMessage.date))
+                await keepOptimisticChatPreviewIfNeeded(chatId: chatId)
+            } else if !pendingChatInfoRequests.contains(chatId) {
+                pendingChatInfoRequests.insert(chatId)
+                td.send(#"{"@type":"getChat","chat_id":\#(chatId)}"#)
+            }
         }
 
         if let (chatId, lastReadInboxMessageId, unreadCount) = parseUpdateChatReadInbox(upd) {
             await applyChatReadInboxUpdate(chatId: chatId, lastReadInboxMessageId: lastReadInboxMessageId, unreadCount: unreadCount)
         }
 
-        if authState == "authorizationStateWaitTdlibParameters", !didSendTdlibParameters {
+        let currentAuthState = await MainActor.run { authState }
+
+        if currentAuthState == "authorizationStateWaitTdlibParameters", !didSendTdlibParameters {
             if sendTdlibParametersIfPossible() {
                 didSendTdlibParameters = true
             }
         }
 
-        if authState == "authorizationStateReady", !didLoadInitialData {
+        if currentAuthState == "authorizationStateReady", !didLoadInitialData {
             didLoadInitialData = true
             td.send(#"{"@type":"getMe","@extra":"getMe"}"#)
             td.send(#"{"@type":"getChats","limit":200}"#)
+            td.send(#"{"@type":"loadChats","@extra":"loadChats:main","chat_list":{"@type":"chatListMain"},"limit":200}"#)
         }
 
-        if authState == "authorizationStateReady", !didRequestInitialStorageStats {
+        if currentAuthState == "authorizationStateReady", !didRequestInitialStorageStats {
             didRequestInitialStorageStats = true
             await MainActor.run { refreshStorageStatistics() }
         }
-        
-        if authState == "authorizationStateWaitEncryptionKey" {
+
+        if currentAuthState == "authorizationStateWaitEncryptionKey" {
             if let key = getOrCreateDatabaseEncryptionKey() {
                 let req: [String: Any] = [
                     "@type": "checkDatabaseEncryptionKey",
@@ -178,6 +191,11 @@ extension TelegramStore {
 #if DEBUG
             debugLogMessageEvent(label: "updateNewMessage", chatId: chatId, messageId: msg.id)
 #endif
+            if databaseRepository.fetchChat(chatId: chatId) == nil && !pendingChatInfoRequests.contains(chatId) {
+                pendingChatInfoRequests.insert(chatId)
+                td.send(#"{"@type":"getChat","chat_id":\#(chatId)}"#)
+            }
+
             await requestUserIfNeeded(msg.senderUserId)
 
             if await tryReconcileOutgoingPendingMessage(msg) {
@@ -194,8 +212,20 @@ extension TelegramStore {
 
     func handleResponse(_ resp: String) async {
         if let err = parseTdError(resp) {
+            if err.extra == "loadChats:main", err.code == 404 {
+#if DEBUG
+                log.debug("loadChats completed for chatListMain")
+#endif
+                return
+            }
             log.error("tdlib error code=\(err.code, privacy: .public) message=\(err.message, privacy: .public) extra=\(err.extra ?? "nil", privacy: .public)")
             return
+        }
+
+        if let obj = parseJSON(resp),
+           (obj["@type"] as? String) == "ok",
+           (obj["@extra"] as? String) == "loadChats:main" {
+            td.send(#"{"@type":"loadChats","@extra":"loadChats:main","chat_list":{"@type":"chatListMain"},"limit":200}"#)
         }
 
         if let ids = parseChatsResponse(resp) {
@@ -205,6 +235,7 @@ extension TelegramStore {
         }
 
         if let (chat, lastMessage, smallId, bigId, bestPath) = parseChatObject(resp) {
+            pendingChatInfoRequests.remove(chat.id)
             await databaseBatchWriter.enqueue(.upsertChat(chat))
             if let lastMessage {
                 await databaseBatchWriter.enqueue(.upsertMessage(lastMessage))
@@ -218,7 +249,8 @@ extension TelegramStore {
                 registerChatAvatar(chatId: chat.id, smallFileId: smallId, bigFileId: bigId, initialBestPath: bestPath)
             }
 
-            if selectedChatId == nil {
+            let shouldAutoSelect = await MainActor.run { selectedChatId == nil }
+            if shouldAutoSelect {
                 await MainActor.run { selectedChatId = chat.id }
                 loadInitialHistory(chatId: chat.id)
             }
@@ -271,16 +303,31 @@ extension TelegramStore {
                 log.debug("history discard extra=\(res.extra, privacy: .public) kind=\(String(describing: job.kind), privacy: .public)")
 #endif
                 historyJobs.removeValue(forKey: res.extra)
-                if selectedChatId == job.chatId {
-                    let loading = historyJobs.values.contains(where: { $0.chatId == job.chatId })
-                    await MainActor.run { isLoadingHistory = loading }
-                }
+                historyRequestStartedAtNs.removeValue(forKey: res.extra)
+                historyMetrics.staleResponses += 1
+                syncHistoryLoadingFlagForSelectedChat()
                 return
             }
+
+            let latencyMs: Double? = {
+                guard let startedAt = historyRequestStartedAtNs.removeValue(forKey: res.extra) else { return nil }
+                let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
+                return Double(elapsed) / 1_000_000.0
+            }()
+
+            historyMetrics.responses += 1
+            if res.messages.isEmpty {
+                historyMetrics.emptyResponses += 1
+            }
+            if let latencyMs {
+                historyMetrics.accumulatedLatencyMs += latencyMs
+                historyMetrics.maxLatencyMs = max(historyMetrics.maxLatencyMs, latencyMs)
+            }
+
 #if DEBUG
             let minId = res.messages.min(by: { $0.id < $1.id })?.id
             let maxId = res.messages.max(by: { $0.id < $1.id })?.id
-            log.debug("getChatHistory chatId=\(job.chatId, privacy: .public) anchorMessageId=\(job.anchorMessageId, privacy: .public) limit=\(job.requestedLimit, privacy: .public) returned=\(res.messages.count, privacy: .public) minId=\(minId ?? 0, privacy: .public) maxId=\(maxId ?? 0, privacy: .public)")
+            log.debug("getChatHistory chatId=\(job.chatId, privacy: .public) anchorMessageId=\(job.anchorMessageId, privacy: .public) limit=\(job.requestedLimit, privacy: .public) returned=\(res.messages.count, privacy: .public) minId=\(minId ?? 0, privacy: .public) maxId=\(maxId ?? 0, privacy: .public) latencyMs=\(latencyMs ?? -1, privacy: .public)")
 #endif
             for m in res.messages {
 #if DEBUG
@@ -290,17 +337,27 @@ extension TelegramStore {
                 // Per-message debug logging only; DB writes are batched below.
             }
 
-            if !res.messages.isEmpty {
-                await databaseBatchWriter.enqueue(.upsertMessages(res.messages))
+            let messagesToMerge: [TGMessage]
+            if job.kind == .older {
+                messagesToMerge = res.messages.filter { $0.id < job.anchorMessageId }
+            } else {
+                messagesToMerge = res.messages
             }
 
-            let senderIds = Set(res.messages.compactMap(\.senderUserId))
+            if !messagesToMerge.isEmpty {
+                await databaseBatchWriter.enqueue(.upsertMessages(messagesToMerge))
+            }
+
+            let senderIds = Set(messagesToMerge.compactMap(\.senderUserId))
             for senderId in senderIds {
                 await requestUserIfNeeded(senderId)
             }
 
-            if job.kind == .older && res.messages.isEmpty {
-                reachedHistoryStart.insert(job.chatId)
+            if job.kind == .older {
+                if messagesToMerge.isEmpty {
+                    reachedHistoryStart.insert(job.chatId)
+                    historyMetrics.olderResponsesWithoutOlder += 1
+                }
             }
 
             historyJobs.removeValue(forKey: res.extra)
@@ -338,10 +395,18 @@ extension TelegramStore {
                 await databaseBatchWriter.flushNow()
             }
 
-            if selectedChatId == job.chatId {
-                let loading = historyJobs.values.contains(where: { $0.chatId == job.chatId })
-                await MainActor.run { isLoadingHistory = loading }
+#if DEBUG
+            let metrics = historyMetrics
+            if metrics.responses % 20 == 0 {
+                let avgMs = metrics.responses > 0
+                    ? (metrics.accumulatedLatencyMs / Double(metrics.responses))
+                    : 0
+                log.debug(
+                    "history metrics localReq=\(metrics.requestsLocal, privacy: .public) remoteReq=\(metrics.requestsRemote, privacy: .public) resp=\(metrics.responses, privacy: .public) stale=\(metrics.staleResponses, privacy: .public) empty=\(metrics.emptyResponses, privacy: .public) noOlder=\(metrics.olderResponsesWithoutOlder, privacy: .public) avgMs=\(avgMs, privacy: .public) maxMs=\(metrics.maxLatencyMs, privacy: .public) maxInFlight=\(metrics.maxInFlightJobs, privacy: .public)"
+                )
             }
+#endif
+            syncHistoryLoadingFlagForSelectedChat()
         }
     }
 

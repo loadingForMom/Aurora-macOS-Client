@@ -568,9 +568,6 @@ struct MessagesPane: View {
                 .task(id: chat.id) {
                     guard !didInitialScrollToBottom else { return }
                     showAfterInitialJump = false
-                    
-                    // Kick off an initial load for this chat (local + remote).
-                    viewModel.loadOlder(pageSize: 80)
 
                     // Let SwiftUI finish initial layout passes.
                     await Task.yield()

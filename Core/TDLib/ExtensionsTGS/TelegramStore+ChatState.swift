@@ -8,6 +8,17 @@ import os
 extension TelegramStore {
 
     func applyChatLastMessageUpdate(chatId: Int64, lastMessageId: Int64, preview: String, date: Int) async {
+        if let current = databaseRepository.fetchChat(chatId: chatId) {
+            if current.lastMessageId > lastMessageId {
+                return
+            }
+            if current.lastMessageId == lastMessageId &&
+                current.lastMessagePreview == preview &&
+                current.lastMessageDate == date {
+                return
+            }
+        }
+
         await databaseBatchWriter.enqueue(
             .updateChatLastMessage(chatId: chatId, messageId: lastMessageId, preview: preview, date: date)
         )

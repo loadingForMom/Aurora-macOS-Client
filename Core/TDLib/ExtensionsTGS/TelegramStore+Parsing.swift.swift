@@ -149,13 +149,17 @@ extension TelegramStore {
 
     func parseChatOrder(_ obj: [String: Any]) -> Int64 {
         guard let positions = obj["positions"] as? [Any] else { return 0 }
+        return parseMainChatOrder(fromPositions: positions) ?? 0
+    }
+
+    func parseMainChatOrder(fromPositions positions: [Any]) -> Int64? {
         for p in positions {
             guard let dict = p as? [String: Any] else { continue }
             guard let list = dict["list"] as? [String: Any],
                   (list["@type"] as? String) == "chatListMain" else { continue }
             if let orderStr = dict["order"] as? String, let v = Int64(orderStr) { return v }
         }
-        return 0
+        return nil
     }
 
     func parseUpdateChatTitle(_ upd: String) -> (Int64, String)? {
@@ -177,13 +181,27 @@ extension TelegramStore {
         return (chatId, order)
     }
 
-    func parseUpdateChatLastMessage(_ upd: String) -> (Int64, TGMessage)? {
+    struct UpdateChatLastMessageParsed {
+        let chatId: Int64
+        let lastMessage: TGMessage?
+        let order: Int64?
+    }
+
+    func parseUpdateChatLastMessage(_ upd: String) -> UpdateChatLastMessageParsed? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "updateChatLastMessage" else { return nil }
         guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
-        guard let last = obj["last_message"] as? [String: Any] else { return nil }
-        guard let msg = parseMessageObject(last, expectedChatId: chatId) else { return nil }
-        return (chatId, msg)
+        let positions = obj["positions"] as? [Any] ?? []
+        let order = parseMainChatOrder(fromPositions: positions)
+
+        let lastMessage: TGMessage?
+        if let last = obj["last_message"] as? [String: Any] {
+            lastMessage = parseMessageObject(last, expectedChatId: chatId)
+        } else {
+            lastMessage = nil
+        }
+
+        return UpdateChatLastMessageParsed(chatId: chatId, lastMessage: lastMessage, order: order)
     }
 
     // MARK: - User objects
@@ -425,6 +443,7 @@ extension TelegramStore {
         let msgs = anyArr
             .compactMap { $0 as? [String: Any] }
             .compactMap { parseMessageObject($0) }
+            .sorted { $0.id > $1.id }
         return MessagesResponse(extra: extra, messages: msgs)
     }
 
