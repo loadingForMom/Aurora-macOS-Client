@@ -6,197 +6,62 @@ import Foundation
 
 extension TelegramStore {
 
-    func sortChronological(_ arr: [TGMessage]) -> [TGMessage] {
-        arr.sorted {
-            if $0.date != $1.date { return $0.date < $1.date }
-            return $0.id < $1.id
-        }
+    private func chatLastMessageOperations(
+        chatId: Int64,
+        messageId: Int64,
+        preview: String,
+        date: Int
+    ) -> [DatabaseOperation] {
+        [
+            .updateChatLastMessage(chatId: chatId, messageId: messageId, preview: preview, date: date),
+            .upsertChatLastMessage(chatId: chatId, messageId: messageId, preview: preview, date: date)
+        ]
     }
 
-    func appendMessage(_ msg: TGMessage, chatId: Int64) {
-        var arr = messagesByChatId[chatId] ?? []
-        if let idx = arr.firstIndex(where: { $0.id == msg.id }) {
-            arr[idx] = msg
-#if DEBUG
-            print("[Message][dedupe] chatId=\(chatId) replaced existing id=\(msg.id) (appendMessage)")
-#endif
-        } else {
-            if arr.contains(where: { $0.messageKey == msg.messageKey }) { return }
-            arr.append(msg)
-        }
-        arr = sortChronological(arr)
-        if arr.count > 800 { arr.removeFirst(arr.count - 800) }
-        messagesByChatId[chatId] = arr
-        persistMessage(msg)
-    }
+    func keepOptimisticChatPreviewIfNeeded(chatId: Int64) async {
+        guard let last = databaseRepository.fetchLatestMessage(chatId: chatId) else { return }
+        guard last.isOutgoing else { return }
+        if case .sent = last.sendState { return }
 
-    func replaceMessageIfExists(chatId: Int64, id: Int64, newMessage: TGMessage) -> Bool {
-        var arr = messagesByChatId[chatId] ?? []
-        guard let idx = arr.firstIndex(where: { $0.id == id }) else { return false }
-        arr[idx] = newMessage
-        arr = sortChronological(arr)
-        if arr.count > 800 { arr.removeFirst(arr.count - 800) }
-        messagesByChatId[chatId] = arr
-        persistMessage(newMessage)
-        return true
-    }
-
-    func removeMessageById(chatId: Int64, id: Int64) -> TGMessage? {
-        var arr = messagesByChatId[chatId] ?? []
-        var removed: TGMessage?
-        if let idx = arr.firstIndex(where: { $0.id == id }) {
-            removed = arr.remove(at: idx)
-            messagesByChatId[chatId] = arr
-        }
-        databaseRepository?.deleteMessages(chatId: chatId, messageIds: [id])
-        return removed
-    }
-
-    func replaceMessage(chatId: Int64, oldId: Int64, newMessage: TGMessage) {
-        var arr = messagesByChatId[chatId] ?? []
-        if let idx = arr.firstIndex(where: { $0.id == oldId }) {
-            arr[idx] = newMessage
-        } else {
-            arr.append(newMessage)
-        }
-        var deduped: [TGMessage] = []
-        var seenIds = Set<Int64>()
-        for msg in arr {
-            if msg.id == newMessage.id {
-                if !seenIds.contains(msg.id) {
-                    deduped.append(newMessage)
-                    seenIds.insert(msg.id)
-                }
-                continue
-            }
-            if seenIds.insert(msg.id).inserted {
-                deduped.append(msg)
-            }
-        }
-        arr = deduped
-        arr = sortChronological(arr)
-        if arr.count > 800 { arr.removeFirst(arr.count - 800) }
-        messagesByChatId[chatId] = arr
-        persistMessage(newMessage)
-#if DEBUG
-        let ids = arr.map(\.id)
-        assert(Set(ids).count == ids.count, "[Timeline] duplicate message ids after replace chatId=\(chatId)")
-#endif
-    }
-
-    // Merge (do not replace) to avoid dropping newer tail/optimistic rows when history windows arrive.
-    func mergeMessages(chatId: Int64, incoming: [TGMessage], windowLimit: Int?, reason: String) {
-        guard !incoming.isEmpty else { return }
-
-        let existing = messagesByChatId[chatId] ?? []
-        let beforeCount = existing.count
-        let beforeMax = existing.map(\.id).max() ?? 0
-
-        var byKey: [MessageKey: TGMessage] = [:]
-        var keyByLocalId: [UUID: MessageKey] = [:]
-        var keyById: [Int64: MessageKey] = [:]
-
-        for msg in existing where msg.chatId == chatId {
-            let key = msg.messageKey
-            byKey[key] = msg
-            keyById[msg.id] = key
-            if let localId = msg.localId {
-                keyByLocalId[localId] = key
-            }
-        }
-
-        func merge(existing: TGMessage, incoming: TGMessage) -> TGMessage {
-            var merged = incoming
-            if merged.localId == nil { merged.localId = existing.localId }
-            if merged.sendingId == nil { merged.sendingId = existing.sendingId }
-            return merged
-        }
-
-        for var msg in incoming where msg.chatId == chatId {
-            if let localId = localIdByTempMessageId[msg.id] ?? serverMessageIdByLocalId.first(where: { $0.value == msg.id })?.key {
-                if msg.localId == nil { msg.localId = localId }
-                if let existingKey = keyByLocalId[localId], existingKey != msg.messageKey {
-                    byKey.removeValue(forKey: existingKey)
-                }
-            }
-            if let existingKey = keyById[msg.id], existingKey != msg.messageKey {
-                byKey.removeValue(forKey: existingKey)
-            }
-
-            let key = msg.messageKey
-            if let existing = byKey[key] {
-                byKey[key] = merge(existing: existing, incoming: msg)
-            } else {
-                byKey[key] = msg
-            }
-            keyById[msg.id] = key
-        }
-
-        var merged = Array(byKey.values)
-        merged = sortChronological(merged)
-        if let windowLimit, merged.count > windowLimit {
-            merged.removeFirst(merged.count - windowLimit)
-        }
-        messagesByChatId[chatId] = merged
-
-#if DEBUG
-        if reason.hasPrefix("history") && beforeCount > 0 {
-            let existingKeys = Set(existing.map(\.messageKey))
-            let mergedKeys = Set(merged.map(\.messageKey))
-            assert(!existingKeys.isDisjoint(with: mergedKeys), "[HistoryMerge] chatId=\(chatId) replaced timeline during \(reason)")
-        }
-        let mergedIds = merged.map(\.id)
-        let mergedKeys = merged.map(\.messageKey)
-        assert(Set(mergedIds).count == mergedIds.count, "[HistoryMerge] chatId=\(chatId) duplicate message ids after merge")
-        assert(Set(mergedKeys).count == mergedKeys.count, "[HistoryMerge] chatId=\(chatId) duplicate message keys after merge")
-        let afterMax = merged.map(\.id).max() ?? 0
-        print("[HistoryMerge] chatId=\(chatId) reason=\(reason) count \(beforeCount)->\(merged.count) maxId \(beforeMax)->\(afterMax)")
-#endif
-    }
-
-    func keepOptimisticChatPreviewIfNeeded(chatId: Int64) {
-        guard let localLast = messagesByChatId[chatId]?.last else { return }
-        guard localLast.isOutgoing else { return }
-        if case .sent = localLast.sendState { return }
-
-        guard var c = chatsById[chatId] else { return }
-
-        switch localLast.sendState {
-        case .pending:
-            c.lastMessagePreview = "You: (sending…) \(localLast.previewText)"
-        case .sending:
-            c.lastMessagePreview = "You: (sending…) \(localLast.previewText)"
+        let preview: String
+        switch last.sendState {
+        case .pending, .sending:
+            preview = "You: (sending…) \(last.previewText)"
         case .failed:
-            c.lastMessagePreview = "You: (failed) \(localLast.previewText)"
+            preview = "You: (failed) \(last.previewText)"
         case .sent:
-            break
+            preview = last.previewText
         }
 
-        c.lastMessageDate = localLast.date
-        c.lastMessageId = localLast.id
-        chatsById[chatId] = c
-        persistChat(c)
-        persistChatLastMessage(chatId: chatId, messageId: localLast.id, preview: c.lastMessagePreview, date: localLast.date)
+        await databaseBatchWriter.enqueue(
+            chatLastMessageOperations(
+                chatId: chatId,
+                messageId: last.id,
+                preview: preview,
+                date: last.date
+            )
+        )
     }
 
-    func updateChatLastFromLocalTimeline(chatId: Int64) {
-        guard let last = messagesByChatId[chatId]?.last else { return }
-        if var c = chatsById[chatId] {
-            c.lastMessageId = last.id
-            c.lastMessageDate = last.date
-            switch last.sendState {
-            case .pending:
-                c.lastMessagePreview = "You: (sending…) \(last.previewText)"
-            case .sending:
-                c.lastMessagePreview = "You: (sending…) \(last.previewText)"
-            case .failed:
-                c.lastMessagePreview = "You: (failed) \(last.previewText)"
-            case .sent:
-                c.lastMessagePreview = last.previewText
-            }
-            chatsById[chatId] = c
-            persistChat(c)
-            persistChatLastMessage(chatId: chatId, messageId: last.id, preview: c.lastMessagePreview, date: last.date)
+    func updateChatLastFromLocalTimeline(chatId: Int64) async {
+        guard let last = databaseRepository.fetchLatestMessage(chatId: chatId) else { return }
+        let preview: String
+        switch last.sendState {
+        case .pending, .sending:
+            preview = "You: (sending…) \(last.previewText)"
+        case .failed:
+            preview = "You: (failed) \(last.previewText)"
+        case .sent:
+            preview = last.previewText
         }
+
+        await databaseBatchWriter.enqueue(
+            chatLastMessageOperations(
+                chatId: chatId,
+                messageId: last.id,
+                preview: preview,
+                date: last.date
+            )
+        )
     }
 }

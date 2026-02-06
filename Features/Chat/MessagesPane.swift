@@ -8,18 +8,20 @@
 import SwiftUI
 import Foundation
 import Combine
+import OSLog
 
 struct MessagesPane: View {
     static let scrollSpaceName = "Aurora.ChatScrollSpace"
+    private let log = Logger(subsystem: "com.aurora.app", category: "messages.pane")
 
     @ObservedObject var store: TelegramStore
     let chat: TGChat
+    @ObservedObject var viewModel: ChatMessagesViewModel
 
     @State private var pagingEnabled: Bool = false
     @State private var pagingInFlight: Bool = false
     @State private var restoreAnchorGroupId: String? = nil
-    @State private var lastPagingAnchor: String? = nil
-    @State private var showLogs: Bool = false
+    @State private var lastPagingAnchorKey: String? = nil
 
     // “Don’t annoy me” UX
     @State private var isAtBottom: Bool = true
@@ -28,14 +30,14 @@ struct MessagesPane: View {
 
     // Cache rows so scroll-driven state updates don't force regrouping work.
     @State private var cachedRows: [Row] = []
+    @State private var cachedGroupIdsOrdered: [String] = []
+    @State private var cachedGroupMessageBounds: [String: (min: Int64, max: Int64)] = [:]
+    @State private var cachedGroupMessageIds: [String: [Int64]] = [:]
     @State private var windowMessages: [TGMessage] = []
+    @State private var rowBuildTask: Task<Void, Never>? = nil
     @State private var windowApplyToken = UUID()
-    @State private var windowChatId: Int64? = nil
-    @State private var needsRepoRetry: Bool = false
-    @State private var viewedMessageIds = Set<Int64>()
+    @State private var visibleGroupIds = Set<String>()
     @State private var lastVisibleGroupIds = Set<String>()
-    @State private var viewMessagesDebouncer = ViewMessagesDebouncer()
-    @State private var pendingGroupFrameUpdate: Task<Void, Never>? = nil
 
     @State private var topVisibleGroupId: String? = nil
     @State private var topVisibleMessageId: Int64? = nil
@@ -50,7 +52,6 @@ struct MessagesPane: View {
 
     // Jelly / springy scrolling (macOS-safe)
     @State private var jellyScrollImpulse: CGFloat = 0
-    @State private var jellyContainerHeight: CGFloat = 0
     @State private var lastScrollOffsetY: CGFloat = 0
     @State private var jellyDecayTask: Task<Void, Never>? = nil
 
@@ -62,12 +63,13 @@ struct MessagesPane: View {
     // Grouping knobs
     private let groupGap: Int = 5 * 60
     private let majorGap: Int = 60 * 60
+    private static let rowBuildWorker = RowsBuildWorker()
 
     private var bottomSentinelId: String { "bottom:\(chat.id)" }
 
     // MARK: - Rows
 
-    private enum Row: Identifiable, Hashable {
+    private enum Row: Identifiable, Hashable, Sendable {
         case dayHeader(id: String, date: Date)
         case timeSeparator(id: String, date: Date)
         case group(MessageGroup)
@@ -81,6 +83,150 @@ struct MessagesPane: View {
         }
     }
 
+    private struct PreparedRows: Sendable {
+        let rows: [Row]
+        let groupIdsOrdered: [String]
+        let groupMessageBounds: [String: (min: Int64, max: Int64)]
+        let groupMessageIds: [String: [Int64]]
+    }
+
+    private actor RowsBuildWorker {
+        private let emptyPreparedRows = PreparedRows(
+            rows: [],
+            groupIdsOrdered: [],
+            groupMessageBounds: [:],
+            groupMessageIds: [:]
+        )
+
+        func build(
+            chatId: Int64,
+            messages: [TGMessage],
+            groupGap: Int,
+            majorGap: Int
+        ) -> PreparedRows {
+            guard !Task.isCancelled else { return emptyPreparedRows }
+            let rows = buildRows(chatId: chatId, messages: messages, groupGap: groupGap, majorGap: majorGap)
+            guard !Task.isCancelled else { return emptyPreparedRows }
+            let groupIdsOrdered: [String] = rows.compactMap {
+                if case .group(let g) = $0 { return g.id }
+                return nil
+            }
+            let maps = buildGroupMaps(rows: rows)
+            return PreparedRows(
+                rows: rows,
+                groupIdsOrdered: groupIdsOrdered,
+                groupMessageBounds: maps.0,
+                groupMessageIds: maps.1
+            )
+        }
+
+        private func buildRows(
+            chatId: Int64,
+            messages: [TGMessage],
+            groupGap: Int,
+            majorGap: Int
+        ) -> [Row] {
+            guard !messages.isEmpty else { return [] }
+
+            let calendar = Calendar.current
+            var rows: [Row] = []
+            var currentDay: Date? = nil
+
+            var bucket: [TGMessage] = []
+            var curSender: Int64? = nil
+            var curOutgoing: Bool = false
+            var lastUnix: Int? = nil
+
+            func flushBucket() {
+                guard let first = bucket.first else { return }
+                let group = MessageGroup(
+                    id: "\(chatId):g:\(first.chatId):\(first.id):\(first.localId?.uuidString ?? "nil")",
+                    isOutgoing: curOutgoing,
+                    senderUserId: curSender,
+                    messages: bucket
+                )
+                rows.append(.group(group))
+                bucket.removeAll(keepingCapacity: true)
+            }
+
+            func ensureDayHeader(unix: Int) {
+                let date = Date(timeIntervalSince1970: TimeInterval(unix))
+                let day = calendar.startOfDay(for: date)
+                if currentDay == nil || currentDay != day {
+                    flushBucket()
+                    currentDay = day
+                    let key = dayKey(day, calendar: calendar)
+                    rows.append(.dayHeader(id: "\(chatId):day:\(key)", date: day))
+                    lastUnix = nil
+                }
+            }
+
+            func maybeInsertMajorGap(prev: Int, next: Int) {
+                let gap = abs(next - prev)
+                guard gap >= majorGap else { return }
+                rows.append(.timeSeparator(id: "\(chatId):time:\(next)", date: Date(timeIntervalSince1970: TimeInterval(next))))
+            }
+
+            for message in messages {
+                if Task.isCancelled { return [] }
+                ensureDayHeader(unix: message.date)
+
+                if let prev = lastUnix {
+                    maybeInsertMajorGap(prev: prev, next: message.date)
+                }
+
+                if bucket.isEmpty {
+                    bucket = [message]
+                    curSender = message.senderUserId
+                    curOutgoing = message.isOutgoing
+                    lastUnix = message.date
+                    continue
+                }
+
+                let sameSender = (message.senderUserId == curSender)
+                let sameDirection = (message.isOutgoing == curOutgoing)
+                let close = abs(message.date - (bucket.last?.date ?? message.date)) <= groupGap
+
+                if sameSender && sameDirection && close {
+                    bucket.append(message)
+                } else {
+                    flushBucket()
+                    bucket = [message]
+                    curSender = message.senderUserId
+                    curOutgoing = message.isOutgoing
+                }
+
+                lastUnix = message.date
+            }
+
+            flushBucket()
+            return rows
+        }
+
+        private func buildGroupMaps(rows: [Row]) -> ([String: (min: Int64, max: Int64)], [String: [Int64]]) {
+            var bounds: [String: (min: Int64, max: Int64)] = [:]
+            var ids: [String: [Int64]] = [:]
+            bounds.reserveCapacity(rows.count)
+            ids.reserveCapacity(rows.count)
+            for row in rows {
+                if Task.isCancelled {
+                    return ([:], [:])
+                }
+                guard case let .group(group) = row else { continue }
+                let messageIds = group.messages.map(\.id)
+                guard let minId = messageIds.min(), let maxId = messageIds.max() else { continue }
+                bounds[group.id] = (minId, maxId)
+                ids[group.id] = messageIds
+            }
+            return (bounds, ids)
+        }
+
+        private func dayKey(_ day: Date, calendar: Calendar) -> String {
+            let components = calendar.dateComponents([.year, .month, .day], from: day)
+            return "\(components.year ?? 0)-\(components.month ?? 0)-\(components.day ?? 0)"
+        }
+    }
+
     // MARK: - Paging
 
     private func requestOlderHistory(anchorGroupId: String?, anchorMessageId: Int64?) {
@@ -90,52 +236,20 @@ struct MessagesPane: View {
         guard let anchorGroupId, let anchorMessageId else { return }
 
         // Prevent “double fire” when SwiftUI reuses/rebuilds the top area.
-        if lastPagingAnchor == anchorGroupId { return }
-        lastPagingAnchor = anchorGroupId
+        let key = "\(anchorGroupId):\(anchorMessageId)"
+        if lastPagingAnchorKey == key { return }
+        lastPagingAnchorKey = key
 
         restoreAnchorGroupId = anchorGroupId
         pagingInFlight = true
 
-        fetchOlderMessages(beforeMessageId: anchorMessageId, anchorGroupId: anchorGroupId)
-        DispatchQueue.main.async {
-            store.loadMoreHistory(chatId: chat.id, anchorMessageId: anchorMessageId)
+        let targetChatId = chat.id
+        Task { @MainActor [targetChatId, anchorMessageId] in
+            await Task.yield()
+            guard chat.id == targetChatId else { return }
+            viewModel.loadOlder(pageSize: 80)
+            store.loadMoreHistory(chatId: targetChatId, anchorMessageId: anchorMessageId)
         }
-    }
-
-    private func fetchLatestMessages() {
-        guard let repo = store.databaseRepository else {
-#if DEBUG
-            print("[DB WINDOW] fetchLatestMessages repo=nil chatId=\(chat.id)")
-#endif
-            DispatchQueue.main.async {
-                needsRepoRetry = true
-            }
-            return
-        }
-        if needsRepoRetry {
-            DispatchQueue.main.async {
-                needsRepoRetry = false
-            }
-        }
-        let limit = store.historyWindowLimitByChatId[chat.id] ?? 160
-        let latest = repo.fetchLatestMessages(chatId: chat.id, limit: limit)
-#if DEBUG
-        if latest.isEmpty {
-            print("[DB WINDOW] fetchLatestMessages returned 0 chatId=\(chat.id)")
-        }
-#endif
-        applyWindowMessages(store.sortChronological(latest), anchorGroupId: nil)
-    }
-
-    private func fetchOlderMessages(beforeMessageId: Int64, anchorGroupId: String) {
-        guard let repo = store.databaseRepository else { return }
-        let older = repo.fetchOlderMessages(chatId: chat.id, beforeMessageId: beforeMessageId, limit: 80)
-        guard !older.isEmpty else { return }
-        let sortedOlder = store.sortChronological(older)
-        let existingKeys = Set(windowMessages.map { $0.messageKey })
-        let filteredOlder = sortedOlder.filter { !existingKeys.contains($0.messageKey) }
-        guard !filteredOlder.isEmpty else { return }
-        applyWindowMessages(filteredOlder + windowMessages, anchorGroupId: anchorGroupId)
     }
 
     private func applyWindowMessages(_ messages: [TGMessage], anchorGroupId: String?) {
@@ -144,95 +258,119 @@ struct MessagesPane: View {
         let filtered = messages.filter { $0.chatId == expectedChatId }
         let dropped = messages.count - filtered.count
         if dropped > 0 {
-            print("[DB WINDOW] dropped \(dropped) messages not in chat \(expectedChatId)")
+            log.debug("dropped \(dropped, privacy: .public) messages not in chat \(expectedChatId, privacy: .public)")
         }
 
         if filtered.isEmpty, !messages.isEmpty {
 #if DEBUG
-            print("[DB WINDOW] fetchLatestMessages filtered out all rows chatId=\(expectedChatId)")
+            log.debug("filtered out all rows chatId=\(expectedChatId, privacy: .public)")
 #endif
         }
-        DispatchQueue.main.async { [token, expectedChatId, filtered] in
+        let shouldForceViewMessages = windowMessages.isEmpty
+        rowBuildTask?.cancel()
+        rowBuildTask = Task { @MainActor [token, expectedChatId, filtered, anchorGroupId, shouldForceViewMessages] in
+            let prepared = await Self.rowBuildWorker.build(
+                chatId: expectedChatId,
+                messages: filtered,
+                groupGap: groupGap,
+                majorGap: majorGap
+            )
+            guard !Task.isCancelled else { return }
             guard windowApplyToken == token else { return }
             guard chat.id == expectedChatId else { return }
             if let anchorGroupId {
                 restoreAnchorGroupId = anchorGroupId
             }
             windowMessages = filtered
-            cachedRows = buildRows(filtered)
-            windowChatId = expectedChatId
+            cachedRows = prepared.rows
+            cachedGroupIdsOrdered = prepared.groupIdsOrdered
+            cachedGroupMessageBounds = prepared.groupMessageBounds
+            cachedGroupMessageIds = prepared.groupMessageIds
+            updateVisibleState(
+                groupIdsOrdered: prepared.groupIdsOrdered,
+                groupMessageBounds: prepared.groupMessageBounds,
+                groupMessageIds: prepared.groupMessageIds,
+                forceViewMessages: shouldForceViewMessages
+            )
         }
     }
 
-    private func scheduleFetchLatestMessages(reason: String) {
-        let token = windowApplyToken
-        let chatId = chat.id
-#if DEBUG
-        print("[DB WINDOW] chatId=\(chatId) token=\(token) fetch scheduled (\(reason))")
-#endif
-        DispatchQueue.main.async { [token, chatId] in
-            guard windowApplyToken == token else { return }
-            guard chat.id == chatId else { return }
-            fetchLatestMessages()
-        }
-    }
+    private func reportVisibleRange(
+        minMessageId: Int64?,
+        maxMessageId: Int64?,
+        groupMessageIds: [String: [Int64]]
+    ) {
+        let groupIds = visibleGroupIds
+        guard !groupIds.isEmpty else { return }
 
-    private func scheduleViewMessages(_ messageIds: Set<Int64>) {
-        let unseen = messageIds.subtracting(viewedMessageIds)
-        guard !unseen.isEmpty else { return }
-        viewMessagesDebouncer.schedule(delay: 0.2) { [chatId = chat.id, unseen] in
-            store.viewMessages(chatId: chatId, messageIds: Array(unseen), forceRead: false)
-            viewedMessageIds.formUnion(unseen)
-        }
+        let messageIds = groupIds
+            .compactMap { groupMessageIds[$0] }
+            .flatMap { $0 }
+
+        guard !messageIds.isEmpty else { return }
+        let firstId = messageIds.min().map(String.init) ?? "n/a"
+        let lastId = messageIds.max().map(String.init) ?? "n/a"
+        let lo = minMessageId.map(String.init) ?? "n/a"
+        let hi = maxMessageId.map(String.init) ?? "n/a"
+        SwiftUIPublishTrace.uiEvent(
+            name: "onPreferenceChange_visibleRange",
+            chatId: chat.id,
+            payload: "range=\(lo)..\(hi) count=\(messageIds.count) visibleIdsCount=\(messageIds.count) first=\(firstId) last=\(lastId)",
+            reason: "fromVisibleRange"
+        )
+        store.reportVisibleMessages(
+            chatId: chat.id,
+            minMessageId: minMessageId,
+            maxMessageId: maxMessageId,
+            messageIds: messageIds
+        )
     }
 
     @MainActor
-    private func updateVisibleGroups(
-        frames: [String: CGRect],
+    private func updateVisibleState(
+        groupIdsOrdered: [String],
         groupMessageBounds: [String: (min: Int64, max: Int64)],
-        groupMessageIds: [String: [Int64]]
+        groupMessageIds: [String: [Int64]],
+        forceViewMessages: Bool = false
     ) {
-        let visibleGroups = frames.filter { $0.value.maxY >= 0 && $0.value.minY <= jellyContainerHeight }
-        let visibleGroupIds = Set(visibleGroups.keys)
-        let visibleBounds = visibleGroups.compactMap { groupMessageBounds[$0.key] }
+        let currentVisible = visibleGroupIds
+        let visibilityChanged = currentVisible != lastVisibleGroupIds
+        if visibilityChanged {
+            lastVisibleGroupIds = currentVisible
+            let visibleIds = currentVisible
+                .compactMap { groupMessageIds[$0] }
+                .flatMap { $0 }
+            let firstId = visibleIds.min().map(String.init) ?? "n/a"
+            let lastId = visibleIds.max().map(String.init) ?? "n/a"
+            SwiftUIPublishTrace.uiEvent(
+                name: "onChange_visibleMessageIds",
+                chatId: chat.id,
+                payload: "visibleIdsCount=\(visibleIds.count) first=\(firstId) last=\(lastId)",
+                reason: "fromVisibleRange"
+            )
+        }
 
+        let visibleBounds = currentVisible.compactMap { groupMessageBounds[$0] }
         let newMin = visibleBounds.map(\.min).min()
         let newMax = visibleBounds.map(\.max).max()
-        let newTopGroup = visibleGroups.min(by: { $0.value.minY < $1.value.minY })?.key
+        let newTopGroup = groupIdsOrdered.first(where: { currentVisible.contains($0) })
         let newTopMessageId = newTopGroup.flatMap { groupMessageBounds[$0]?.min }
 
-        let visibilityChanged = visibleGroupIds != lastVisibleGroupIds
         let boundsChanged = newMin != visibleMinMessageId || newMax != visibleMaxMessageId
         let anchorChanged = newTopGroup != topVisibleGroupId || newTopMessageId != topVisibleMessageId
 
-        guard visibilityChanged || boundsChanged || anchorChanged else { return }
+        if boundsChanged || anchorChanged {
+            visibleMinMessageId = newMin
+            visibleMaxMessageId = newMax
+            topVisibleGroupId = newTopGroup
+            topVisibleMessageId = newTopMessageId
+        }
 
-        lastVisibleGroupIds = visibleGroupIds
-        visibleMinMessageId = newMin
-        visibleMaxMessageId = newMax
-        topVisibleGroupId = newTopGroup
-        topVisibleMessageId = newTopMessageId
-
-        let visibleMessageIds = Set(visibleGroupIds.flatMap { groupMessageIds[$0] ?? [] })
-        scheduleViewMessages(visibleMessageIds)
-    }
-
-    private func scheduleVisibleGroupsUpdate(
-        frames: [String: CGRect],
-        groupMessageBounds: [String: (min: Int64, max: Int64)],
-        groupMessageIds: [String: [Int64]]
-    ) {
-        // Coalesce preference updates off the render pass to avoid SwiftUI "publishing during update" warnings.
-        pendingGroupFrameUpdate?.cancel()
-        let snapshotFrames = frames
-        let snapshotBounds = groupMessageBounds
-        let snapshotIds = groupMessageIds
-        pendingGroupFrameUpdate = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 16_000_000) // coalesce per-frame updates
-                updateVisibleGroups(
-                frames: snapshotFrames,
-                groupMessageBounds: snapshotBounds,
-                groupMessageIds: snapshotIds
+        if boundsChanged || forceViewMessages {
+            reportVisibleRange(
+                minMessageId: newMin,
+                maxMessageId: newMax,
+                groupMessageIds: groupMessageIds
             )
         }
     }
@@ -336,7 +474,13 @@ struct MessagesPane: View {
     // MARK: - Row rendering (helps compiler + performance)
 
     @ViewBuilder
-    private func rowView(_ row: Row, firstGroupId: String?) -> some View {
+    private func rowView(
+        _ row: Row,
+        firstGroupId: String?,
+        groupIdsOrdered: [String],
+        groupMessageBounds: [String: (min: Int64, max: Int64)],
+        groupMessageIds: [String: [Int64]]
+    ) -> some View {
         switch row {
         case .dayHeader(_, let day):
             DayHeaderView(day: day)
@@ -350,27 +494,54 @@ struct MessagesPane: View {
                 chat: chat,
                 group: g,
                 revealTimeX: revealTimeX,
-                jellyScrollImpulse: jellyScrollImpulse,
-                jellyContainerHeight: jellyContainerHeight
+                jellyScrollImpulse: jellyScrollImpulse
             )
             .id(g.id)
-            .background(
-                GeometryReader { geo in
-                    Color.clear.preference(
-                        key: GroupFrameKey.self,
-                        value: [g.id: geo.frame(in: .named(MessagesPane.scrollSpaceName))]
+            .onAppear {
+                SwiftUIPublishTrace.uiEvent(
+                    name: "onAppear_messageGroup",
+                    chatId: chat.id,
+                    payload: "groupId=\(g.id) count=\(g.messages.count)",
+                    reason: "messageGroupVisibility"
+                )
+                DispatchQueue.main.async {
+                    visibleGroupIds.insert(g.id)
+                    updateVisibleState(
+                        groupIdsOrdered: groupIdsOrdered,
+                        groupMessageBounds: groupMessageBounds,
+                        groupMessageIds: groupMessageIds
+                    )
+
+                    // Trigger paging only when we actually reach the top of what's loaded.
+                    guard pagingEnabled, !pagingInFlight, !store.isLoadingHistory else { return }
+
+                    // Never page during the initial hidden render / jump-to-bottom sequence.
+                    guard didInitialScrollToBottom, showAfterInitialJump else { return }
+
+                    guard let firstGroupId, g.id == firstGroupId else { return }
+                    // Don't page while user is already at the bottom (initial open / reading newest).
+                    guard !isAtBottom else { return }
+
+                    let anchorGroupId = topVisibleGroupId ?? g.id
+                    let anchorMessageId = topVisibleMessageId ?? g.messages.first?.id
+                    requestOlderHistory(anchorGroupId: anchorGroupId, anchorMessageId: anchorMessageId)
+                }
+            }
+            .onDisappear {
+                SwiftUIPublishTrace.uiEvent(
+                    name: "onDisappear_messageGroup",
+                    chatId: chat.id,
+                    payload: "groupId=\(g.id) count=\(g.messages.count)",
+                    reason: "messageGroupVisibility"
+                )
+                DispatchQueue.main.async {
+                    visibleGroupIds.remove(g.id)
+                    updateVisibleState(
+                        groupIdsOrdered: groupIdsOrdered,
+                        groupMessageBounds: groupMessageBounds,
+                        groupMessageIds: groupMessageIds
                     )
                 }
-            )
-            .onAppear {
-                // Trigger paging only when we actually reach the top of what's loaded.
-                guard pagingEnabled, !pagingInFlight, !store.isLoadingHistory else { return }
-                guard let firstGroupId, g.id == firstGroupId else { return }
-                // Don't page while user is already at the bottom (initial open / reading newest).
-                guard !isAtBottom else { return }
-                let anchorGroupId = topVisibleGroupId ?? g.id
-                let anchorMessageId = topVisibleMessageId ?? g.messages.first?.id
-                requestOlderHistory(anchorGroupId: anchorGroupId, anchorMessageId: anchorMessageId)
             }
         }
     }
@@ -380,66 +551,61 @@ struct MessagesPane: View {
     // MARK: - Body
 
     var body: some View {
-        let storeMessages = store.messagesByChatId[chat.id] ?? []
-        let messages = windowChatId == chat.id ? windowMessages : []
-        let rows = windowChatId == chat.id
-            ? (cachedRows.isEmpty ? buildRows(messages) : cachedRows)
-            : []
+        let messages = windowMessages
+        let rows = cachedRows
 
 #if DEBUG
         let _ = debugAssertUniqueMessageKeys(messages)
 #endif
 
-        let groupIds: [String] = rows.compactMap {
-            if case .group(let g) = $0 { return g.id }
-            return nil
-        }
+        let groupIds = cachedGroupIdsOrdered
         let firstGroupId = groupIds.first
-        let lastGroupId = groupIds.last
-        let groupMessageBounds: [String: (min: Int64, max: Int64)] = Dictionary(
-            uniqueKeysWithValues: rows.compactMap { row in
-                guard case let .group(g) = row else { return nil }
-                guard let minId = g.messages.min(by: { $0.id < $1.id })?.id else { return nil }
-                guard let maxId = g.messages.max(by: { $0.id < $1.id })?.id else { return nil }
-                return (g.id, (minId, maxId))
-            }
-        )
-        let groupMessageIds: [String: [Int64]] = Dictionary(
-            uniqueKeysWithValues: rows.compactMap { row in
-                guard case let .group(g) = row else { return nil }
-                return (g.id, g.messages.map { $0.id })
-            }
-        )
+        let groupMessageBounds = cachedGroupMessageBounds
+        let groupMessageIds = cachedGroupMessageIds
 
         ScrollViewReader { proxy in
-            GeometryReader { containerGeo in
-                ScrollView {
+            ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         // Scroll offset reader (macOS-safe).
                         ScrollOffsetReader()
                             .frame(height: 0)
 
                         ForEach(rows) { row in
-                            rowView(row, firstGroupId: firstGroupId)
-                        }
-
-                        if showLogs {
-                            Divider().padding(.vertical, 10)
-                            Text(store.logs.joined(separator: "\n\n"))
-                                .font(.system(.footnote, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .topLeading)
-                                .textSelection(.enabled)
+                            rowView(
+                                row,
+                                firstGroupId: firstGroupId,
+                                groupIdsOrdered: groupIds,
+                                groupMessageBounds: groupMessageBounds,
+                                groupMessageIds: groupMessageIds
+                            )
                         }
 
                         Color.clear
                             .frame(height: 1)
                             .id(bottomSentinelId)
                             .onAppear {
-                                isAtBottom = true
-                                if newIncomingCount != 0 { newIncomingCount = 0 }
+                                SwiftUIPublishTrace.uiEvent(
+                                    name: "onAppear_bottomSentinel",
+                                    chatId: chat.id,
+                                    payload: "isAtBottom=true incomingCount=\(newIncomingCount)",
+                                    reason: "scrollPosition"
+                                )
+                                DispatchQueue.main.async {
+                                    isAtBottom = true
+                                    if newIncomingCount != 0 { newIncomingCount = 0 }
+                                }
                             }
-                            .onDisappear { isAtBottom = false }
+                            .onDisappear {
+                                SwiftUIPublishTrace.uiEvent(
+                                    name: "onDisappear_bottomSentinel",
+                                    chatId: chat.id,
+                                    payload: "isAtBottom=false",
+                                    reason: "scrollPosition"
+                                )
+                                DispatchQueue.main.async {
+                                    isAtBottom = false
+                                }
+                            }
                     }
                     .padding(.horizontal, 18)
                     .padding(.vertical, 14)
@@ -451,22 +617,17 @@ struct MessagesPane: View {
                 .simultaneousGesture(revealGesture)
                 .onPreferenceChange(ScrollOffsetKey.self) { minY in
                     let offsetY = -minY
-                    let delta = offsetY - lastScrollOffsetY
-                    lastScrollOffsetY = offsetY
-                    pushJellyImpulse(delta: delta)
-                }
-                .onPreferenceChange(GroupFrameKey.self) { frames in
-                    scheduleVisibleGroupsUpdate(
-                        frames: frames,
-                        groupMessageBounds: groupMessageBounds,
-                        groupMessageIds: groupMessageIds
-                    )
-                }
-                .onAppear {
-                    jellyContainerHeight = containerGeo.size.height
-                }
-                .onChange(of: containerGeo.size.height) { _, newH in
-                    jellyContainerHeight = newH
+                    DispatchQueue.main.async {
+                        let delta = offsetY - lastScrollOffsetY
+                        lastScrollOffsetY = offsetY
+                        SwiftUIPublishTrace.uiEvent(
+                            name: "onPreferenceChange_scrollOffset",
+                            chatId: chat.id,
+                            payload: "offsetY=\(Int(offsetY.rounded())) delta=\(Int(delta.rounded()))",
+                            reason: "scrollGeometryPreference"
+                        )
+                        pushJellyImpulse(delta: delta)
+                    }
                 }
                 .overlay(alignment: .bottomTrailing) {
                     if newIncomingCount > 0 && !isAtBottom {
@@ -515,103 +676,130 @@ struct MessagesPane: View {
 #endif
                 }
                 .onAppear {
+                    SwiftUIPublishTrace.uiEvent(
+                        name: "onAppear_messagesPane",
+                        chatId: chat.id,
+                        payload: "initialCount=\(viewModel.messages.count)",
+                        reason: "viewLifecycle"
+                    )
                     // Build once; after that, scrolling should not re-run grouping.
-                    cachedRows = buildRows(messages)
-                    scheduleFetchLatestMessages(reason: "onAppear")
-
-                    lastKnownMessageCount = messages.count
-                    newIncomingCount = 0
-
-                    // Reset paging state for this chat. We enable paging only after we jump to bottom.
-                    pagingEnabled = false
-                    didInitialScrollToBottom = false
-                    showAfterInitialJump = false
-                    lastPagingAnchor = nil
-                    restoreAnchorGroupId = nil
-                    pagingInFlight = false
-
-                    topVisibleGroupId = nil
-                    topVisibleMessageId = nil
-                    visibleMinMessageId = nil
-                    visibleMaxMessageId = nil
-                }
-                .onChange(of: chat.id) { _, _ in
-                    pagingEnabled = false
-                    pagingInFlight = false
-                    restoreAnchorGroupId = nil
-                    lastPagingAnchor = nil
-                    didInitialScrollToBottom = false
-                    showAfterInitialJump = false
-                    cachedRows = []
-                    windowMessages = []
-                    windowApplyToken = UUID()
-                    windowChatId = nil
-                    viewMessagesDebouncer.cancel()
-                    viewedMessageIds = []
-                    lastVisibleGroupIds = []
-
-                    isAtBottom = true
-                    newIncomingCount = 0
-                    lastKnownMessageCount = 0
-
-                    revealTimeX = 0
-                    revealGestureEngaged = false
-
-                    topVisibleGroupId = nil
-                    topVisibleMessageId = nil
-                    visibleMinMessageId = nil
-                    visibleMaxMessageId = nil
-
-                    needsRepoRetry = false
-                    scheduleFetchLatestMessages(reason: "chat change")
-                }
-                .onChange(of: storeMessages.count) { _, _ in
-                    scheduleFetchLatestMessages(reason: "store update")
-                }
-                .onChange(of: store.databaseRepository != nil) { _, isReady in
-                    guard isReady else { return }
+                    applyWindowMessages(viewModel.messages, anchorGroupId: nil)
                     DispatchQueue.main.async {
-                        if needsRepoRetry || windowChatId != chat.id {
-                            scheduleFetchLatestMessages(reason: "db ready")
-                        }
-                        needsRepoRetry = false
-                    }
-                }
-                .onChange(of: messages.count) { _, newCount in
-                    if newCount < lastKnownMessageCount {
-                        lastKnownMessageCount = newCount
+                        lastKnownMessageCount = messages.count
                         newIncomingCount = 0
-                        return
-                    }
 
-                    if pagingInFlight, let anchorId = restoreAnchorGroupId {
-                        scrollToAnchorTop(proxy, anchorId: anchorId)
+                        // Reset paging state for this chat. We enable paging only after we jump to bottom.
+                        pagingEnabled = false
+                        didInitialScrollToBottom = false
+                        showAfterInitialJump = false
+                        lastPagingAnchorKey = nil
                         restoreAnchorGroupId = nil
                         pagingInFlight = false
-                        lastKnownMessageCount = newCount
-                        return
+
+                        topVisibleGroupId = nil
+                        topVisibleMessageId = nil
+                        visibleMinMessageId = nil
+                        visibleMaxMessageId = nil
+                        visibleGroupIds = []
+                        lastVisibleGroupIds = []
                     }
+                }
+                .onChange(of: chat.id) { oldChatId, _ in
+                    SwiftUIPublishTrace.uiEvent(
+                        name: "onChange_chatId",
+                        chatId: oldChatId,
+                        payload: "oldChatId=\(oldChatId) newChatId=\(chat.id)",
+                        reason: "fromSelectionChange"
+                    )
+                    DispatchQueue.main.async {
+                        pagingEnabled = false
+                        pagingInFlight = false
+                        restoreAnchorGroupId = nil
+                        lastPagingAnchorKey = nil
+                        didInitialScrollToBottom = false
+                        showAfterInitialJump = false
+                        cachedRows = []
+                        cachedGroupIdsOrdered = []
+                        cachedGroupMessageBounds = [:]
+                        cachedGroupMessageIds = [:]
+                        windowMessages = []
+                        rowBuildTask?.cancel()
+                        rowBuildTask = nil
+                        windowApplyToken = UUID()
+                        jellyDecayTask?.cancel()
+                        jellyDecayTask = nil
+                        visibleGroupIds = []
+                        lastVisibleGroupIds = []
+                        store.resetVisibleMessageTracking(chatId: oldChatId)
 
-                    let delta = newCount - lastKnownMessageCount
-                    lastKnownMessageCount = newCount
-                    guard delta > 0 else { return }
-
-                    let lastIsOutgoing = messages.last?.isOutgoing ?? false
-                    let shouldAutoScroll = (!pagingEnabled) || isAtBottom || lastIsOutgoing
-
-                    if shouldAutoScroll {
-                        scrollToBottomSentinel(proxy, animated: pagingEnabled)
+                        isAtBottom = true
                         newIncomingCount = 0
-                        if !pagingEnabled {
-                            pagingEnabled = true
-                            didInitialScrollToBottom = true
+                        lastKnownMessageCount = 0
+
+                        revealTimeX = 0
+                        revealGestureEngaged = false
+
+                        topVisibleGroupId = nil
+                        topVisibleMessageId = nil
+                        visibleMinMessageId = nil
+                        visibleMaxMessageId = nil
+                    }
+                }
+                .onDisappear {
+                    SwiftUIPublishTrace.uiEvent(
+                        name: "onDisappear_messagesPane",
+                        chatId: chat.id,
+                        payload: "visibleRange=\(debugId(visibleMinMessageId))..\(debugId(visibleMaxMessageId))",
+                        reason: "viewLifecycle"
+                    )
+                    rowBuildTask?.cancel()
+                    rowBuildTask = nil
+                    store.resetVisibleMessageTracking(chatId: chat.id)
+                }
+                .onChange(of: viewModel.messages) { _, newMessages in
+                    SwiftUIPublishTrace.uiEvent(
+                        name: "onChange_viewModelMessages",
+                        chatId: chat.id,
+                        payload: "count=\(newMessages.count)",
+                        reason: "fromSnapshotStream"
+                    )
+                    applyWindowMessages(newMessages, anchorGroupId: restoreAnchorGroupId)
+                }
+                .onChange(of: messages.count) { _, newCount in
+                    let snapshot = messages
+                    DispatchQueue.main.async {
+                        // During the initial hidden render + jump-to-bottom, do not auto-show or auto-scroll.
+                        guard didInitialScrollToBottom else {
+                            lastKnownMessageCount = newCount
+                            newIncomingCount = 0
+                            return
                         }
-                        // If we got here during initial load, ensure the list becomes visible.
-                        if !showAfterInitialJump {
-                            showAfterInitialJump = true
+
+                        if newCount < lastKnownMessageCount {
+                            lastKnownMessageCount = newCount
+                            newIncomingCount = 0
+                            return
                         }
-                    } else {
-                        if !lastIsOutgoing {
+
+                        if pagingInFlight, let anchorId = restoreAnchorGroupId {
+                            scrollToAnchorTop(proxy, anchorId: anchorId)
+                            restoreAnchorGroupId = nil
+                            pagingInFlight = false
+                            lastKnownMessageCount = newCount
+                            return
+                        }
+
+                        let delta = newCount - lastKnownMessageCount
+                        lastKnownMessageCount = newCount
+                        guard delta > 0 else { return }
+
+                        let lastIsOutgoing = snapshot.last?.isOutgoing ?? false
+                        let shouldAutoScroll = (!pagingEnabled) || isAtBottom || lastIsOutgoing
+
+                        if shouldAutoScroll {
+                            scrollToBottomSentinel(proxy, animated: pagingEnabled)
+                            newIncomingCount = 0
+                        } else if !lastIsOutgoing {
                             newIncomingCount += delta
                         }
                     }
@@ -640,9 +828,11 @@ struct MessagesPane: View {
                         showAfterInitialJump = true
                     }
                 }
-            }
         }
         .id(chat.id)
+        .transaction { _ in
+            ViewUpdatePhaseTracker.shared.markUpdating(source: "MessagesPane")
+        }
         .background(Color(nsColor: .textBackgroundColor))
     }
 
@@ -653,108 +843,6 @@ struct MessagesPane: View {
         assert(unique.count == keys.count, "[MessagesPane] duplicate message keys in chat \(chat.id)")
     }
 #endif
-
-    // MARK: - Grouping into rows (day headers + time separators + bubble groups)
-
-    private func buildRows(_ msgs: [TGMessage]) -> [Row] {
-        guard !msgs.isEmpty else { return [] }
-
-        let cal = Calendar.current
-        var rows: [Row] = []
-
-        var currentDay: Date? = nil
-
-        var bucket: [TGMessage] = []
-        var curSender: Int64? = nil
-        var curOutgoing: Bool = false
-        var lastUnix: Int? = nil
-
-        func flushBucket() {
-            guard let first = bucket.first else { return }
-            let group = MessageGroup(
-                id: "\(chat.id):g:\(first.id)",
-                isOutgoing: curOutgoing,
-                senderUserId: curSender,
-                messages: bucket
-            )
-            rows.append(.group(group))
-            bucket.removeAll(keepingCapacity: true)
-        }
-
-        func ensureDayHeader(unix: Int) {
-            let d = Date(timeIntervalSince1970: TimeInterval(unix))
-            let day = cal.startOfDay(for: d)
-            if currentDay == nil || currentDay != day {
-                flushBucket()
-                currentDay = day
-                let key = dayKey(day)
-                rows.append(.dayHeader(id: "\(chat.id):day:\(key)", date: day))
-                lastUnix = nil
-            }
-        }
-
-        func maybeInsertMajorGap(prev: Int, next: Int) {
-            let gap = abs(next - prev)
-            guard gap >= majorGap else { return }
-            rows.append(.timeSeparator(id: "\(chat.id):time:\(next)", date: Date(timeIntervalSince1970: TimeInterval(next))))
-        }
-
-        for m in msgs {
-            ensureDayHeader(unix: m.date)
-
-            if let prev = lastUnix {
-                maybeInsertMajorGap(prev: prev, next: m.date)
-            }
-
-            if bucket.isEmpty {
-                bucket = [m]
-                curSender = m.senderUserId
-                curOutgoing = m.isOutgoing
-                lastUnix = m.date
-                continue
-            }
-
-            let sameSender = (m.senderUserId == curSender)
-            let sameDir = (m.isOutgoing == curOutgoing)
-            let close = abs(m.date - (bucket.last?.date ?? m.date)) <= groupGap
-
-            if sameSender && sameDir && close {
-                bucket.append(m)
-            } else {
-                flushBucket()
-                bucket = [m]
-                curSender = m.senderUserId
-                curOutgoing = m.isOutgoing
-            }
-
-            lastUnix = m.date
-        }
-
-        flushBucket()
-        return rows
-    }
-
-    private func dayKey(_ d: Date) -> String {
-        let cal = Calendar.current
-        let c = cal.dateComponents([.year, .month, .day], from: d)
-        return "\(c.year ?? 0)-\(c.month ?? 0)-\(c.day ?? 0)"
-    }
-}
-
-private final class ViewMessagesDebouncer {
-    private var workItem: DispatchWorkItem?
-
-    func schedule(delay: TimeInterval, action: @escaping () -> Void) {
-        workItem?.cancel()
-        let item = DispatchWorkItem(block: action)
-        workItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
-    }
-
-    func cancel() {
-        workItem?.cancel()
-        workItem = nil
-    }
 }
 
 // MARK: - Scroll tracking (macOS-safe)
@@ -763,13 +851,6 @@ private struct ScrollOffsetKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
-    }
-}
-
-private struct GroupFrameKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { $1 })
     }
 }
 
@@ -834,7 +915,7 @@ private struct TimeSeparatorView: View {
     }
 }
 
-struct MessageGroup: Identifiable, Hashable {
+struct MessageGroup: Identifiable, Hashable, Sendable {
     let id: String
     let isOutgoing: Bool
     let senderUserId: Int64?

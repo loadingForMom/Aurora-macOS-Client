@@ -214,6 +214,16 @@ struct ChatInspectorView: View {
         hasBaseline = true
     }
 
+    private func shouldAcceptScrollMetricUpdate(previous: CGFloat, next: CGFloat, epsilon: CGFloat = 0.35) -> Bool {
+        if previous.isNaN || next.isNaN {
+            return previous.isNaN != next.isNaN
+        }
+        if !previous.isFinite || !next.isFinite {
+            return previous.isFinite != next.isFinite
+        }
+        return abs(previous - next) >= epsilon
+    }
+
     var body: some View {
         GeometryReader { geo in
             let width = geo.size.width
@@ -273,38 +283,44 @@ struct ChatInspectorView: View {
                 }
                 .scrollEdgeEffectStyle(.soft, for: .top)
                 .onPreferenceChange(_HeroTitleMinYKey.self) {
-                    heroTitleScrollMinY = $0
-                    updateBaseline()
+                    let value = $0
+                    DispatchQueue.main.async {
+                        guard shouldAcceptScrollMetricUpdate(previous: heroTitleScrollMinY, next: value) else { return }
+                        heroTitleScrollMinY = value
+                        updateBaseline()
+                    }
                 }
                 .onPreferenceChange(_PinnedTitleMinYKey.self) {
-                    pinnedTitleScrollMinY = $0
-                    updateBaseline()
+                    let value = $0
+                    DispatchQueue.main.async {
+                        guard shouldAcceptScrollMetricUpdate(previous: pinnedTitleScrollMinY, next: value) else { return }
+                        pinnedTitleScrollMinY = value
+                        updateBaseline()
+                    }
                 }
                 .onAppear {
                     // Important: попросим hi-res у TDLib только когда инспектор реально открыт
                     store.prefetchChatAvatarHiResIfNeeded(chatId: chat.id)
-
-                    resetBaseline()
-                    DispatchQueue.main.async { updateBaseline() }
+                    DispatchQueue.main.async {
+                        resetBaseline()
+                        updateBaseline()
+                    }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { updateBaseline() }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { updateBaseline() }
                 }
-                .onChange(of: chat.id) { _ in
-                    store.prefetchChatAvatarHiResIfNeeded(chatId: chat.id)
-
-                    resetBaseline()
-                    DispatchQueue.main.async { updateBaseline() }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { updateBaseline() }
-                }
                 .onPreferenceChange(_ScrollTopMinYKey.self) {
-                    scrollTopMinY = $0
+                    let value = $0
+                    DispatchQueue.main.async {
+                        guard shouldAcceptScrollMetricUpdate(previous: scrollTopMinY, next: value) else { return }
+                        scrollTopMinY = value
 
-                    if !baselineScrollTopMinY.isFinite, $0.isFinite {
-                        baselineScrollTopMinY = $0
+                        if !baselineScrollTopMinY.isFinite, value.isFinite {
+                            baselineScrollTopMinY = value
+                        }
+
+                        updateBaseline()
+                        scheduleBaselineSettleCheck()
                     }
-
-                    updateBaseline()
-                    scheduleBaselineSettleCheck()
                 }
 
                 PinnedHeaderChrome(
@@ -437,7 +453,25 @@ private struct PosterBackground: View {
         let overlapHeight = headerHeight * overlapFraction
         let overlayTop = headerHeight - overlapHeight
         let overlayHeight = max(0, totalHeight - overlayTop)
-        let overlapRatio = overlayHeight > 0 ? overlapHeight / overlayHeight : 0
+
+        // 1) если высоты почти нет — нечего маскировать
+        guard overlayHeight > 1 else {
+            return AnyView(EmptyView())
+        }
+
+        // 2) clamp ratio в 0...1 и защитимся от NaN/inf
+        let raw = overlapHeight / overlayHeight
+        let r: CGFloat = raw.isFinite ? raw.clamped(0, 1) : 0
+
+        // 3) гарантируем строго возрастающие стопы
+        let eps: CGFloat = 0.0005
+        let s0: CGFloat = 0.0
+        let s1: CGFloat = max(s0 + eps, min(r * 0.10, 1 - eps * 5))
+        let s2: CGFloat = max(s1 + eps, min(r * 0.30, 1 - eps * 4))
+        let s3: CGFloat = max(s2 + eps, min(r * 0.60, 1 - eps * 3))
+        let s4: CGFloat = max(s3 + eps, min(r * 0.85, 1 - eps * 2))
+        let s5: CGFloat = max(s4 + eps, min(r,        1 - eps))
+        let s6: CGFloat = 1.0
 
         let base: AnyView = {
             if reduceTransparency {
@@ -447,28 +481,30 @@ private struct PosterBackground: View {
             }
         }()
 
-        return base
-            .frame(width: width, height: overlayHeight)
-            .overlay(colorScheme == .dark
-                     ? Color.black.opacity(0.03)
-                     : Color(nsColor: .windowBackgroundColor).opacity(0.06))
-            .mask(
-                LinearGradient(
-                    stops: [
-                        .init(color: .black.opacity(0.03),  location: 0.00),
-                        .init(color: .black.opacity(0.08),  location: max(0.00, overlapRatio * 0.10)),
-                        .init(color: .black.opacity(0.18),  location: max(0.00, overlapRatio * 0.30)),
-                        .init(color: .black.opacity(0.45),  location: max(0.00, overlapRatio * 0.60)),
-                        .init(color: .black.opacity(0.75),  location: max(0.00, overlapRatio * 0.85)),
-                        .init(color: .black,               location: overlapRatio),
-                        .init(color: .black,               location: 1.00),
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
+        return AnyView(
+            base
+                .frame(width: width, height: overlayHeight)
+                .overlay(colorScheme == .dark
+                         ? Color.black.opacity(0.03)
+                         : Color(nsColor: .windowBackgroundColor).opacity(0.06))
+                .mask(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .black.opacity(0.03), location: s0),
+                            .init(color: .black.opacity(0.08), location: s1),
+                            .init(color: .black.opacity(0.18), location: s2),
+                            .init(color: .black.opacity(0.45), location: s3),
+                            .init(color: .black.opacity(0.75), location: s4),
+                            .init(color: .black,               location: s5),
+                            .init(color: .black,               location: s6),
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
                 )
-            )
-            .offset(y: overlayTop)
-            .allowsHitTesting(false)
+                .offset(y: overlayTop)
+                .allowsHitTesting(false)
+        )
     }
 }
 

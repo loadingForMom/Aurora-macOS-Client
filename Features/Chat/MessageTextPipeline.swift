@@ -5,6 +5,7 @@
 
 import SwiftUI
 import Foundation
+import OSLog
 
 enum MessageTextStyle: Hashable {
     case bubbleBody
@@ -14,6 +15,7 @@ struct MessageTextCacheKey: Hashable {
     let chatId: Int64
     let messageId: Int64
     let style: MessageTextStyle
+    let textFingerprint: Int
 }
 
 final class MessageTextCache {
@@ -56,6 +58,7 @@ final class MessageTextCache {
 }
 
 enum MessageTextPipeline {
+    private static let log = Logger(subsystem: "com.aurora.app", category: "message.text")
     // Supported now vs later:
     // | Supported now | Later |
     // | --- | --- |
@@ -68,7 +71,12 @@ enum MessageTextPipeline {
         entities: [TGTextEntity]?,
         style: MessageTextStyle
     ) -> AttributedString {
-        let cacheKey = MessageTextCacheKey(chatId: chatId, messageId: messageId, style: style)
+        let cacheKey = MessageTextCacheKey(
+            chatId: chatId,
+            messageId: messageId,
+            style: style,
+            textFingerprint: textFingerprint(rawText: rawText, entities: entities)
+        )
         if let cached = MessageTextCache.shared.value(for: cacheKey) {
             return cached
         }
@@ -77,7 +85,7 @@ enum MessageTextPipeline {
         if let rawText {
             if rawText.isEmpty {
 #if DEBUG
-                print("[MessageTextPipeline] (chatId=\(chatId), messageId=\(messageId)) no text content")
+                log.debug("no text content chatId=\(chatId, privacy: .public) messageId=\(messageId, privacy: .public)")
 #endif
                 text = "[unsupported message]"
             } else {
@@ -85,7 +93,7 @@ enum MessageTextPipeline {
             }
         } else {
 #if DEBUG
-            print("[MessageTextPipeline] (chatId=\(chatId), messageId=\(messageId)) unsupported content type")
+            log.debug("unsupported content type chatId=\(chatId, privacy: .public) messageId=\(messageId, privacy: .public)")
 #endif
             text = "[unsupported message]"
         }
@@ -106,6 +114,20 @@ enum MessageTextPipeline {
         return attributed
     }
 
+    private static func textFingerprint(rawText: String?, entities: [TGTextEntity]?) -> Int {
+        var hasher = Hasher()
+        hasher.combine(rawText != nil)
+        hasher.combine(rawText ?? "")
+        if let entities {
+            for entity in entities {
+                hasher.combine(entity)
+            }
+        } else {
+            hasher.combine(0)
+        }
+        return hasher.finalize()
+    }
+
     private static func applyEntities(
         _ entities: [TGTextEntity],
         to attributed: inout AttributedString,
@@ -118,13 +140,13 @@ enum MessageTextPipeline {
         for entity in sorted {
             guard let stringRange = utf16Range(in: rawText, offset: entity.offset, length: entity.length) else {
 #if DEBUG
-                print("[MessageTextPipeline] (chatId=\(chatId), messageId=\(messageId)) invalid entity range offset=\(entity.offset) length=\(entity.length)")
+                log.debug("invalid entity range chatId=\(chatId, privacy: .public) messageId=\(messageId, privacy: .public) offset=\(entity.offset, privacy: .public) length=\(entity.length, privacy: .public)")
 #endif
                 continue
             }
             guard let attrRange = Range<AttributedString.Index>(stringRange, in: attributed) else {
 #if DEBUG
-                print("[MessageTextPipeline] (chatId=\(chatId), messageId=\(messageId)) entity apply error range mapping failed")
+                log.debug("entity apply error chatId=\(chatId, privacy: .public) messageId=\(messageId, privacy: .public)")
 #endif
                 continue
             }
@@ -143,7 +165,7 @@ enum MessageTextPipeline {
             case .textUrl(let urlString):
                 guard let url = URL(string: urlString), !urlString.isEmpty else {
 #if DEBUG
-                    print("[MessageTextPipeline] (chatId=\(chatId), messageId=\(messageId)) invalid URL entity")
+                    log.debug("invalid URL entity chatId=\(chatId, privacy: .public) messageId=\(messageId, privacy: .public)")
 #endif
                     continue
                 }

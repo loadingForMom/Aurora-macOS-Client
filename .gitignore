@@ -5,3 +5,7 @@ DerivedData/
 .build/
 *.swp
 *.orig
+.derivedData/
+DerivedData/
+.git
+.git/

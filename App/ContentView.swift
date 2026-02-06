@@ -10,16 +10,18 @@ import AppKit
 
 struct ContentView: View {
     @ObservedObject var store: TelegramStore
+    @StateObject private var chatListViewModel: ChatListViewModel
 
     @State private var searchText: String = ""
     @State private var inspectorShown: Bool = true
+    @State private var listSelection: Int64? = nil
 
     private func filteredChats(_ base: [TGChat], query: String) -> [TGChat] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !q.isEmpty else { return base }
 
-        // NOTE: we only use chat fields here (not store.messagesByChatId),
-        // so the sidebar won't rerender on every message update.
+        // NOTE: sidebar uses chat rows only, sourced from DB observation,
+        // so it won't rerender on every message update.
         return base.filter {
             $0.title.lowercased().contains(q) ||
             $0.lastMessagePreview.lowercased().contains(q)
@@ -35,18 +37,27 @@ struct ContentView: View {
         store.chatAvatarPathByChatId[chatId]
     }
 
+    private var selectedChatIdForUI: Int64? {
+        listSelection ?? store.selectedChatId
+    }
+
     private var selectedChat: TGChat? {
-        guard let chatId = store.selectedChatId else { return nil }
-        return store.chatsById[chatId]
+        guard let chatId = selectedChatIdForUI else { return nil }
+        return chatListViewModel.chats.first(where: { $0.id == chatId })
+    }
+
+    init(store: TelegramStore) {
+        self.store = store
+        _chatListViewModel = StateObject(wrappedValue: ChatListViewModel(dbPool: store.dbPool))
     }
 
     var body: some View {
-        let baseChats = store.sortedChats
+        let baseChats = chatListViewModel.chats
         let chats = filteredChats(baseChats, query: searchText)
 
         ZStack {
             NavigationSplitView {
-                List(selection: $store.selectedChatId) {
+                List(selection: $listSelection) {
                     ForEach(chats) { chat in
                         ChatRow(
                             chat: chat,
@@ -62,6 +73,7 @@ struct ContentView: View {
                 Group {
                     if let chat = selectedChat {
                         ChatScreen(store: store, chat: chat)
+                            .id(chat.id)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .toolbar {
                                 ToolbarItem(placement: .principal) {
@@ -92,22 +104,56 @@ struct ContentView: View {
                 }
             }
             .task {
-                if let id = store.selectedChatId {
-                    await MainActor.run {
+                if listSelection == nil, let storeSelection = store.selectedChatId {
+                    listSelection = storeSelection
+                }
+                if let id = listSelection ?? store.selectedChatId {
+                    SwiftUIPublishTrace.uiEvent(
+                        name: "task_restoreSelectedChat",
+                        chatId: id,
+                        payload: "chatId=\(id)",
+                        reason: "fromSelectionChange"
+                    )
+                    DispatchQueue.main.async {
                         store.selectChat(id, forceReload: false)
                     }
                 }
             }
-            .onChange(of: store.selectedChatId) { _, newChatId in
+            .onChange(of: listSelection) { oldChatId, newChatId in
+                SwiftUIPublishTrace.uiEvent(
+                    name: "onChange_selectedChat",
+                    chatId: newChatId ?? oldChatId,
+                    payload: "old=\(oldChatId.map(String.init) ?? "n/a") new=\(newChatId.map(String.init) ?? "n/a")",
+                    reason: "fromSelectionChange"
+                )
                 guard let id = newChatId else { return }
-                Task { @MainActor in
+                DispatchQueue.main.async {
                     store.selectChat(id)
+                }
+            }
+            .onChange(of: store.selectedChatId) { _, newChatId in
+                guard listSelection != newChatId else { return }
+                DispatchQueue.main.async {
+                    listSelection = newChatId
                 }
             }
 
             if !store.isAuthorized {
                 TelegramLoginView(store: store)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willResignActiveNotification)) { _ in
+            store.flushDatabaseNow()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            store.flushDatabaseNow()
+            SwiftUIPublishTrace.emitSummary()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { _ in
+            store.flushDatabaseNow()
+        }
+        .transaction { _ in
+            ViewUpdatePhaseTracker.shared.markUpdating(source: "ContentView")
         }
     }
 }
@@ -256,7 +302,7 @@ private struct TelegramLoginView: View {
                     submitCodeIfPossible()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(authCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(!canSubmitCode)
             }
         case .password:
             VStack(alignment: .leading, spacing: 12) {
@@ -303,14 +349,26 @@ private struct TelegramLoginView: View {
     }
 
     private func submitCodeIfPossible() {
-        let trimmed = authCode.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        store.submitAuthCode(trimmed)
+        guard let code = sanitizedAuthCode() else { return }
+        store.submitAuthCode(code)
     }
 
     private func submitPasswordIfPossible() {
         let trimmed = password.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         store.submitAuthPassword(trimmed)
+    }
+
+    private var canSubmitCode: Bool {
+        sanitizedAuthCode() != nil
+    }
+
+    private func sanitizedAuthCode() -> String? {
+        let trimmed = authCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let compact = trimmed.filter { !$0.isWhitespace }
+        guard compact.allSatisfy({ $0.isNumber }) else { return nil }
+        guard (3...8).contains(compact.count) else { return nil }
+        return compact
     }
 }

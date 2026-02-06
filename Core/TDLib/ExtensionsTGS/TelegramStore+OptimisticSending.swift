@@ -4,8 +4,56 @@
 
 import Foundation
 import AppKit
+import os
 
 extension TelegramStore {
+
+    private func enqueueChatLastUpdate(for message: TGMessage) async {
+        let preview: String
+        switch message.sendState {
+        case .pending, .sending:
+            preview = "You: (sending…) \(message.previewText)"
+        case .failed:
+            preview = "You: (failed) \(message.previewText)"
+        case .sent:
+            preview = message.previewText
+        }
+        await databaseBatchWriter.enqueue(
+            [
+                .updateChatLastMessage(chatId: message.chatId, messageId: message.id, preview: preview, date: message.date),
+                .upsertChatLastMessage(chatId: message.chatId, messageId: message.id, preview: preview, date: message.date)
+            ]
+        )
+    }
+
+    private func replaceMessage(chatId: Int64, oldId: Int64, newMessage: TGMessage) async {
+        _ = await messageStore.mergeMessages(
+            chatId: chatId,
+            messages: [newMessage],
+            windowLimit: historyWindowLimitByChatId[chatId] ?? 160
+        )
+        await databaseBatchWriter.enqueue(.upsertMessage(newMessage))
+        if oldId != newMessage.id {
+            _ = await messageStore.applyDelete(chatId: chatId, messageIds: [oldId])
+            await databaseBatchWriter.enqueue(.deleteMessages(chatId: chatId, messageIds: [oldId]))
+        }
+    }
+
+    private func replaceMessageIfExists(chatId: Int64, id: Int64, newMessage: TGMessage) async -> Bool {
+        guard databaseRepository.messageExists(chatId: chatId, messageId: id) else { return false }
+        _ = await messageStore.mergeMessages(
+            chatId: chatId,
+            messages: [newMessage],
+            windowLimit: historyWindowLimitByChatId[chatId] ?? 160
+        )
+        await databaseBatchWriter.enqueue(.upsertMessage(newMessage))
+        return true
+    }
+
+    private func removeMessageById(chatId: Int64, id: Int64) async {
+        _ = await messageStore.applyDelete(chatId: chatId, messageIds: [id])
+        await databaseBatchWriter.enqueue(.deleteMessages(chatId: chatId, messageIds: [id]))
+    }
 
     func makeLocalTempId() -> Int64 {
         nextLocalTempId -= 1
@@ -20,17 +68,18 @@ extension TelegramStore {
         return x
     }
 
-    @MainActor
     func startPendingCleanupTimer() {
-        pendingCleanupTimer?.invalidate()
-        pendingCleanupTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.cleanupExpiredPendingItems()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.pendingCleanupTimer?.invalidate()
+            self.pendingCleanupTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+                self?.cleanupExpiredPendingItems()
+            }
         }
     }
 
     func restorePendingMessagesFromDatabase() {
-        guard let repo = databaseRepository else { return }
-        let pendingMessages = repo.fetchPendingMessages()
+        let pendingMessages = databaseRepository.fetchPendingMessages()
         guard !pendingMessages.isEmpty else { return }
 
         let now = Int(Date().timeIntervalSince1970)
@@ -46,8 +95,10 @@ extension TelegramStore {
             }
             guard let localId = message.localId else { continue }
             if needsPersist {
-                if !replaceMessageIfExists(chatId: message.chatId, id: message.id, newMessage: message) {
-                    persistMessage(message)
+                Task {
+                    if !(await replaceMessageIfExists(chatId: message.chatId, id: message.id, newMessage: message)) {
+                        await databaseBatchWriter.enqueue(.upsertMessage(message))
+                    }
                 }
             }
 
@@ -70,7 +121,7 @@ extension TelegramStore {
             )
 
             if isPendingExpired(link: link, now: now) {
-                finalizePending(localId: localId, result: .failed(reason: "Send timed out", canRetry: true, message: nil))
+                Task { await finalizePending(localId: localId, result: .failed(reason: "Send timed out", canRetry: true, message: nil)) }
                 continue
             }
 
@@ -100,7 +151,7 @@ extension TelegramStore {
         let now = Int(Date().timeIntervalSince1970)
         let expired = pendingByLocalId.values.filter { isPendingExpired(link: $0, now: now) }
         for link in expired {
-            finalizePending(localId: link.localId, result: .failed(reason: "Send timed out", canRetry: true, message: nil))
+            Task { await finalizePending(localId: link.localId, result: .failed(reason: "Send timed out", canRetry: true, message: nil)) }
         }
     }
 
@@ -188,7 +239,7 @@ extension TelegramStore {
                 "clear_draft": true
             ]
         ]
-        sendJSON(req)
+        enqueueTDLibRequest(req, typeOverride: "sendMessage", priority: .high)
         markMessageSending(localId: localId)
     }
 
@@ -231,7 +282,7 @@ extension TelegramStore {
                 "clear_draft": true
             ]
         ]
-        sendJSON(req)
+        enqueueTDLibRequest(req, typeOverride: "sendMessage", priority: .high)
         markMessageSending(localId: localId)
     }
 
@@ -259,7 +310,7 @@ extension TelegramStore {
                 "chat_id": message.chatId,
                 "message_ids": [message.id]
             ]
-            sendJSON(req)
+            enqueueTDLibRequest(req, typeOverride: "resendMessages")
             return
         }
 
@@ -273,7 +324,7 @@ extension TelegramStore {
     func _cancelPending_impl(message: TGMessage) {
         let localId = message.localId ?? localIdByTempMessageId[message.id]
         guard let localId, pendingByLocalId[localId] != nil else { return }
-        finalizePending(localId: localId, result: .canceled)
+        Task { await finalizePending(localId: localId, result: .canceled) }
     }
 
     func _deleteMessages_impl(chatId: Int64, messageIds: [Int64], revoke: Bool) {
@@ -285,7 +336,7 @@ extension TelegramStore {
             "message_ids": messageIds,
             "revoke": revoke
         ]
-        sendJSON(req)
+        enqueueTDLibRequest(req, typeOverride: "deleteMessages")
     }
 
     func _editMessageText_impl(chatId: Int64, messageId: Int64, newText: String) {
@@ -308,73 +359,57 @@ extension TelegramStore {
                 "clear_draft": false
             ]
         ]
-        sendJSON(req)
+        enqueueTDLibRequest(req, typeOverride: "editMessageText")
     }
 
     func optimisticInsertMessage(_ msg: TGMessage) {
-        var arr = messagesByChatId[msg.chatId] ?? []
-        if let idx = arr.firstIndex(where: { $0.id == msg.id }) {
-            arr[idx] = msg
-#if DEBUG
-            print("[Message][dedupe] chatId=\(msg.chatId) replaced existing id=\(msg.id) (optimisticInsert)")
-#endif
-        } else {
-            arr.append(msg)
-        }
-        arr = sortChronological(arr)
-        if arr.count > 800 { arr.removeFirst(arr.count - 800) }
-        messagesByChatId[msg.chatId] = arr
-        persistMessage(msg)
-
-        if var c = chatsById[msg.chatId] {
-            c.lastMessageId = msg.id
-            c.lastMessageDate = msg.date
-            switch msg.sendState {
-            case .pending:
-                c.lastMessagePreview = "You: (sending…) \(msg.previewText)"
-            case .sending:
-                c.lastMessagePreview = "You: (sending…) \(msg.previewText)"
-            case .failed:
-                c.lastMessagePreview = "You: (failed) \(msg.previewText)"
-            case .sent:
-                c.lastMessagePreview = msg.previewText
-            }
-            chatsById[msg.chatId] = c
-            persistChat(c)
-            persistChatLastMessage(chatId: msg.chatId, messageId: msg.id, preview: c.lastMessagePreview, date: msg.date)
+        Task {
+            _ = await messageStore.mergeMessages(
+                chatId: msg.chatId,
+                messages: [msg],
+                windowLimit: historyWindowLimitByChatId[msg.chatId] ?? 160
+            )
+            await databaseBatchWriter.enqueue(.upsertMessage(msg))
+            await enqueueChatLastUpdate(for: msg)
         }
     }
 
     func markMessagePending(chatId: Int64, id: Int64) {
-        guard var arr = messagesByChatId[chatId] else { return }
-        guard let idx = arr.firstIndex(where: { $0.id == id }) else { return }
-        var m = arr[idx]
-        m.sendState = .pending
-        m.canRetry = false
-        arr[idx] = m
-        messagesByChatId[chatId] = sortChronological(arr)
-        keepOptimisticChatPreviewIfNeeded(chatId: chatId)
-        persistMessage(m)
+        Task {
+            guard var m = databaseRepository.fetchMessage(chatId: chatId, messageId: id) else { return }
+            m.sendState = .pending
+            m.canRetry = false
+            _ = await messageStore.mergeMessages(
+                chatId: chatId,
+                messages: [m],
+                windowLimit: historyWindowLimitByChatId[chatId] ?? 160
+            )
+            await databaseBatchWriter.enqueue(.upsertMessage(m))
+            await enqueueChatLastUpdate(for: m)
+        }
     }
 
     func markMessageSending(chatId: Int64, id: Int64, localId: UUID?, sendingId: Int32?) {
-        guard var arr = messagesByChatId[chatId] else { return }
-        guard let idx = arr.firstIndex(where: { $0.id == id }) else { return }
-        var m = arr[idx]
-        m.sendState = .sending
-        m.canRetry = false
-        if let localId { m.localId = localId }
-        if let sendingId { m.sendingId = sendingId }
-        if let localId, let link = pendingByLocalId[localId] {
-            m.retryCount = link.retryCount
-            m.nextRetryAt = link.nextRetryAt
-        }
-        arr[idx] = m
-        messagesByChatId[chatId] = sortChronological(arr)
-        keepOptimisticChatPreviewIfNeeded(chatId: chatId)
-        persistMessage(m)
-        if let localId, let link = pendingByLocalId[localId] {
-            logPendingStateChange(state: "sending", link: link, messageId: id)
+        Task {
+            guard var m = databaseRepository.fetchMessage(chatId: chatId, messageId: id) else { return }
+            m.sendState = .sending
+            m.canRetry = false
+            if let localId { m.localId = localId }
+            if let sendingId { m.sendingId = sendingId }
+            if let localId, let link = pendingByLocalId[localId] {
+                m.retryCount = link.retryCount
+                m.nextRetryAt = link.nextRetryAt
+            }
+            _ = await messageStore.mergeMessages(
+                chatId: chatId,
+                messages: [m],
+                windowLimit: historyWindowLimitByChatId[chatId] ?? 160
+            )
+            await databaseBatchWriter.enqueue(.upsertMessage(m))
+            await enqueueChatLastUpdate(for: m)
+            if let localId, let link = pendingByLocalId[localId] {
+                logPendingStateChange(state: "sending", link: link, messageId: id)
+            }
         }
     }
 
@@ -391,15 +426,13 @@ extension TelegramStore {
         case canceled
     }
 
-    func finalizePending(localId: UUID, result: PendingFinalizeResult) {
+    func finalizePending(localId: UUID, result: PendingFinalizeResult) async {
         guard let link = pendingByLocalId[localId] else { return }
         let chatId = link.chatId
         let placeholderId = link.placeholderId
 
         func findLocalMessage() -> TGMessage? {
-            guard let arr = messagesByChatId[chatId] else { return nil }
-            if let match = arr.first(where: { $0.localId == localId }) { return match }
-            return arr.first(where: { $0.id == placeholderId })
+            databaseRepository.fetchMessage(chatId: chatId, messageId: placeholderId)
         }
 
         var finalMessage: TGMessage? = nil
@@ -414,7 +447,9 @@ extension TelegramStore {
             sent.sendingId = sent.sendingId ?? link.sendingId
             sent.retryCount = link.retryCount
             sent.nextRetryAt = nil
-            replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: sent)
+            if !(await replaceMessageIfExists(chatId: chatId, id: sent.id, newMessage: sent)) {
+                await replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: sent)
+            }
             finalMessage = sent
             keepServerLink = true
 
@@ -444,11 +479,11 @@ extension TelegramStore {
             failed.sendingId = failed.sendingId ?? link.sendingId
             failed.retryCount = link.retryCount
             failed.nextRetryAt = link.nextRetryAt
-            replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: failed)
+            await replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: failed)
             finalMessage = failed
 
         case .canceled:
-            _ = removeMessageById(chatId: chatId, id: placeholderId)
+            await removeMessageById(chatId: chatId, id: placeholderId)
         }
 
         pendingByLocalId.removeValue(forKey: localId)
@@ -462,25 +497,11 @@ extension TelegramStore {
         }
 
         if let finalMessage {
-            keepOptimisticChatPreviewIfNeeded(chatId: chatId)
-            coalesceOutgoingDuplicates(chatId: chatId, localId: localId, keepMessageId: finalMessage.id, fallbackMessage: finalMessage)
-            persistMessage(finalMessage)
+            await enqueueChatLastUpdate(for: finalMessage)
+            await coalesceOutgoingDuplicates(chatId: chatId, localId: localId, keepMessageId: finalMessage.id, fallbackMessage: finalMessage)
         }
 
-        if let finalMessage, placeholderId != finalMessage.id {
-            if var arr = messagesByChatId[chatId], arr.contains(where: { $0.id == placeholderId }) {
-                arr.removeAll { $0.id == placeholderId }
-                messagesByChatId[chatId] = arr
-            }
-            databaseRepository?.deleteMessages(chatId: chatId, messageIds: [placeholderId])
-#if DEBUG
-            if let repo = databaseRepository, repo.messageExists(chatId: chatId, messageId: placeholderId) {
-                assertionFailure("[Pending] placeholder row leak chatId=\(chatId) id=\(placeholderId)")
-            }
-#endif
-        }
-
-        updateChatLastFromLocalTimeline(chatId: chatId)
+        await updateChatLastFromLocalTimeline(chatId: chatId)
         logPendingTransition(result: result, link: link, message: finalMessage)
     }
 
@@ -496,12 +517,12 @@ extension TelegramStore {
         case .canceled:
             label = "canceled"
         }
-        print("[Pending] \(label) localId=\(link.localId.uuidString) sendingId=\(sendingId) placeholderId=\(link.placeholderId) serverMessageId=\(serverId) retry=\(link.retryCount)")
+        log.debug("pending \(label) localId=\(link.localId.uuidString) sendingId=\(sendingId) placeholderId=\(link.placeholderId) serverMessageId=\(serverId) retry=\(link.retryCount)")
     }
 
     func logPendingStateChange(state: String, link: PendingLink, messageId: Int64) {
         let serverId = serverMessageIdByLocalId[link.localId] ?? 0
-        print("[Pending] \(state) localId=\(link.localId.uuidString) sendingId=\(link.sendingId) placeholderId=\(link.placeholderId) serverMessageId=\(serverId) messageId=\(messageId) retry=\(link.retryCount)")
+        log.debug("pending \(state) localId=\(link.localId.uuidString) sendingId=\(link.sendingId) placeholderId=\(link.placeholderId) serverMessageId=\(serverId) messageId=\(messageId) retry=\(link.retryCount)")
     }
 
     struct FunctionResponseMessage {
@@ -522,11 +543,11 @@ extension TelegramStore {
         return FunctionResponseMessage(extra: extra, message: msg, raw: obj)
     }
 
-    func bindPendingToServerMessage(localId: UUID, msg: TGMessage, logLabel: String) -> Bool {
+    func bindPendingToServerMessage(localId: UUID, msg: TGMessage, logLabel: String) async -> Bool {
         guard var link = pendingByLocalId[localId] else { return false }
 
         if case .sent = msg.sendState {
-            finalizePending(localId: localId, result: .sent(message: msg))
+            await finalizePending(localId: localId, result: .sent(message: msg))
             return true
         }
 
@@ -545,8 +566,8 @@ extension TelegramStore {
             merged.sendState = .sending
         }
 
-        replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: merged)
-        _ = removeMessageById(chatId: chatId, id: placeholderId)
+        await replaceMessage(chatId: chatId, oldId: placeholderId, newMessage: merged)
+        await removeMessageById(chatId: chatId, id: placeholderId)
 
         link.placeholderId = merged.id
         link.sendingId = merged.sendingId ?? link.sendingId
@@ -555,37 +576,44 @@ extension TelegramStore {
         localIdByTempMessageId[merged.id] = localId
         serverMessageIdByLocalId[localId] = merged.id
 
-        keepOptimisticChatPreviewIfNeeded(chatId: chatId)
-        coalesceOutgoingDuplicates(chatId: chatId, localId: localId, keepMessageId: merged.id, fallbackMessage: merged)
-        persistMessage(merged)
+        await enqueueChatLastUpdate(for: merged)
+        await coalesceOutgoingDuplicates(chatId: chatId, localId: localId, keepMessageId: merged.id, fallbackMessage: merged)
 
 #if DEBUG
-        print("[Reconcile] \(logLabel) localId=\(localId.uuidString) placeholderId=\(placeholderId) -> messageId=\(merged.id)")
+        log.debug("reconcile \(logLabel) localId=\(localId.uuidString) placeholderId=\(placeholderId) -> messageId=\(merged.id)")
 #endif
         return true
     }
 
-    func reconcileFunctionResponseSend(extra: String?, msg: TGMessage) -> Bool {
+    func reconcileFunctionResponseSend(extra: String?, msg: TGMessage) async -> Bool {
         guard let extra, extra.hasPrefix("send:") else { return false }
         let suffix = String(extra.dropFirst("send:".count))
         guard let localId = UUID(uuidString: suffix),
               pendingByLocalId[localId] != nil else { return false }
 
         pendingMetrics.reconcileByFunctionResponseExtra += 1
-        return bindPendingToServerMessage(localId: localId, msg: msg, logLabel: "functionResponse")
+        return await bindPendingToServerMessage(localId: localId, msg: msg, logLabel: "functionResponse")
     }
 
-    func handleFunctionResponseMessage(_ resp: FunctionResponseMessage) {
+    func handleFunctionResponseMessage(_ resp: FunctionResponseMessage) async {
         let msg = resp.message
-        let reconciled = reconcileFunctionResponseSend(extra: resp.extra, msg: msg)
-            || tryReconcileOutgoingPendingMessage(msg)
-#if DEBUG
-        if let extra = resp.extra, extra.hasPrefix("send:") {
-            print("[SendResponse] handled message response extra=\(extra) reconciled=\(reconciled), skipped timeline insert")
+
+        let reconciledByFunctionResponse = await reconcileFunctionResponseSend(extra: resp.extra, msg: msg)
+        let reconciled: Bool
+        if reconciledByFunctionResponse {
+            reconciled = true
+        } else {
+            reconciled = await tryReconcileOutgoingPendingMessage(msg)
         }
-#endif
+
+    #if DEBUG
+        if let extra = resp.extra, extra.hasPrefix("send:") {
+            log.debug("send response extra=\(extra, privacy: .public) reconciled=\(reconciled, privacy: .public)")
+        }
+    #endif
+
         if reconciled {
-            updateChatLastFromLocalTimeline(chatId: msg.chatId)
+            await updateChatLastFromLocalTimeline(chatId: msg.chatId)
         }
     }
 
@@ -646,45 +674,45 @@ extension TelegramStore {
         return nil
     }
 
-    func handleSendSucceeded(_ succ: SendSucceeded) {
+    func handleSendSucceeded(_ succ: SendSucceeded) async {
         var final = succ.message
         final.sendState = .sent
         final.canRetry = false
 
         if let localId = resolvePendingLocalId(for: final, oldMessageId: succ.oldMessageId),
            pendingByLocalId[localId] != nil {
-            finalizePending(localId: localId, result: .sent(message: final))
+            await finalizePending(localId: localId, result: .sent(message: final))
             return
         }
 
         let chatId = final.chatId
-        let replaced = replaceMessageIfExists(chatId: chatId, id: succ.oldMessageId, newMessage: final)
+        let replaced = await replaceMessageIfExists(chatId: chatId, id: succ.oldMessageId, newMessage: final)
         if !replaced {
-            _ = replaceMessageIfExists(chatId: chatId, id: final.id, newMessage: final)
+            _ = await replaceMessageIfExists(chatId: chatId, id: final.id, newMessage: final)
         }
         if succ.oldMessageId != final.id {
-            _ = removeMessageById(chatId: chatId, id: succ.oldMessageId)
+            await removeMessageById(chatId: chatId, id: succ.oldMessageId)
         }
-        updateChatLastFromLocalTimeline(chatId: chatId)
+        await updateChatLastFromLocalTimeline(chatId: chatId)
     }
 
-    func handleSendFailed(_ fail: SendFailed) {
+    func handleSendFailed(_ fail: SendFailed) async {
         var failed = fail.message
         failed.sendState = .failed(errorText: fail.errorText)
         failed.canRetry = fail.canRetry
 
         if let localId = resolvePendingLocalId(for: failed, oldMessageId: fail.oldMessageId),
            pendingByLocalId[localId] != nil {
-            finalizePending(localId: localId, result: .failed(reason: fail.errorText, canRetry: fail.canRetry, message: failed))
+            await finalizePending(localId: localId, result: .failed(reason: fail.errorText, canRetry: fail.canRetry, message: failed))
             return
         }
 
         let chatId = failed.chatId
-        let didReplace = replaceMessageIfExists(chatId: chatId, id: fail.oldMessageId, newMessage: failed)
+        let didReplace = await replaceMessageIfExists(chatId: chatId, id: fail.oldMessageId, newMessage: failed)
         if !didReplace {
-            _ = replaceMessageIfExists(chatId: chatId, id: failed.id, newMessage: failed)
+            _ = await replaceMessageIfExists(chatId: chatId, id: failed.id, newMessage: failed)
         }
-        updateChatLastFromLocalTimeline(chatId: chatId)
+        await updateChatLastFromLocalTimeline(chatId: chatId)
     }
 
     func pendingFallbackMatches(link: PendingLink, msg: TGMessage, windowSeconds: Int) -> Bool {
@@ -702,13 +730,13 @@ extension TelegramStore {
         return abs(link.date - msg.date) <= windowSeconds
     }
 
-    func tryReconcileOutgoingPendingMessage(_ msg: TGMessage) -> Bool {
+    func tryReconcileOutgoingPendingMessage(_ msg: TGMessage) async -> Bool {
         guard msg.isOutgoing else { return false }
         if let sid = msg.sendingId,
            let localId = localIdBySendingId[sid],
            pendingByLocalId[localId] != nil {
             pendingMetrics.reconcileBySendingId += 1
-            return bindPendingToServerMessage(localId: localId, msg: msg, logLabel: "sendingId")
+            return await bindPendingToServerMessage(localId: localId, msg: msg, logLabel: "sendingId")
         }
 
         let window = pendingFallbackWindowSeconds()
@@ -717,51 +745,27 @@ extension TelegramStore {
         if candidates.count > 1 {
             pendingMetrics.fallbackAmbiguous += 1
 #if DEBUG
-            print("[Reconcile] fallback ambiguous chatId=\(msg.chatId) count=\(candidates.count)")
+            log.debug("reconcile fallback ambiguous chatId=\(msg.chatId) count=\(candidates.count)")
 #endif
             return false
         }
 
         guard let match = candidates.first else { return false }
         pendingMetrics.reconcileByFallback += 1
-        return bindPendingToServerMessage(localId: match.localId, msg: msg, logLabel: "fallback")
+        return await bindPendingToServerMessage(localId: match.localId, msg: msg, logLabel: "fallback")
     }
 
     func coalesceOutgoingDuplicates(
         chatId: Int64,
         localId: UUID?,
         keepMessageId: Int64,
-        fallbackMessage: TGMessage?
-    ) {
-        guard var arr = messagesByChatId[chatId] else { return }
-        var idsToRemove: [Int64] = []
-
-        if let localId {
-            idsToRemove = arr.filter { $0.localId == localId && $0.id != keepMessageId }.map(\.id)
-        } else if let fallbackMessage {
-            let fallbackText = fallbackMessage.rawText ?? fallbackMessage.text
-            let candidates = arr.filter {
-                $0.isOutgoing &&
-                ($0.rawText ?? $0.text) == fallbackText &&
-                abs($0.date - fallbackMessage.date) <= 10 &&
-                ($0.sendState != .sent)
-            }
-            if candidates.count == 1, let candidate = candidates.first, candidate.id != keepMessageId {
-                idsToRemove = [candidate.id]
-            }
-        }
-
-        guard !idsToRemove.isEmpty else { return }
-        pendingMetrics.coalesceRemovedCount += idsToRemove.count
-        idsToRemove.forEach { id in
-            arr.removeAll { $0.id == id }
+        fallbackMessage _: TGMessage?
+    ) async {
+        guard let localId else { return }
+        pendingMetrics.coalesceRemovedCount += 1
+        await databaseBatchWriter.enqueue(.deleteMessagesByLocalId(chatId: chatId, localId: localId, keepingMessageId: keepMessageId))
 #if DEBUG
-            print("[Deduper] removed duplicate id=\(id) keep=\(keepMessageId) localId=\(localId?.uuidString ?? "nil")")
+        log.debug("deduper removed duplicates keep=\(keepMessageId) localId=\(localId.uuidString)")
 #endif
-            if id > 0 {
-                self.deleteMessages(chatId: chatId, messageIds: [id]) // deleteMessages(chatId:messageIds:)
-            }
-        }
-        messagesByChatId[chatId] = arr
     }
 }

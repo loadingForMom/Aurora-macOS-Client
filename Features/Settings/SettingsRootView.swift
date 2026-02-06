@@ -331,7 +331,27 @@ private struct DataAndStorageSettingsView: View {
     var body: some View {
         Form {
             Section("Использование памяти") {
-                if categories.isEmpty {
+                if !store.isAuthorized {
+                    LabeledContent("Всего") {
+                        Text("—")
+                            .foregroundStyle(.secondary)
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Доступно после входа в Telegram")
+                        Text("Завершите авторизацию, чтобы загрузить статистику и управлять кэшем.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+
+                    HStack(spacing: 12) {
+                        Button("Обновить статистику") { }
+                        Button("Очистить кэш") { }
+                            .disabled(true)
+                    }
+                    .disabled(true)
+                } else if categories.isEmpty {
                     LabeledContent("Всего") {
                         Text("—")
                             .foregroundStyle(.secondary)
@@ -347,10 +367,14 @@ private struct DataAndStorageSettingsView: View {
 
                     HStack(spacing: 12) {
                         Button("Обновить статистику") {
-                            store.refreshStorageStatistics()
+                            Task { @MainActor in
+                                store.refreshStorageStatistics()
+                            }
                         }
                         Button("Очистить кэш") {
-                            store.clearAllCache()
+                            Task { @MainActor in
+                                store.clearAllCache()
+                            }
                         }
                         .disabled(!canClearCache)
                     }
@@ -383,10 +407,14 @@ private struct DataAndStorageSettingsView: View {
 
                     HStack(spacing: 12) {
                         Button("Обновить статистику") {
-                            store.refreshStorageStatistics()
+                            Task { @MainActor in
+                                store.refreshStorageStatistics()
+                            }
                         }
                         Button("Очистить кэш") {
-                            store.clearAllCache()
+                            Task { @MainActor in
+                                store.clearAllCache()
+                            }
                         }
                         .disabled(!canClearCache)
                     }
@@ -451,9 +479,19 @@ private struct DataAndStorageSettingsView: View {
         }
         .task {
             guard !didRequestInitialStats else { return }
+            guard store.isAuthorized else { return }
             didRequestInitialStats = true
-            store.applyCacheLimitBytes(cacheLimitBytes)
-            store.refreshStorageStatistics()
+            await store.applyCacheLimitBytes(cacheLimitBytes)
+            await store.refreshStorageStatistics()
+        }
+        .onChange(of: store.isAuthorized) { _, isAuthorized in
+            guard isAuthorized else { return }
+            guard !didRequestInitialStats else { return }
+            didRequestInitialStats = true
+            Task { @MainActor in
+                store.applyCacheLimitBytes(cacheLimitBytes)
+                store.refreshStorageStatistics()
+            }
         }
         .onDisappear {
             cacheLimitApplyTask?.cancel()

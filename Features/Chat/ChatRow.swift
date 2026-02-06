@@ -6,6 +6,7 @@
 import SwiftUI
 import Foundation
 import AppKit
+import OSLog
 
 /// Shared disk image cache for avatars (prevents repeated NSImage(contentsOfFile:) thrash).
 final class DiskImageCache {
@@ -43,6 +44,8 @@ struct AvatarCacheKey: Hashable {
         "\(kind.rawValue):\(id):\(size):\(scale)" as NSString
     }
 }
+
+private let avatarLog = Logger(subsystem: "com.aurora.app", category: "avatar")
 
 final class AvatarImageCache {
     static let shared = AvatarImageCache()
@@ -162,7 +165,7 @@ struct AvatarCircle: View {
         guard self.identityKey == requestKey else {
 #if DEBUG
             assertionFailure("Avatar identity mismatch: expected \(String(describing: self.identityKey)) got \(requestKey)")
-            print("[Avatar] discarded image for \(requestKey)")
+            avatarLog.debug("discarded image for \(String(describing: requestKey), privacy: .public)")
 #endif
             return
         }

@@ -17,10 +17,11 @@ struct MessageBubble: View {
     var onRetry: () -> Void = {}
     var onDelete: () -> Void = {}
 
-    /// Kept for compatibility; jelly is applied via visualEffect in parent now.
+    /// Kept for compatibility; jelly is applied by the parent at the group level.
     var jellyOffsetY: CGFloat = 0
 
     private let maxReveal: CGFloat = 72
+    private let bubbleMaxWidth: CGFloat = 560
 
     init(
         msg: TGMessage,
@@ -36,9 +37,7 @@ struct MessageBubble: View {
         self.onRetry = onRetry
         self.onDelete = onDelete
         self.jellyOffsetY = jellyOffsetY
-#if DEBUG
-        assert(msg.chatId == currentChatId, "Message chatId mismatch: expected \(currentChatId) got \(msg.chatId)")
-#endif
+
     }
 
     var body: some View {
@@ -132,6 +131,7 @@ struct MessageBubble: View {
                 }
             }
         }
+        .frame(maxWidth: bubbleMaxWidth, alignment: msg.isOutgoing ? .trailing : .leading)
     }
 
     @ViewBuilder

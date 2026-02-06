@@ -86,19 +86,22 @@ struct TGUser: Identifiable, Hashable {
     }
 }
 
-enum TGMessageSendState: Hashable {
+enum TGMessageSendState: Hashable, Sendable {
     case sent
     case pending
     case sending
     case failed(errorText: String)
 }
 
-struct TGMessage: Identifiable, Hashable {
+struct TGMessage: Identifiable, Hashable, Sendable {
     let id: Int64
     let chatId: Int64
     let date: Int
     let isOutgoing: Bool
     let senderUserId: Int64?
+    
+    
+    
 
     /// Preview / fallback text (what you already used everywhere).
     let text: String
@@ -181,8 +184,13 @@ struct TGMessage: Identifiable, Hashable {
     var previewText: String { text }
 
     var textForRendering: String? {
-        guard contentType == "messageText" else { return nil }
-        return rawText ?? text
+        if contentType == "messageText" {
+            return rawText ?? text
+        }
+        if text.isEmpty {
+            return nil
+        }
+        return text
     }
 
     var messageKey: MessageKey {
@@ -203,23 +211,23 @@ struct TGMessage: Identifiable, Hashable {
     }
 }
 
-enum MessageStableId: Hashable {
+enum MessageStableId: Hashable, Sendable {
     case server(Int64)
     case local(UUID)
 }
 
-struct MessageKey: Hashable {
+struct MessageKey: Hashable, Sendable {
     let chatId: Int64
     let stableId: MessageStableId
 }
 
-struct TGTextEntity: Hashable {
+struct TGTextEntity: Hashable, Sendable {
     let type: TGTextEntityType
     let offset: Int
     let length: Int
 }
 
-enum TGTextEntityType: Hashable {
+enum TGTextEntityType: Hashable, Sendable {
     case bold
     case italic
     case underline

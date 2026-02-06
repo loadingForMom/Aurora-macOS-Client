@@ -3,28 +3,46 @@
 //
 
 import Foundation
+import os
 
 extension TelegramStore {
 
     // MARK: - JSON helpers
 
-    func sendJSON(_ obj: Any) {
+    func sendJSON(_ obj: Any, priority: TDLibClient.SendPriority = .high) {
         guard JSONSerialization.isValidJSONObject(obj) else {
-            print("[TD->] INVALID JSON: \(obj)")
+            log.error("tdlib invalid json: \(String(describing: obj), privacy: .public)")
             return
         }
 
         do {
             let data = try JSONSerialization.data(withJSONObject: obj)
             if let str = String(data: data, encoding: .utf8) {
-                print("[TD->] \(str)")
-                td.send(str)
+                log.debug("tdlib send \(str, privacy: .public)")
+                td.send(str, priority: priority)
             } else {
-                print("[TD->] encode error: invalid utf8")
+                log.error("tdlib encode error: invalid utf8")
             }
         } catch {
-            print("[TD->] encode error: \(error)")
+            log.error("tdlib encode error: \(String(describing: error), privacy: .public)")
         }
+    }
+
+    @discardableResult
+    func sendIfAuthorized(
+        _ obj: Any,
+        typeOverride: String? = nil,
+        priority: TDLibClient.SendPriority = .high
+    ) -> Bool {
+        let type = typeOverride
+            ?? (obj as? [String: Any])?["@type"] as? String
+            ?? "unknown"
+        guard isRequestAuthorizedSnapshot() else {
+            log.info("Blocked TDLib request (not authorized yet): \(type, privacy: .public)")
+            return false
+        }
+        sendJSON(obj, priority: priority)
+        return true
     }
 
     func parseTdError(_ resp: String) -> (code: Int, message: String, extra: String?)? {
@@ -134,13 +152,17 @@ extension TelegramStore {
 
     func parseChatOrder(_ obj: [String: Any]) -> Int64 {
         guard let positions = obj["positions"] as? [Any] else { return 0 }
+        return parseMainChatOrder(fromPositions: positions) ?? 0
+    }
+
+    func parseMainChatOrder(fromPositions positions: [Any]) -> Int64? {
         for p in positions {
             guard let dict = p as? [String: Any] else { continue }
             guard let list = dict["list"] as? [String: Any],
                   (list["@type"] as? String) == "chatListMain" else { continue }
             if let orderStr = dict["order"] as? String, let v = Int64(orderStr) { return v }
         }
-        return 0
+        return nil
     }
 
     func parseUpdateChatTitle(_ upd: String) -> (Int64, String)? {
@@ -162,13 +184,27 @@ extension TelegramStore {
         return (chatId, order)
     }
 
-    func parseUpdateChatLastMessage(_ upd: String) -> (Int64, TGMessage)? {
+    struct UpdateChatLastMessageParsed {
+        let chatId: Int64
+        let lastMessage: TGMessage?
+        let order: Int64?
+    }
+
+    func parseUpdateChatLastMessage(_ upd: String) -> UpdateChatLastMessageParsed? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "updateChatLastMessage" else { return nil }
         guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
-        guard let last = obj["last_message"] as? [String: Any] else { return nil }
-        guard let msg = parseMessageObject(last, expectedChatId: chatId) else { return nil }
-        return (chatId, msg)
+        let positions = obj["positions"] as? [Any] ?? []
+        let order = parseMainChatOrder(fromPositions: positions)
+
+        let lastMessage: TGMessage?
+        if let last = obj["last_message"] as? [String: Any] {
+            lastMessage = parseMessageObject(last, expectedChatId: chatId)
+        } else {
+            lastMessage = nil
+        }
+
+        return UpdateChatLastMessageParsed(chatId: chatId, lastMessage: lastMessage, order: order)
     }
 
     // MARK: - User objects
@@ -315,6 +351,7 @@ extension TelegramStore {
         return (user, photoFileId, photoPath)
     }
 
+    @MainActor
     func downloadMyPhotoIfNeeded(fileId: Int32) {
         if let p = myProfilePhotoPath,
            !p.isEmpty,
@@ -331,66 +368,66 @@ extension TelegramStore {
             "limit": 0,
             "synchronous": false
         ]
-        sendJSON(req)
+        _ = sendIfAuthorized(req)
     }
 
-    func parseUpdateFilePathIfMyPhoto(_ upd: String) -> String? {
+    func parseUpdateFilePathIfMyPhoto(_ upd: String) -> (Int32, String)? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "updateFile" else { return nil }
         guard let file = obj["file"] as? [String: Any] else { return nil }
         guard let idNum = file["id"] as? NSNumber else { return nil }
 
         let fid = idNum.int32Value
-        guard let target = myPhotoFileId, fid == target else { return nil }
-
         guard let local = file["local"] as? [String: Any] else { return nil }
         let done = (local["is_downloading_completed"] as? Bool) ?? false
         let path = (local["path"] as? String) ?? ""
 
         guard !path.isEmpty else { return nil }
 
-        if done { return path }
-        if FileManager.default.fileExists(atPath: path) { return path }
+        if done { return (fid, path) }
+        if FileManager.default.fileExists(atPath: path) { return (fid, path) }
         return nil
     }
 
-    func parseUpdateFilePathIfChatAvatar(_ upd: String) -> (Int64, Int32, String)? {
+    func parseUpdateFilePathIfChatAvatar(_ upd: String) -> (Int32, String)? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "updateFile" else { return nil }
         guard let file = obj["file"] as? [String: Any] else { return nil }
         guard let idNum = file["id"] as? NSNumber else { return nil }
 
         let fid = idNum.int32Value
-        guard let chatId = chatIdByAvatarFileId[fid] else { return nil }
-
         guard let local = file["local"] as? [String: Any] else { return nil }
         let done = (local["is_downloading_completed"] as? Bool) ?? false
         let path = (local["path"] as? String) ?? ""
 
         guard !path.isEmpty else { return nil }
 
-        if FileManager.default.fileExists(atPath: path) {
-            return (chatId, fid, path)
-        }
+        if FileManager.default.fileExists(atPath: path) { return (fid, path) }
 
         guard done else { return nil }
-        return (chatId, fid, path)
+        return (fid, path)
     }
 
-    func parseUpdateChatPhoto(_ upd: String) -> (Int64, Int32?, Int32?, String?)? {
+    struct ChatPhotoUpdate {
+        let chatId: Int64
+        let smallId: Int32?
+        let bigId: Int32?
+        let bestPath: String?
+        let hasPhoto: Bool
+    }
+
+    func parseUpdateChatPhoto(_ upd: String) -> ChatPhotoUpdate? {
         guard let obj = parseJSON(upd) else { return nil }
         guard (obj["@type"] as? String) == "updateChatPhoto" else { return nil }
         guard let chatId = (obj["chat_id"] as? NSNumber)?.int64Value else { return nil }
 
         guard let photo = obj["photo"] as? [String: Any] else {
-            chatAvatarPathByChatId.removeValue(forKey: chatId)
-            chatAvatarMetaByChatId.removeValue(forKey: chatId)
-            return (chatId, nil, nil, nil)
+            return ChatPhotoUpdate(chatId: chatId, smallId: nil, bigId: nil, bestPath: nil, hasPhoto: false)
         }
 
         let extracted = extractChatPhotoIdsAndPaths(photo)
         let best = extracted.smallPath ?? extracted.bigPath
-        return (chatId, extracted.smallId, extracted.bigId, best)
+        return ChatPhotoUpdate(chatId: chatId, smallId: extracted.smallId, bigId: extracted.bigId, bestPath: best, hasPhoto: true)
     }
 
     // MARK: - Messages / history
@@ -409,6 +446,7 @@ extension TelegramStore {
         let msgs = anyArr
             .compactMap { $0 as? [String: Any] }
             .compactMap { parseMessageObject($0) }
+            .sorted { $0.id > $1.id }
         return MessagesResponse(extra: extra, messages: msgs)
     }
 
