@@ -303,10 +303,14 @@ final class TelegramStore: ObservableObject {
 
     // Read/viewed
     func viewMessages(chatId: Int64, messageIds: [Int64], forceRead: Bool = false) {
-        let filteredIds = messageIds.filter { $0 > 0 }
+        let positiveIds = messageIds.filter { $0 > 0 }
+        let filteredIds = Array(Set(positiveIds)).sorted()
 #if DEBUG
-        if filteredIds.count != messageIds.count {
+        if positiveIds.count != messageIds.count {
             log.debug("viewMessages filtered invalid ids from \(messageIds, privacy: .public)")
+        }
+        if filteredIds.count != positiveIds.count {
+            log.debug("viewMessages deduped \(positiveIds.count - filteredIds.count, privacy: .public) duplicate ids")
         }
 #endif
         guard !filteredIds.isEmpty else { return }
@@ -319,7 +323,7 @@ final class TelegramStore: ObservableObject {
     }
 
     func reportVisibleMessages(chatId: Int64, minMessageId: Int64?, maxMessageId: Int64?, messageIds: [Int64]) {
-        let sortedIds = messageIds.filter { $0 > 0 }.sorted()
+        let sortedIds = Array(Set(messageIds.filter { $0 > 0 })).sorted()
         let lo = minMessageId.map(String.init) ?? "n/a"
         let hi = maxMessageId.map(String.init) ?? "n/a"
         let firstId = sortedIds.first.map(String.init) ?? "n/a"
@@ -334,7 +338,7 @@ final class TelegramStore: ObservableObject {
             chatId: chatId,
             minMessageId: minMessageId,
             maxMessageId: maxMessageId,
-            messageIds: messageIds
+            messageIds: sortedIds
         ) { [weak self] scheduledChatId, ids in
             self?.sendViewMessagesNow(
                 chatId: scheduledChatId,
@@ -354,7 +358,8 @@ final class TelegramStore: ObservableObject {
     }
 
     func sendViewMessagesNow(chatId: Int64, messageIds: [Int64], forceRead: Bool, reason: String) {
-        let sortedIds = messageIds.filter { $0 > 0 }.sorted()
+        let sortedIds = Array(Set(messageIds.filter { $0 > 0 })).sorted()
+        guard !sortedIds.isEmpty else { return }
         let firstId = sortedIds.first.map(String.init) ?? "n/a"
         let lastId = sortedIds.last.map(String.init) ?? "n/a"
         SwiftUIPublishTrace.storeEvent(
@@ -366,7 +371,7 @@ final class TelegramStore: ObservableObject {
         let req: [String: Any] = [
             "@type": "viewMessages",
             "chat_id": chatId,
-            "message_ids": messageIds,
+            "message_ids": sortedIds,
             "force_read": forceRead
         ]
         enqueueTDLibRequest(req, typeOverride: "viewMessages", priority: .low)
@@ -963,12 +968,19 @@ final class ViewMessagesCoordinator {
 
     private let queue = DispatchQueue(label: "com.aurora.app.viewmessages.coordinator")
     private let debounceDelay: TimeInterval
+    private let resendSuppressionWindowNs: UInt64
     private var pendingByChat: [Int64: PendingState] = [:]
     private var seenByChat: [Int64: Set<Int64>] = [:]
     private var lastSentRangeByChat: [Int64: RangeSignature] = [:]
+    private var lastSentAtNsByChat: [Int64: UInt64] = [:]
+    private var lastSentIdsByChat: [Int64: Set<Int64>] = [:]
 
-    init(debounceDelay: TimeInterval = 0.25) {
+    init(
+        debounceDelay: TimeInterval = 0.25,
+        resendSuppressionWindowNs: UInt64 = 300_000_000
+    ) {
         self.debounceDelay = debounceDelay
+        self.resendSuppressionWindowNs = resendSuppressionWindowNs
     }
 
     func schedule(
@@ -1027,6 +1039,22 @@ final class ViewMessagesCoordinator {
 
                 let ids = unseen.sorted()
                 guard !ids.isEmpty else { return }
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                if let lastSentAt = self.lastSentAtNsByChat[chatId],
+                   nowNs >= lastSentAt,
+                   (nowNs - lastSentAt) <= self.resendSuppressionWindowNs,
+                   let lastSentIds = self.lastSentIdsByChat[chatId],
+                   unseen.isSubset(of: lastSentIds) {
+                    let firstId = ids.first.map(String.init) ?? "n/a"
+                    let lastId = ids.last.map(String.init) ?? "n/a"
+                    SwiftUIPublishTrace.storeEvent(
+                        name: "viewMessages_skipped",
+                        chatId: chatId,
+                        details: "source=ViewMessagesCoordinator_fire reason=duplicate_window count=\(ids.count) first=\(firstId) last=\(lastId)",
+                        reason: "fromVisibleRange"
+                    )
+                    return
+                }
                 let firstId = ids.first.map(String.init) ?? "n/a"
                 let lastId = ids.last.map(String.init) ?? "n/a"
                 SwiftUIPublishTrace.storeEvent(
@@ -1036,6 +1064,8 @@ final class ViewMessagesCoordinator {
                     reason: "fromVisibleRange"
                 )
                 send(chatId, ids)
+                self.lastSentAtNsByChat[chatId] = nowNs
+                self.lastSentIdsByChat[chatId] = Set(ids)
             }
 
             state.workItem = item
@@ -1051,6 +1081,8 @@ final class ViewMessagesCoordinator {
             self.pendingByChat.removeValue(forKey: chatId)
             self.seenByChat.removeValue(forKey: chatId)
             self.lastSentRangeByChat.removeValue(forKey: chatId)
+            self.lastSentAtNsByChat.removeValue(forKey: chatId)
+            self.lastSentIdsByChat.removeValue(forKey: chatId)
         }
     }
 
@@ -1063,6 +1095,8 @@ final class ViewMessagesCoordinator {
             self.pendingByChat.removeAll(keepingCapacity: false)
             self.seenByChat.removeAll(keepingCapacity: false)
             self.lastSentRangeByChat.removeAll(keepingCapacity: false)
+            self.lastSentAtNsByChat.removeAll(keepingCapacity: false)
+            self.lastSentIdsByChat.removeAll(keepingCapacity: false)
         }
     }
 }

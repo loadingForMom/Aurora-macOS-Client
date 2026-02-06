@@ -11,43 +11,77 @@ actor DatabaseBatchWriter {
     private let repository: AppDatabaseRepository
     private let coalesceDelay: UInt64
     private let maxPendingBeforeImmediateFlush: Int
+    private let burstCoalesceDelay: UInt64
+    private let burstImmediateFlushThreshold: Int
+    private let burstBatchLimit: Int
+    private let burstWindowNs: UInt64
+    private let burstOpsThreshold: Int
 
     private var pending: [DatabaseOperation] = []
     private var flushTask: Task<Void, Never>?
+    private var scheduledFlushDelay: UInt64?
+    private var recentEnqueueSamples: [(timestamp: UInt64, count: Int)] = []
 
     init(
         repository: AppDatabaseRepository,
         coalesceDelay: UInt64 = 30_000_000,
         maxPendingBeforeImmediateFlush: Int = 160
     ) {
+        let normalizedMaxPending = max(32, maxPendingBeforeImmediateFlush)
         self.repository = repository
         self.coalesceDelay = coalesceDelay
-        self.maxPendingBeforeImmediateFlush = max(32, maxPendingBeforeImmediateFlush)
+        self.maxPendingBeforeImmediateFlush = normalizedMaxPending
+        self.burstCoalesceDelay = min(coalesceDelay, 8_000_000)
+        self.burstImmediateFlushThreshold = max(48, normalizedMaxPending * 3 / 4)
+        self.burstBatchLimit = max(48, normalizedMaxPending * 3 / 5)
+        self.burstWindowNs = 600_000_000
+        self.burstOpsThreshold = max(80, normalizedMaxPending * 3 / 4)
     }
 
     func enqueue(_ operation: DatabaseOperation) {
         pending.append(operation)
+        recordEnqueue(count: 1)
         scheduleFlush()
     }
 
     func enqueue(_ operations: [DatabaseOperation]) {
         guard !operations.isEmpty else { return }
         pending.append(contentsOf: operations)
+        recordEnqueue(count: operations.count)
         scheduleFlush()
     }
 
     private func scheduleFlush() {
-        if pending.count >= maxPendingBeforeImmediateFlush {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let burstMode = isBurstMode(now: now)
+        let immediateThreshold = burstMode
+            ? burstImmediateFlushThreshold
+            : maxPendingBeforeImmediateFlush
+        if pending.count >= immediateThreshold {
             flushTask?.cancel()
             flushTask = nil
+            scheduledFlushDelay = nil
             flush()
             return
         }
 
+        let desiredDelay = burstMode ? burstCoalesceDelay : coalesceDelay
+        if flushTask != nil {
+            let currentDelay = scheduledFlushDelay ?? UInt64.max
+            guard desiredDelay < currentDelay else { return }
+            flushTask?.cancel()
+            flushTask = nil
+            scheduledFlushDelay = nil
+        }
+        scheduleFlushTask(after: desiredDelay)
+    }
+
+    private func scheduleFlushTask(after delay: UInt64) {
         guard flushTask == nil else { return }
+        scheduledFlushDelay = delay
         flushTask = Task(priority: .utility) { [weak self] in
             guard let self else { return }
-            try? await Task.sleep(nanoseconds: self.coalesceDelay)
+            try? await Task.sleep(nanoseconds: delay)
             await self.flush()
         }
     }
@@ -55,22 +89,91 @@ actor DatabaseBatchWriter {
     func flushNow() async {
         flushTask?.cancel()
         flushTask = nil
-        flush()
+        scheduledFlushDelay = nil
+        flush(drainAll: true)
     }
 
-    private func flush() {
+    private func flush(drainAll: Bool = false) {
         flushTask = nil
-        let operations = pending
-        pending.removeAll(keepingCapacity: true)
-        guard !operations.isEmpty else { return }
-        let compacted = compact(operations)
-        repository.apply(operations: compacted)
-        if compacted.count == operations.count {
-            log.debug("flushed \(compacted.count, privacy: .public) db operations")
-        } else {
-            log.debug(
-                "flushed \(compacted.count, privacy: .public) db operations (from \(operations.count, privacy: .public))"
-            )
+        scheduledFlushDelay = nil
+
+        while true {
+            let operations = pending
+            pending.removeAll(keepingCapacity: true)
+            guard !operations.isEmpty else { return }
+
+            let now = DispatchTime.now().uptimeNanoseconds
+            let burstMode = isBurstMode(now: now)
+            let compacted = compact(operations)
+            guard !compacted.isEmpty else {
+                if drainAll {
+                    continue
+                }
+                if !pending.isEmpty {
+                    scheduleFlushTask(after: burstMode ? burstCoalesceDelay : coalesceDelay)
+                }
+                return
+            }
+
+            let batchLimit: Int = {
+                if drainAll {
+                    return compacted.count
+                }
+                if burstMode && compacted.count > burstBatchLimit {
+                    return burstBatchLimit
+                }
+                return compacted.count
+            }()
+
+            let applied = Array(compacted.prefix(batchLimit))
+            let deferredCount = compacted.count - applied.count
+            if deferredCount > 0 {
+                pending.insert(contentsOf: compacted.suffix(deferredCount), at: 0)
+            }
+
+            repository.apply(operations: applied)
+            if deferredCount > 0 {
+                log.debug(
+                    "flushed \(applied.count, privacy: .public) db operations (from \(operations.count, privacy: .public), deferred \(deferredCount, privacy: .public)) mode=\(burstMode ? "burst" : "normal", privacy: .public)"
+                )
+            } else if applied.count == operations.count {
+                log.debug("flushed \(applied.count, privacy: .public) db operations mode=\(burstMode ? "burst" : "normal", privacy: .public)")
+            } else {
+                log.debug(
+                    "flushed \(applied.count, privacy: .public) db operations (from \(operations.count, privacy: .public)) mode=\(burstMode ? "burst" : "normal", privacy: .public)"
+                )
+            }
+
+            if drainAll {
+                continue
+            }
+
+            if !pending.isEmpty {
+                scheduleFlushTask(after: burstMode ? burstCoalesceDelay : coalesceDelay)
+            }
+            return
+        }
+    }
+
+    private func recordEnqueue(count: Int) {
+        guard count > 0 else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        recentEnqueueSamples.append((timestamp: now, count: count))
+        trimRecentEnqueueSamples(now: now)
+    }
+
+    private func isBurstMode(now: UInt64) -> Bool {
+        trimRecentEnqueueSamples(now: now)
+        let recentOps = recentEnqueueSamples.reduce(into: 0) { partialResult, sample in
+            partialResult += sample.count
+        }
+        return recentOps >= burstOpsThreshold
+    }
+
+    private func trimRecentEnqueueSamples(now: UInt64) {
+        let minTimestamp = now > burstWindowNs ? (now - burstWindowNs) : 0
+        while let first = recentEnqueueSamples.first, first.timestamp < minTimestamp {
+            recentEnqueueSamples.removeFirst()
         }
     }
 
