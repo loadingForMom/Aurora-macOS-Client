@@ -14,6 +14,9 @@ struct MessageBubble: View {
     /// Trackpad “reveal exact time” (0…maxReveal), passed from parent.
     let revealTimeX: CGFloat
 
+    /// Simplified rendering mode for dense windows.
+    let optimizeForPerformance: Bool
+
     var onRetry: () -> Void = {}
     var onDelete: () -> Void = {}
 
@@ -27,6 +30,7 @@ struct MessageBubble: View {
         msg: TGMessage,
         currentChatId: Int64,
         revealTimeX: CGFloat = 0,
+        optimizeForPerformance: Bool = false,
         onRetry: @escaping () -> Void = {},
         onDelete: @escaping () -> Void = {},
         jellyOffsetY: CGFloat = 0
@@ -34,6 +38,7 @@ struct MessageBubble: View {
         self.msg = msg
         self.currentChatId = currentChatId
         self.revealTimeX = revealTimeX
+        self.optimizeForPerformance = optimizeForPerformance
         self.onRetry = onRetry
         self.onDelete = onDelete
         self.jellyOffsetY = jellyOffsetY
@@ -76,7 +81,21 @@ struct MessageBubble: View {
                 }
                 .frame(maxWidth: .infinity, alignment: msg.isOutgoing ? .trailing : .leading)
                 .offset(y: jellyOffsetY)
-                .contextMenu {
+                .modifier(OutgoingContextMenuModifier(enabled: !optimizeForPerformance, msg: msg, onRetry: onRetry, onDelete: onDelete))
+            }
+        }
+    }
+
+    private struct OutgoingContextMenuModifier: ViewModifier {
+        let enabled: Bool
+        let msg: TGMessage
+        let onRetry: () -> Void
+        let onDelete: () -> Void
+
+        @ViewBuilder
+        func body(content: Content) -> some View {
+            if enabled {
+                content.contextMenu {
                     if msg.isOutgoing {
                         if case .failed = msg.sendState, msg.canRetry {
                             Button("Retry") { onRetry() }
@@ -84,6 +103,8 @@ struct MessageBubble: View {
                         Button("Delete") { onDelete() }
                     }
                 }
+            } else {
+                content
             }
         }
     }
@@ -93,24 +114,23 @@ struct MessageBubble: View {
         let hideStatusLine = isRevealingTime && isSentState
 
         VStack(alignment: msg.isOutgoing ? .trailing : .leading, spacing: 4) {
-            let attributed = MessageTextPipeline.render(
+            BubbleTextView(
                 chatId: msg.chatId,
                 messageId: msg.id,
                 rawText: msg.textForRendering,
                 entities: msg.entities,
-                style: .bubbleBody
+                isOutgoing: msg.isOutgoing,
+                textSelectionEnabled: !optimizeForPerformance
             )
-            Text(attributed)
-                .foregroundStyle(msg.isOutgoing ? .white : .primary)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.vertical, 8)
-                .padding(.horizontal, 12)
-                .background(bubbleBackground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay(
+            .padding(.vertical, 8)
+            .padding(.horizontal, 12)
+            .background(bubbleBackground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay {
+                if !optimizeForPerformance {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
-                )
+                }
+            }
 
             HStack(spacing: 6) {
                 if msg.isEdited {
@@ -175,6 +195,9 @@ struct MessageBubble: View {
             // Make outgoing bubbles always “Messages blue” on macOS.
             return AnyShapeStyle(Color(nsColor: .systemBlue))
         } else {
+            if optimizeForPerformance {
+                return AnyShapeStyle(Color(nsColor: .controlBackgroundColor))
+            }
             return AnyShapeStyle(.thinMaterial)
         }
     }
@@ -201,4 +224,73 @@ struct MessageBubble: View {
         f.timeStyle = .short
         return f
     }()
+}
+
+private struct BubbleTextView: View {
+    let chatId: Int64
+    let messageId: Int64
+    let rawText: String?
+    let entities: [TGTextEntity]
+    let isOutgoing: Bool
+    let textSelectionEnabled: Bool
+
+    @State private var attributed: AttributedString
+
+    init(
+        chatId: Int64,
+        messageId: Int64,
+        rawText: String?,
+        entities: [TGTextEntity],
+        isOutgoing: Bool,
+        textSelectionEnabled: Bool
+    ) {
+        self.chatId = chatId
+        self.messageId = messageId
+        self.rawText = rawText
+        self.entities = entities
+        self.isOutgoing = isOutgoing
+        self.textSelectionEnabled = textSelectionEnabled
+        _attributed = State(
+            initialValue: MessageTextPipeline.render(
+                chatId: chatId,
+                messageId: messageId,
+                rawText: rawText,
+                entities: entities,
+                style: .bubbleBody
+            )
+        )
+    }
+
+    var body: some View {
+        Group {
+            if textSelectionEnabled {
+                Text(attributed)
+                    .textSelection(.enabled)
+            } else {
+                Text(attributed)
+                    .textSelection(.disabled)
+            }
+        }
+        .foregroundStyle(isOutgoing ? .white : .primary)
+        .fixedSize(horizontal: false, vertical: true)
+        .onChange(of: messageId) { _, _ in
+            rerender()
+        }
+        .onChange(of: rawText) { _, _ in
+            rerender()
+        }
+        .onChange(of: entities) { _, _ in
+            rerender()
+        }
+    }
+
+    private func rerender() {
+        attributed = MessageTextPipeline.render(
+            chatId: chatId,
+            messageId: messageId,
+            rawText: rawText,
+            entities: entities,
+            style: .bubbleBody
+        )
+    }
 }

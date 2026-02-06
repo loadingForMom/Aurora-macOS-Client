@@ -233,10 +233,6 @@ final class TelegramStore: ObservableObject {
             AuroraRuntimeMetrics.shared.incrementPublish("storeSelectedChat")
         }
         syncHistoryLoadingFlagForSelectedChat()
-        Task.detached(priority: .utility) { [weak self] in
-            guard let self else { return }
-            await self.primeMessageStore(chatId: chatId, limit: 160)
-        }
 
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
@@ -420,7 +416,6 @@ final class TelegramStore: ObservableObject {
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             await self.messageStore.setWindowLimit(chatId: chatId, limit: windowSize)
-            await self.primeMessageStore(chatId: chatId, limit: windowSize)
         }
     }
 
@@ -1201,6 +1196,7 @@ final class TDLibDownloadLimiter {
 actor MessageStore {
     private struct ChatState {
         var messagesById: [Int64: TGMessage] = [:]
+        var orderedMessageIds: [Int64] = []
         var windowLimit: Int = 160
         var continuations: [UUID: AsyncStream<[TGMessage]>.Continuation] = [:]
         var lastPublishedSnapshot: [TGMessage] = []
@@ -1235,6 +1231,7 @@ actor MessageStore {
 
     func setWindowLimit(chatId: Int64, limit: Int) {
         var chat = chatStateById[chatId] ?? ChatState()
+        normalizeOrderedIdsIfNeeded(chat: &chat)
         let bounded = max(40, min(limit, 5_000))
         guard chat.windowLimit != bounded else { return }
         chat.windowLimit = bounded
@@ -1252,14 +1249,14 @@ actor MessageStore {
         }
 
         var chat = chatStateById[chatId] ?? ChatState()
+        normalizeOrderedIdsIfNeeded(chat: &chat)
         if let windowLimit {
             chat.windowLimit = max(chat.windowLimit, min(windowLimit, 5_000))
         }
 
         var changed = 0
         for message in messages where message.chatId == chatId {
-            if chat.messagesById[message.id] != message {
-                chat.messagesById[message.id] = message
+            if upsertMessage(&chat, message: message) {
                 changed += 1
             }
         }
@@ -1282,6 +1279,7 @@ actor MessageStore {
         guard var chat = chatStateById[chatId],
               var message = chat.messagesById[messageId]
         else { return false }
+        normalizeOrderedIdsIfNeeded(chat: &chat)
         let editedValue = editDate > 0 ? editDate : nil
         guard message.editedAt != editedValue else { return false }
         message.editedAt = editedValue
@@ -1297,6 +1295,7 @@ actor MessageStore {
         guard var chat = chatStateById[chatId],
               var message = chat.messagesById[messageId]
         else { return false }
+        normalizeOrderedIdsIfNeeded(chat: &chat)
         guard message.text != text else { return false }
         let id = message.id
         let date = message.date
@@ -1343,9 +1342,11 @@ actor MessageStore {
     @discardableResult
     func applyDelete(chatId: Int64, messageIds: [Int64]) -> Int {
         guard var chat = chatStateById[chatId], !messageIds.isEmpty else { return 0 }
+        normalizeOrderedIdsIfNeeded(chat: &chat)
         var removed = 0
         for id in messageIds {
             if chat.messagesById.removeValue(forKey: id) != nil {
+                removeOrderedMessageId(&chat.orderedMessageIds, messageId: id)
                 removed += 1
             }
         }
@@ -1370,6 +1371,7 @@ actor MessageStore {
         windowLimit: Int
     ) {
         var chat = chatStateById[chatId] ?? ChatState()
+        normalizeOrderedIdsIfNeeded(chat: &chat)
         chat.windowLimit = max(chat.windowLimit, min(windowLimit, 5_000))
         chat.continuations[subscriberId] = continuation
         chatStateById[chatId] = chat
@@ -1407,6 +1409,7 @@ actor MessageStore {
 
     private func publish(chatId: Int64) {
         guard var chat = chatStateById[chatId] else { return }
+        normalizeOrderedIdsIfNeeded(chat: &chat)
         chat.publishTask = nil
         let newSnapshot = snapshot(for: chat)
         let firstId = newSnapshot.first.map(\.id).map(String.init) ?? "n/a"
@@ -1439,18 +1442,18 @@ actor MessageStore {
     }
 
     private func snapshot(for chat: ChatState) -> [TGMessage] {
-        let sorted = chat.messagesById.values.sorted { lhs, rhs in
-            let l = orderingKey(for: lhs.id)
-            let r = orderingKey(for: rhs.id)
-            if l == r {
-                return lhs.date < rhs.date
+        guard !chat.orderedMessageIds.isEmpty else { return [] }
+        let boundedCount = min(chat.windowLimit, chat.orderedMessageIds.count)
+        let start = chat.orderedMessageIds.count - boundedCount
+        let ids = chat.orderedMessageIds[start...]
+        var window: [TGMessage] = []
+        window.reserveCapacity(boundedCount)
+        for id in ids {
+            if let message = chat.messagesById[id] {
+                window.append(message)
             }
-            return l < r
         }
-        if sorted.count > chat.windowLimit {
-            return Array(sorted.suffix(chat.windowLimit))
-        }
-        return sorted
+        return window
     }
 
     private func orderingKey(for messageId: Int64) -> Int64 {
@@ -1463,10 +1466,64 @@ actor MessageStore {
     private func pruneIfNeeded(chat: inout ChatState) {
         let overflow = chat.messagesById.count - maxMessagesPerChat
         guard overflow > 0 else { return }
-        let sortedIds = chat.messagesById.keys.sorted { orderingKey(for: $0) < orderingKey(for: $1) }
-        for id in sortedIds.prefix(overflow) {
+        let overflowIds = chat.orderedMessageIds.prefix(overflow)
+        for id in overflowIds {
             chat.messagesById.removeValue(forKey: id)
         }
+        chat.orderedMessageIds.removeFirst(min(overflow, chat.orderedMessageIds.count))
+    }
+
+    private func upsertMessage(_ chat: inout ChatState, message: TGMessage) -> Bool {
+        let existing = chat.messagesById[message.id]
+        guard existing != message else { return false }
+        if existing == nil {
+            let insertion = insertionIndex(for: message.id, in: chat.orderedMessageIds)
+            chat.orderedMessageIds.insert(message.id, at: insertion)
+        }
+        chat.messagesById[message.id] = message
+        return true
+    }
+
+    private func removeOrderedMessageId(_ orderedIds: inout [Int64], messageId: Int64) {
+        guard let index = indexOfMessageId(messageId, in: orderedIds) else { return }
+        orderedIds.remove(at: index)
+    }
+
+    private func normalizeOrderedIdsIfNeeded(chat: inout ChatState) {
+        guard chat.orderedMessageIds.count != chat.messagesById.count else { return }
+        chat.orderedMessageIds = chat.messagesById.keys.sorted { orderingKey(for: $0) < orderingKey(for: $1) }
+    }
+
+    private func insertionIndex(for messageId: Int64, in orderedIds: [Int64]) -> Int {
+        let key = orderingKey(for: messageId)
+        var low = 0
+        var high = orderedIds.count
+        while low < high {
+            let mid = (low + high) / 2
+            if orderingKey(for: orderedIds[mid]) < key {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        return low
+    }
+
+    private func indexOfMessageId(_ messageId: Int64, in orderedIds: [Int64]) -> Int? {
+        let key = orderingKey(for: messageId)
+        var low = 0
+        var high = orderedIds.count
+        while low < high {
+            let mid = (low + high) / 2
+            let midKey = orderingKey(for: orderedIds[mid])
+            if midKey < key {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        guard low < orderedIds.count, orderedIds[low] == messageId else { return nil }
+        return low
     }
 
     private func debugLogMutation(label: String, chatId: Int64, changed: Int) {

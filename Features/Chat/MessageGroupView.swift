@@ -10,6 +10,7 @@ struct ChatMessageGroupView: View {
     @ObservedObject var store: TelegramStore
     let chat: TGChat
     let group: MessageGroup
+    let optimizeForLargeTimeline: Bool
 
     /// Trackpad “reveal exact time” (0…maxReveal)
     let revealTimeX: CGFloat
@@ -21,12 +22,14 @@ struct ChatMessageGroupView: View {
         store: TelegramStore,
         chat: TGChat,
         group: MessageGroup,
+        optimizeForLargeTimeline: Bool = false,
         revealTimeX: CGFloat = 0,
         jellyScrollImpulse: CGFloat = 0
     ) {
         self.store = store
         self.chat = chat
         self.group = group
+        self.optimizeForLargeTimeline = optimizeForLargeTimeline
         self.revealTimeX = revealTimeX
         self.jellyScrollImpulse = jellyScrollImpulse
     }
@@ -54,6 +57,7 @@ struct ChatMessageGroupView: View {
                         msg: msg,
                         currentChatId: chat.id,
                         revealTimeX: revealTimeX,
+                        optimizeForPerformance: optimizeForLargeTimeline,
                         onRetry: { store.retrySend(message: msg) },
                         onDelete: { store.deleteMessages(chatId: msg.chatId, messageIds: [msg.id], revoke: true) }
                     )

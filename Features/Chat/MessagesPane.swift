@@ -31,14 +31,25 @@ struct MessagesPane: View {
     @State private var didInitialScrollToBottom: Bool = false
 
     @State private var revealTimeX: CGFloat = 0
-    private let maxReveal: CGFloat = 72
+    @State private var lastAutoScrollAnimatedAtNs: UInt64 = 0
+    @State private var didCrossPaginationThreshold: Bool = false
     private let groupGap: Int = 5 * 60
     private let majorGap: Int = 60 * 60
+    private let autoScrollAnimationCooldownNs: UInt64 = 220_000_000
+    private let paginationTopThreshold: CGFloat = 140
+    private let heavyEffectsCutoffMessages: Int = 700
 
     private static let rowBuildWorker = RowsBuildWorker()
+    private let scrollSpaceName = "messages-scroll-space"
 
     private var topSentinelId: String { "top:\(chat.id)" }
     private var bottomSentinelId: String { "bottom:\(chat.id)" }
+    private var optimizeBubbleEffects: Bool { windowMessages.count >= heavyEffectsCutoffMessages }
+
+    private struct RowBuildResult: Sendable {
+        let filteredMessages: [TGMessage]
+        let rows: [Row]
+    }
 
     private enum Row: Identifiable, Hashable, Sendable {
         case dayHeader(id: String, date: Date)
@@ -58,15 +69,29 @@ struct MessagesPane: View {
         func build(
             chatId: Int64,
             messages: [TGMessage],
+            previousMessages: [TGMessage],
+            previousRows: [Row],
             groupGap: Int,
             majorGap: Int
-        ) -> [Row] {
-            MessagesPane.buildRows(
+        ) -> RowBuildResult {
+            let filtered = messages.filter { $0.chatId == chatId }
+            if let incremental = MessagesPane.buildRowsIncrementalIfPossible(
                 chatId: chatId,
-                messages: messages,
+                previousMessages: previousMessages,
+                newMessages: filtered,
+                previousRows: previousRows,
+                groupGap: groupGap,
+                majorGap: majorGap
+            ) {
+                return RowBuildResult(filteredMessages: filtered, rows: incremental)
+            }
+            let rebuilt = MessagesPane.buildRows(
+                chatId: chatId,
+                messages: filtered,
                 groupGap: groupGap,
                 majorGap: majorGap
             )
+            return RowBuildResult(filteredMessages: filtered, rows: rebuilt)
         }
     }
 
@@ -153,6 +178,119 @@ struct MessagesPane: View {
         return rows
     }
 
+    nonisolated private static func buildRowsIncrementalIfPossible(
+        chatId: Int64,
+        previousMessages: [TGMessage],
+        newMessages: [TGMessage],
+        previousRows: [Row],
+        groupGap: Int,
+        majorGap: Int
+    ) -> [Row]? {
+        guard !previousMessages.isEmpty else { return nil }
+        guard newMessages.count >= previousMessages.count else { return nil }
+        guard newMessages.starts(with: previousMessages) else { return nil }
+        let appendedMessages = Array(newMessages.dropFirst(previousMessages.count))
+        guard !appendedMessages.isEmpty else { return previousRows }
+
+        var rows = previousRows
+        var lastMessage = previousMessages.last
+        let calendar = Calendar.current
+
+        for message in appendedMessages {
+            appendMessageRow(
+                chatId: chatId,
+                message: message,
+                rows: &rows,
+                lastMessage: &lastMessage,
+                calendar: calendar,
+                groupGap: groupGap,
+                majorGap: majorGap
+            )
+        }
+        return rows
+    }
+
+    nonisolated private static func appendMessageRow(
+        chatId: Int64,
+        message: TGMessage,
+        rows: inout [Row],
+        lastMessage: inout TGMessage?,
+        calendar: Calendar,
+        groupGap: Int,
+        majorGap: Int
+    ) {
+        let messageDate = Date(timeIntervalSince1970: TimeInterval(message.date))
+        let messageDay = calendar.startOfDay(for: messageDate)
+
+        if let previous = lastMessage {
+            let previousDay = calendar.startOfDay(for: Date(timeIntervalSince1970: TimeInterval(previous.date)))
+            if previousDay != messageDay {
+                let key = dayKey(messageDay, calendar: calendar)
+                rows.append(.dayHeader(id: "\(chatId):day:\(key)", date: messageDay))
+            } else if abs(message.date - previous.date) >= majorGap {
+                rows.append(
+                    .timeSeparator(
+                        id: "\(chatId):time:\(message.date)",
+                        date: messageDate
+                    )
+                )
+            }
+        } else {
+            let key = dayKey(messageDay, calendar: calendar)
+            rows.append(.dayHeader(id: "\(chatId):day:\(key)", date: messageDay))
+        }
+
+        if canAppendToLastGroup(
+            rows: rows,
+            previousMessage: lastMessage,
+            message: message,
+            groupGap: groupGap,
+            calendar: calendar
+        ) {
+            if case .group(var group) = rows[rows.count - 1] {
+                group.messages.append(message)
+                rows[rows.count - 1] = .group(group)
+                lastMessage = message
+                return
+            }
+        }
+
+        rows.append(
+            .group(
+                MessageGroup(
+                    id: groupId(chatId: chatId, firstMessage: message),
+                    isOutgoing: message.isOutgoing,
+                    senderUserId: message.senderUserId,
+                    messages: [message]
+                )
+            )
+        )
+        lastMessage = message
+    }
+
+    nonisolated private static func canAppendToLastGroup(
+        rows: [Row],
+        previousMessage: TGMessage?,
+        message: TGMessage,
+        groupGap: Int,
+        calendar: Calendar
+    ) -> Bool {
+        guard let previousMessage else { return false }
+        guard case .group(let group) = rows.last else { return false }
+        guard group.messages.last?.id == previousMessage.id else { return false }
+        let previousDay = calendar.startOfDay(for: Date(timeIntervalSince1970: TimeInterval(previousMessage.date)))
+        let messageDay = calendar.startOfDay(for: Date(timeIntervalSince1970: TimeInterval(message.date)))
+        guard previousDay == messageDay else { return false }
+        let sameSender = message.senderUserId == group.senderUserId
+        let sameDirection = message.isOutgoing == group.isOutgoing
+        let close = abs(message.date - previousMessage.date) <= groupGap
+        return sameSender && sameDirection && close
+    }
+
+    nonisolated private static func groupId(chatId: Int64, firstMessage: TGMessage) -> String {
+        "\(chatId):g:\(firstMessage.chatId):\(firstMessage.id):\(firstMessage.localId?.uuidString ?? "nil")"
+    }
+
     nonisolated private static func dayKey(_ day: Date, calendar: Calendar) -> String {
         let components = calendar.dateComponents([.year, .month, .day], from: day)
         return "\(components.year ?? 0)-\(components.month ?? 0)-\(components.day ?? 0)"
@@ -179,30 +317,37 @@ struct MessagesPane: View {
         didInitialScrollToBottom = false
 
         revealTimeX = 0
+        lastAutoScrollAnimatedAtNs = 0
+        didCrossPaginationThreshold = false
     }
 
     @MainActor
     private func applyWindowMessages(_ messages: [TGMessage]) {
         let expectedChatId = chat.id
         let token = UUID()
+        let previousMessages = windowMessages
+        let previousRows = rows
+        let currentGroupGap = groupGap
+        let currentMajorGap = majorGap
 
         rowBuildToken = token
         rowBuildTask?.cancel()
 
-        rowBuildTask = Task(priority: .userInitiated) { [token, expectedChatId, messages] in
-            let filtered = messages.filter { $0.chatId == expectedChatId }
-            let builtRows = await Self.rowBuildWorker.build(
+        rowBuildTask = Task.detached(priority: .userInitiated) { [token, expectedChatId, messages, previousMessages, previousRows, currentGroupGap, currentMajorGap] in
+            let buildResult = await Self.rowBuildWorker.build(
                 chatId: expectedChatId,
-                messages: filtered,
-                groupGap: groupGap,
-                majorGap: majorGap
+                messages: messages,
+                previousMessages: previousMessages,
+                previousRows: previousRows,
+                groupGap: currentGroupGap,
+                majorGap: currentMajorGap
             )
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard rowBuildToken == token else { return }
                 guard chat.id == expectedChatId else { return }
-                windowMessages = filtered
-                rows = builtRows
+                windowMessages = buildResult.filteredMessages
+                rows = buildResult.rows
             }
         }
     }
@@ -220,8 +365,19 @@ struct MessagesPane: View {
         paginationBaselineFirstMessageId = anchorMessageId
         pagingInFlight = true
 
-        viewModel.loadOlder(pageSize: 80)
         store.loadMoreHistory(chatId: chat.id, anchorMessageId: anchorMessageId)
+    }
+
+    @MainActor
+    private func handleTopSentinelOffset(_ minY: CGFloat) {
+        let nearTop = minY >= -paginationTopThreshold
+        if nearTop {
+            guard !didCrossPaginationThreshold else { return }
+            didCrossPaginationThreshold = true
+            requestOlderHistoryIfNeeded()
+            return
+        }
+        didCrossPaginationThreshold = false
     }
 
     @MainActor
@@ -291,7 +447,12 @@ struct MessagesPane: View {
         guard newLastId != oldLastId else { return }
 
         if isAtBottom {
-            scrollToBottomSentinel(proxy, animated: true)
+            let nowNs = DispatchTime.now().uptimeNanoseconds
+            let shouldAnimate = (nowNs &- lastAutoScrollAnimatedAtNs) >= autoScrollAnimationCooldownNs
+            scrollToBottomSentinel(proxy, animated: shouldAnimate)
+            if shouldAnimate {
+                lastAutoScrollAnimatedAtNs = nowNs
+            }
             newIncomingCount = 0
             return
         }
@@ -299,23 +460,6 @@ struct MessagesPane: View {
         guard let last = newMessages.last, !last.isOutgoing else { return }
         let delta = max(1, newMessages.count - oldMessages.count)
         newIncomingCount += delta
-    }
-
-    @MainActor
-    private func handleTrackpadHorizontalScroll(deltaX: CGFloat, isDirectionInverted: Bool) {
-        // Convert AppKit wheel delta into finger-space delta where left swipe is negative.
-        let fingerDeltaX = isDirectionInverted ? -deltaX : deltaX
-        let revealDelta = fingerDeltaX
-        guard abs(revealDelta) > 0.15 else { return }
-        revealTimeX = min(maxReveal, max(0, revealTimeX + revealDelta))
-    }
-
-    @MainActor
-    private func resetRevealTime() {
-        guard revealTimeX != 0 else { return }
-        withAnimation(.interactiveSpring(response: 0.30, dampingFraction: 0.82, blendDuration: 0.10)) {
-            revealTimeX = 0
-        }
     }
 
     @ViewBuilder
@@ -332,6 +476,7 @@ struct MessagesPane: View {
                 store: store,
                 chat: chat,
                 group: group,
+                optimizeForLargeTimeline: optimizeBubbleEffects,
                 revealTimeX: revealTimeX,
                 jellyScrollImpulse: 0
             )
@@ -346,9 +491,14 @@ struct MessagesPane: View {
                     Color.clear
                         .frame(height: 1)
                         .id(topSentinelId)
-                        .onAppear {
-                            requestOlderHistoryIfNeeded()
-                        }
+                        .background(
+                            GeometryReader { geometry in
+                                Color.clear.preference(
+                                    key: TopSentinelOffsetPreferenceKey.self,
+                                    value: geometry.frame(in: .named(scrollSpaceName)).minY
+                                )
+                            }
+                        )
 
                     ForEach(rows) { row in
                         rowView(row)
@@ -370,21 +520,9 @@ struct MessagesPane: View {
                 .padding(.horizontal, 18)
                 .padding(.vertical, 14)
             }
+            .coordinateSpace(name: scrollSpaceName)
             .defaultScrollAnchor(.bottom)
             .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
-            .background(
-                TrackpadHorizontalSwipeSensor(
-                    onHorizontalScroll: { deltaX, isDirectionInverted in
-                        handleTrackpadHorizontalScroll(
-                            deltaX: deltaX,
-                            isDirectionInverted: isDirectionInverted
-                        )
-                    },
-                    onGestureEnd: {
-                        resetRevealTime()
-                    }
-                )
-            )
             .overlay(alignment: .bottomTrailing) {
                 if newIncomingCount > 0 && !isAtBottom {
                     Button {
@@ -415,6 +553,9 @@ struct MessagesPane: View {
                 applyWindowMessages(viewModel.messages)
                 await Task.yield()
                 performInitialJumpIfNeeded(proxy)
+            }
+            .onPreferenceChange(TopSentinelOffsetPreferenceKey.self) { minY in
+                handleTopSentinelOffset(minY)
             }
             .onChange(of: viewModel.messages) { _, newMessages in
                 applyWindowMessages(newMessages)
@@ -493,113 +634,13 @@ struct MessageGroup: Identifiable, Hashable, Sendable {
     let id: String
     let isOutgoing: Bool
     let senderUserId: Int64?
-    let messages: [TGMessage]
+    var messages: [TGMessage]
 }
 
-private struct TrackpadHorizontalSwipeSensor: NSViewRepresentable {
-    let onHorizontalScroll: (_ deltaX: CGFloat, _ isDirectionInverted: Bool) -> Void
-    let onGestureEnd: () -> Void
+private struct TopSentinelOffsetPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = -.greatestFiniteMagnitude
 
-    func makeNSView(context: Context) -> SensorView {
-        let view = SensorView()
-        view.onHorizontalScroll = onHorizontalScroll
-        view.onGestureEnd = onGestureEnd
-        return view
-    }
-
-    func updateNSView(_ nsView: SensorView, context: Context) {
-        nsView.onHorizontalScroll = onHorizontalScroll
-        nsView.onGestureEnd = onGestureEnd
-    }
-
-    final class SensorView: NSView {
-        var onHorizontalScroll: ((_ deltaX: CGFloat, _ isDirectionInverted: Bool) -> Void)?
-        var onGestureEnd: (() -> Void)?
-
-        private var eventMonitor: Any?
-        private var endWorkItem: DispatchWorkItem?
-
-        override var isOpaque: Bool { false }
-
-        override init(frame frameRect: NSRect) {
-            super.init(frame: frameRect)
-        }
-
-        required init?(coder: NSCoder) {
-            super.init(coder: coder)
-        }
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            installMonitorIfNeeded()
-        }
-
-        override func viewWillMove(toWindow newWindow: NSWindow?) {
-            if newWindow == nil {
-                removeMonitor()
-            }
-            super.viewWillMove(toWindow: newWindow)
-        }
-
-        deinit {
-            removeMonitor()
-        }
-
-        private func installMonitorIfNeeded() {
-            guard eventMonitor == nil else { return }
-            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-                self?.handleScrollEvent(event)
-                return event
-            }
-        }
-
-        private func removeMonitor() {
-            if let eventMonitor {
-                NSEvent.removeMonitor(eventMonitor)
-                self.eventMonitor = nil
-            }
-            endWorkItem?.cancel()
-            endWorkItem = nil
-        }
-
-        private func handleScrollEvent(_ event: NSEvent) {
-            guard let window, event.window === window else { return }
-
-            let localPoint = convert(event.locationInWindow, from: nil)
-            guard bounds.contains(localPoint) else { return }
-
-            let dx = CGFloat(event.scrollingDeltaX)
-            let dy = CGFloat(event.scrollingDeltaY)
-            let isHorizontal = abs(dx) > abs(dy) * 1.20 && abs(dx) > 0.25
-
-            if isHorizontal {
-                onHorizontalScroll?(dx, event.isDirectionInvertedFromDevice)
-                scheduleGestureEnd()
-                return
-            }
-
-            if event.phase == .ended ||
-                event.phase == .cancelled ||
-                event.momentumPhase == .ended ||
-                event.momentumPhase == .cancelled ||
-                abs(dy) > abs(dx) {
-                triggerGestureEnd()
-            }
-        }
-
-        private func scheduleGestureEnd() {
-            endWorkItem?.cancel()
-            let workItem = DispatchWorkItem { [weak self] in
-                self?.onGestureEnd?()
-            }
-            endWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
-        }
-
-        private func triggerGestureEnd() {
-            endWorkItem?.cancel()
-            endWorkItem = nil
-            onGestureEnd?()
-        }
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }

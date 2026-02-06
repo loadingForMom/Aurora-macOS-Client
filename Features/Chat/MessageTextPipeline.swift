@@ -15,45 +15,88 @@ struct MessageTextCacheKey: Hashable {
     let chatId: Int64
     let messageId: Int64
     let style: MessageTextStyle
-    let textFingerprint: Int
 }
 
 final class MessageTextCache {
     static let shared = MessageTextCache()
 
-    private let limit = 512
-    private var values: [MessageTextCacheKey: AttributedString] = [:]
-    private var order: [MessageTextCacheKey] = []
-    private let lock = NSLock()
-
-    func value(for key: MessageTextCacheKey) -> AttributedString? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let value = values[key] else { return nil }
-        touch(key)
-        return value
+    private struct CachedEntry {
+        let rawText: String?
+        let entities: [TGTextEntity]?
+        let attributed: AttributedString
     }
 
-    func set(_ value: AttributedString, for key: MessageTextCacheKey) {
+    private let limit = 512
+    private var entries: [MessageTextCacheKey: CachedEntry] = [:]
+    private var previousByKey: [MessageTextCacheKey: MessageTextCacheKey] = [:]
+    private var nextByKey: [MessageTextCacheKey: MessageTextCacheKey] = [:]
+    private var oldestKey: MessageTextCacheKey?
+    private var newestKey: MessageTextCacheKey?
+    private let lock = NSLock()
+
+    func value(for key: MessageTextCacheKey, rawText: String?, entities: [TGTextEntity]?) -> AttributedString? {
         lock.lock()
         defer { lock.unlock() }
-        values[key] = value
+        guard let entry = entries[key] else { return nil }
+        guard entry.rawText == rawText, entry.entities == entities else { return nil }
+        touch(key)
+        return entry.attributed
+    }
+
+    func set(_ value: AttributedString, for key: MessageTextCacheKey, rawText: String?, entities: [TGTextEntity]?) {
+        lock.lock()
+        defer { lock.unlock() }
+        entries[key] = CachedEntry(rawText: rawText, entities: entities, attributed: value)
         touch(key)
         trimIfNeeded()
     }
 
     private func touch(_ key: MessageTextCacheKey) {
-        if let idx = order.firstIndex(of: key) {
-            order.remove(at: idx)
-        }
-        order.append(key)
+        if newestKey == key { return }
+        detach(key)
+        appendNewest(key)
     }
 
     private func trimIfNeeded() {
-        while order.count > limit {
-            let removed = order.removeFirst()
-            values.removeValue(forKey: removed)
+        while entries.count > limit {
+            guard let oldest = oldestKey else { return }
+            remove(oldest)
         }
+    }
+
+    private func appendNewest(_ key: MessageTextCacheKey) {
+        if let newest = newestKey {
+            nextByKey[newest] = key
+            previousByKey[key] = newest
+        } else {
+            oldestKey = key
+        }
+        newestKey = key
+    }
+
+    private func detach(_ key: MessageTextCacheKey) {
+        let previous = previousByKey[key]
+        let next = nextByKey[key]
+
+        if let previous {
+            nextByKey[previous] = next
+        } else if oldestKey == key {
+            oldestKey = next
+        }
+
+        if let next {
+            previousByKey[next] = previous
+        } else if newestKey == key {
+            newestKey = previous
+        }
+
+        previousByKey.removeValue(forKey: key)
+        nextByKey.removeValue(forKey: key)
+    }
+
+    private func remove(_ key: MessageTextCacheKey) {
+        detach(key)
+        entries.removeValue(forKey: key)
     }
 }
 
@@ -74,10 +117,9 @@ enum MessageTextPipeline {
         let cacheKey = MessageTextCacheKey(
             chatId: chatId,
             messageId: messageId,
-            style: style,
-            textFingerprint: textFingerprint(rawText: rawText, entities: entities)
+            style: style
         )
-        if let cached = MessageTextCache.shared.value(for: cacheKey) {
+        if let cached = MessageTextCache.shared.value(for: cacheKey, rawText: rawText, entities: entities) {
             return cached
         }
 
@@ -110,22 +152,8 @@ enum MessageTextPipeline {
             )
         }
 
-        MessageTextCache.shared.set(attributed, for: cacheKey)
+        MessageTextCache.shared.set(attributed, for: cacheKey, rawText: rawText, entities: entities)
         return attributed
-    }
-
-    private static func textFingerprint(rawText: String?, entities: [TGTextEntity]?) -> Int {
-        var hasher = Hasher()
-        hasher.combine(rawText != nil)
-        hasher.combine(rawText ?? "")
-        if let entities {
-            for entity in entities {
-                hasher.combine(entity)
-            }
-        } else {
-            hasher.combine(0)
-        }
-        return hasher.finalize()
     }
 
     private static func applyEntities(
