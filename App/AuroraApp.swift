@@ -16,6 +16,7 @@ struct AuroraApp: App {
             ContentView(store: store)
                 .environmentObject(store)
         }
+        .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
             InspectorCommands()
         }

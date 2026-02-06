@@ -90,6 +90,8 @@ struct MessageBubble: View {
 
     @ViewBuilder
     private func content(isRevealingTime: Bool) -> some View {
+        let hideStatusLine = isRevealingTime && isSentState
+
         VStack(alignment: msg.isOutgoing ? .trailing : .leading, spacing: 4) {
             let attributed = MessageTextPipeline.render(
                 chatId: msg.chatId,
@@ -110,28 +112,27 @@ struct MessageBubble: View {
                         .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
                 )
 
-            if !isRevealingTime {
-                HStack(spacing: 6) {
-                    if msg.isEdited {
-                        Text("edited")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    statusView
-                }
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            } else {
-                if case .sent = msg.sendState {
-                    EmptyView()
-                } else {
-                    statusView
+            HStack(spacing: 6) {
+                if msg.isEdited {
+                    Text("edited")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                        .opacity(isRevealingTime ? 0 : 1)
                 }
+                statusView
             }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            // Keep status row in layout while revealing so bubbles do not jump on Y.
+            .opacity(hideStatusLine ? 0 : 1)
+            .allowsHitTesting(!hideStatusLine)
         }
         .frame(maxWidth: bubbleMaxWidth, alignment: msg.isOutgoing ? .trailing : .leading)
+    }
+
+    private var isSentState: Bool {
+        if case .sent = msg.sendState { return true }
+        return false
     }
 
     @ViewBuilder

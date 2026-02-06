@@ -37,7 +37,6 @@ struct ChatScreen: View {
                 )
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
-                .background(.clear)
             }
             .task(id: chat.id) {
                 draft = ""

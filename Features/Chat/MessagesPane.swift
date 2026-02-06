@@ -7,6 +7,7 @@
 
 import SwiftUI
 import Foundation
+import AppKit
 
 struct MessagesPane: View {
     @ObservedObject var store: TelegramStore
@@ -28,11 +29,8 @@ struct MessagesPane: View {
     @State private var newIncomingCount: Int = 0
 
     @State private var didInitialScrollToBottom: Bool = false
-    @State private var showAfterInitialJump: Bool = false
 
     @State private var revealTimeX: CGFloat = 0
-    @State private var revealGestureEngaged: Bool = false
-
     private let maxReveal: CGFloat = 72
     private let groupGap: Int = 5 * 60
     private let majorGap: Int = 60 * 60
@@ -179,10 +177,8 @@ struct MessagesPane: View {
         newIncomingCount = 0
 
         didInitialScrollToBottom = false
-        showAfterInitialJump = false
 
         revealTimeX = 0
-        revealGestureEngaged = false
     }
 
     @MainActor
@@ -269,7 +265,6 @@ struct MessagesPane: View {
             pagingEnabled = true
             isAtBottom = true
             newIncomingCount = 0
-            showAfterInitialJump = true
         }
     }
 
@@ -306,25 +301,21 @@ struct MessagesPane: View {
         newIncomingCount += delta
     }
 
-    private var revealGesture: some Gesture {
-        DragGesture(minimumDistance: 2, coordinateSpace: .local)
-            .onChanged { value in
-                let dx = value.translation.width
-                let dy = value.translation.height
+    @MainActor
+    private func handleTrackpadHorizontalScroll(deltaX: CGFloat, isDirectionInverted: Bool) {
+        // Convert AppKit wheel delta into finger-space delta where left swipe is negative.
+        let fingerDeltaX = isDirectionInverted ? -deltaX : deltaX
+        let revealDelta = fingerDeltaX
+        guard abs(revealDelta) > 0.15 else { return }
+        revealTimeX = min(maxReveal, max(0, revealTimeX + revealDelta))
+    }
 
-                if !revealGestureEngaged {
-                    guard abs(dx) > abs(dy) * 1.25 else { return }
-                    revealGestureEngaged = true
-                }
-
-                revealTimeX = min(maxReveal, max(0, -dx))
-            }
-            .onEnded { _ in
-                revealGestureEngaged = false
-                withAnimation(.interactiveSpring(response: 0.38, dampingFraction: 0.72, blendDuration: 0.10)) {
-                    revealTimeX = 0
-                }
-            }
+    @MainActor
+    private func resetRevealTime() {
+        guard revealTimeX != 0 else { return }
+        withAnimation(.interactiveSpring(response: 0.30, dampingFraction: 0.82, blendDuration: 0.10)) {
+            revealTimeX = 0
+        }
     }
 
     @ViewBuilder
@@ -379,10 +370,21 @@ struct MessagesPane: View {
                 .padding(.horizontal, 18)
                 .padding(.vertical, 14)
             }
-            .opacity(showAfterInitialJump ? 1 : 0)
-            .allowsHitTesting(showAfterInitialJump)
-            .animation(nil, value: showAfterInitialJump)
-            .simultaneousGesture(revealGesture)
+            .defaultScrollAnchor(.bottom)
+            .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
+            .background(
+                TrackpadHorizontalSwipeSensor(
+                    onHorizontalScroll: { deltaX, isDirectionInverted in
+                        handleTrackpadHorizontalScroll(
+                            deltaX: deltaX,
+                            isDirectionInverted: isDirectionInverted
+                        )
+                    },
+                    onGestureEnd: {
+                        resetRevealTime()
+                    }
+                )
+            )
             .overlay(alignment: .bottomTrailing) {
                 if newIncomingCount > 0 && !isAtBottom {
                     Button {
@@ -492,4 +494,112 @@ struct MessageGroup: Identifiable, Hashable, Sendable {
     let isOutgoing: Bool
     let senderUserId: Int64?
     let messages: [TGMessage]
+}
+
+private struct TrackpadHorizontalSwipeSensor: NSViewRepresentable {
+    let onHorizontalScroll: (_ deltaX: CGFloat, _ isDirectionInverted: Bool) -> Void
+    let onGestureEnd: () -> Void
+
+    func makeNSView(context: Context) -> SensorView {
+        let view = SensorView()
+        view.onHorizontalScroll = onHorizontalScroll
+        view.onGestureEnd = onGestureEnd
+        return view
+    }
+
+    func updateNSView(_ nsView: SensorView, context: Context) {
+        nsView.onHorizontalScroll = onHorizontalScroll
+        nsView.onGestureEnd = onGestureEnd
+    }
+
+    final class SensorView: NSView {
+        var onHorizontalScroll: ((_ deltaX: CGFloat, _ isDirectionInverted: Bool) -> Void)?
+        var onGestureEnd: (() -> Void)?
+
+        private var eventMonitor: Any?
+        private var endWorkItem: DispatchWorkItem?
+
+        override var isOpaque: Bool { false }
+
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+        }
+
+        required init?(coder: NSCoder) {
+            super.init(coder: coder)
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            installMonitorIfNeeded()
+        }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            if newWindow == nil {
+                removeMonitor()
+            }
+            super.viewWillMove(toWindow: newWindow)
+        }
+
+        deinit {
+            removeMonitor()
+        }
+
+        private func installMonitorIfNeeded() {
+            guard eventMonitor == nil else { return }
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                self?.handleScrollEvent(event)
+                return event
+            }
+        }
+
+        private func removeMonitor() {
+            if let eventMonitor {
+                NSEvent.removeMonitor(eventMonitor)
+                self.eventMonitor = nil
+            }
+            endWorkItem?.cancel()
+            endWorkItem = nil
+        }
+
+        private func handleScrollEvent(_ event: NSEvent) {
+            guard let window, event.window === window else { return }
+
+            let localPoint = convert(event.locationInWindow, from: nil)
+            guard bounds.contains(localPoint) else { return }
+
+            let dx = CGFloat(event.scrollingDeltaX)
+            let dy = CGFloat(event.scrollingDeltaY)
+            let isHorizontal = abs(dx) > abs(dy) * 1.20 && abs(dx) > 0.25
+
+            if isHorizontal {
+                onHorizontalScroll?(dx, event.isDirectionInvertedFromDevice)
+                scheduleGestureEnd()
+                return
+            }
+
+            if event.phase == .ended ||
+                event.phase == .cancelled ||
+                event.momentumPhase == .ended ||
+                event.momentumPhase == .cancelled ||
+                abs(dy) > abs(dx) {
+                triggerGestureEnd()
+            }
+        }
+
+        private func scheduleGestureEnd() {
+            endWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.onGestureEnd?()
+            }
+            endWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
+        }
+
+        private func triggerGestureEnd() {
+            endWorkItem?.cancel()
+            endWorkItem = nil
+            onGestureEnd?()
+        }
+    }
 }

@@ -93,6 +93,7 @@ struct ContentView: View {
                     }
                 }
             }
+            .toolbar(removing: .title)
             .inspector(isPresented: $inspectorShown) {
                 if let chat = selectedChat {
                     ChatInspectorView(chat: chat)
