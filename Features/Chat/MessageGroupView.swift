@@ -49,7 +49,7 @@ struct ChatMessageGroupView: View {
             }
 
             VStack(alignment: group.isOutgoing ? .trailing : .leading, spacing: 4) {
-                ForEach(group.messages, id: \.messageKey) { msg in
+                ForEach(group.messages, id: \.id) { msg in
                     MessageBubble(
                         msg: msg,
                         currentChatId: chat.id,
@@ -57,6 +57,7 @@ struct ChatMessageGroupView: View {
                         onRetry: { store.retrySend(message: msg) },
                         onDelete: { store.deleteMessages(chatId: msg.chatId, messageIds: [msg.id], revoke: true) }
                     )
+                    .id(msg.id)
                 }
             }
         }

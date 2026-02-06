@@ -5,19 +5,17 @@
 
 import Foundation
 import Combine
-import OSLog
 
 @MainActor
 final class ChatMessagesViewModel: ObservableObject {
     @Published private(set) var messages: [TGMessage] = []
 
-    private let log = Logger(subsystem: "com.aurora.app", category: "chat.messages.vm")
     private let store: TelegramStore
     private let chatId: Int64
     private var windowSize: Int
-    private var applyCount = 0
+    private var lastPublishedCount: Int = 0
+    private var lastPublishedLastId: Int64?
     private var streamTask: Task<Void, Never>?
-    private let publishDebouncer = MainThreadPublishDebouncer<[TGMessage]>(delay: 0.033)
 
     init(store: TelegramStore, chatId: Int64, windowSize: Int = 160) {
         self.store = store
@@ -41,51 +39,48 @@ final class ChatMessagesViewModel: ObservableObject {
     private func startStreaming() {
         streamTask?.cancel()
 
-        let startedAtNs = DispatchTime.now().uptimeNanoseconds
         let chatId = self.chatId
         let initialWindow = windowSize
         let store = self.store
-        let debouncer = publishDebouncer
+        let debounceDelayNs: UInt64 = 120_000_000
 
         streamTask = Task.detached(priority: .userInitiated) { [weak self] in
             await store.primeMessageStore(chatId: chatId, limit: initialWindow)
             let stream = await store.messageSnapshotStream(chatId: chatId, windowSize: initialWindow)
+            var lastStreamCount: Int?
+            var lastStreamLastId: Int64?
+            var debounceTask: Task<Void, Never>?
+
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
-                SwiftUIPublishTrace.storeEvent(
-                    name: "snapshot_ready",
-                    chatId: chatId,
-                    details: "source=messageSnapshotStream count=\(snapshot.count)",
-                    reason: "fromSnapshotStream"
-                )
-                await debouncer.schedule(
-                    value: snapshot,
-                    chatId: chatId,
-                    source: "ChatMessagesViewModel.messages"
-                ) { [weak self] debouncedSnapshot in
-                    guard let self else { return }
-                    self.applyCount += 1
-                    let isViewUpdating = ViewUpdatePhaseTracker.shared.isViewUpdating
-                    SwiftUIPublishTrace.publishVM(
-                        vm: "ChatMessagesViewModel",
-                        property: "messages",
-                        chatId: self.chatId,
-                        newCount: debouncedSnapshot.count,
-                        reason: "fromSnapshotStream",
-                        isViewUpdating: isViewUpdating
-                    )
-                    self.messages = debouncedSnapshot
-                    AuroraRuntimeMetrics.shared.incrementPublish("chatMessages")
-#if DEBUG
-                    if self.applyCount == 1 || self.applyCount % 25 == 0 {
-                        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - startedAtNs) / 1_000_000.0
-                        self.log.debug(
-                            "messages vm chatId=\(chatId, privacy: .public) applies=\(self.applyCount, privacy: .public) count=\(self.messages.count, privacy: .public) window=\(self.windowSize, privacy: .public) sinceStartMs=\(elapsedMs, privacy: .public)"
-                        )
+                let streamCount = snapshot.count
+                let streamLastId = snapshot.last?.id
+                if lastStreamCount == streamCount && lastStreamLastId == streamLastId {
+                    continue
+                }
+                lastStreamCount = streamCount
+                lastStreamLastId = streamLastId
+
+                debounceTask?.cancel()
+                let pending = snapshot
+                debounceTask = Task {
+                    try? await Task.sleep(nanoseconds: debounceDelayNs)
+                    guard !Task.isCancelled else { return }
+                    await MainActor.run { [weak self] in
+                        guard let self else { return }
+                        let publishCount = pending.count
+                        let publishLastId = pending.last?.id
+                        if self.lastPublishedCount == publishCount && self.lastPublishedLastId == publishLastId {
+                            return
+                        }
+                        self.lastPublishedCount = publishCount
+                        self.lastPublishedLastId = publishLastId
+                        self.messages = pending
                     }
-#endif
                 }
             }
+
+            debounceTask?.cancel()
         }
     }
 }
