@@ -136,8 +136,7 @@ extension TelegramStore {
                         initialBestPath: update.bestPath
                     )
                 } else {
-                    queueChatAvatarPathUpdate(chatId: update.chatId, path: nil)
-                    chatAvatarMetaByChatId.removeValue(forKey: update.chatId)
+                    clearChatAvatar(chatId: update.chatId)
                 }
             }
         }
@@ -241,12 +240,29 @@ extension TelegramStore {
 
     func handleResponse(_ resp: String) async {
         if let err = parseTdError(resp) {
+            if let extra = err.extra, extra.hasPrefix("storage:") {
+                _ = await MainActor.run {
+                    storageExtrasInFlight.remove(extra)
+                }
+            }
+
             if err.extra == "loadChats:main", err.code == 404 {
 #if DEBUG
                 log.debug("loadChats completed for chatListMain")
 #endif
                 return
             }
+
+            if let extra = err.extra,
+               extra.hasPrefix("storage:optimize:"),
+               err.code == 500,
+               err.message.localizedCaseInsensitiveContains("request aborted") {
+#if DEBUG
+                log.debug("tdlib optimizeStorage aborted extra=\(extra, privacy: .public)")
+#endif
+                return
+            }
+
             log.error("tdlib error code=\(err.code, privacy: .public) message=\(err.message, privacy: .public) extra=\(err.extra ?? "nil", privacy: .public)")
             return
         }

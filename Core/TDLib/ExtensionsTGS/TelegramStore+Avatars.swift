@@ -70,6 +70,7 @@ extension TelegramStore {
             chatAvatarMetaByChatId: &chatAvatarMetaByChatId,
             chatIdByAvatarFileId: &chatIdByAvatarFileId
         )
+        bumpChatAvatarVersion(chatId: chatId)
         queueChatAvatarPathUpdate(chatId: chatId, path: initialBestPath)
     }
 
@@ -81,7 +82,22 @@ extension TelegramStore {
             path: path,
             chatAvatarMetaByChatId: &chatAvatarMetaByChatId
         )
+        bumpChatAvatarVersion(chatId: chatId)
         queueChatAvatarPathUpdate(chatId: chatId, path: bestPath)
+    }
+
+    @MainActor
+    func clearChatAvatar(chatId: Int64) {
+        if let meta = chatAvatarMetaByChatId.removeValue(forKey: chatId) {
+            if let smallId = meta.smallFileId, chatIdByAvatarFileId[smallId] == chatId {
+                chatIdByAvatarFileId.removeValue(forKey: smallId)
+            }
+            if let bigId = meta.bigFileId, chatIdByAvatarFileId[bigId] == chatId {
+                chatIdByAvatarFileId.removeValue(forKey: bigId)
+            }
+        }
+        bumpChatAvatarVersion(chatId: chatId)
+        queueChatAvatarPathUpdate(chatId: chatId, path: nil)
     }
 
     @MainActor

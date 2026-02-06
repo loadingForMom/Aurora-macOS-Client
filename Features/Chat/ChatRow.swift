@@ -39,9 +39,10 @@ struct AvatarCacheKey: Hashable {
     let id: Int64
     let size: CGFloat
     let scale: CGFloat
+    let revision: String
 
     var cacheKey: NSString {
-        "\(kind.rawValue):\(id):\(size):\(scale)" as NSString
+        "\(kind.rawValue):\(id):\(size):\(scale):\(revision)" as NSString
     }
 }
 
@@ -77,6 +78,7 @@ struct AvatarCircle: View {
     let title: String
     let image: NSImage?
     let identityKey: AvatarCacheKey?
+    let reloadToken: String?
     let imageProvider: (() -> NSImage?)?
     let size: CGFloat
     let font: Font
@@ -86,6 +88,7 @@ struct AvatarCircle: View {
         self.title = title
         self.image = path.flatMap { DiskImageCache.shared.image(path: $0) }
         self.identityKey = nil
+        self.reloadToken = path
         self.imageProvider = nil
         self.size = size
         self.font = font
@@ -95,18 +98,34 @@ struct AvatarCircle: View {
         self.title = title
         self.image = image
         self.identityKey = nil
+        self.reloadToken = nil
         self.imageProvider = nil
         self.size = size
         self.font = font
     }
 
-    init(title: String, identityKey: AvatarCacheKey, size: CGFloat, font: Font, imageProvider: @escaping () -> NSImage?) {
+    init(
+        title: String,
+        identityKey: AvatarCacheKey,
+        reloadToken: String? = nil,
+        size: CGFloat,
+        font: Font,
+        imageProvider: @escaping () -> NSImage?
+    ) {
         self.title = title
         self.image = nil
         self.identityKey = identityKey
+        self.reloadToken = reloadToken
         self.imageProvider = imageProvider
         self.size = size
         self.font = font
+    }
+
+    private var loadTaskId: String {
+        if let identityKey {
+            return "\(identityKey.cacheKey)|\(reloadToken ?? "nil")"
+        }
+        return "legacy|\(reloadToken ?? "nil")|\(title)"
     }
 
     var body: some View {
@@ -125,7 +144,13 @@ struct AvatarCircle: View {
             }
         }
         .frame(width: size, height: size)
-        .task(id: identityKey) {
+        .onChange(of: identityKey) { _, _ in
+            loadedImage = nil
+        }
+        .onChange(of: reloadToken) { _, _ in
+            loadedImage = nil
+        }
+        .task(id: loadTaskId) {
             await loadAvatarImage()
         }
     }
@@ -184,8 +209,20 @@ struct ChatRow: View {
     let previewText: String
     let avatarPath: String? // keep (legacy), but we prefer store thumbs
 
+    private var avatarRevision: String {
+        let pathPart = avatarPath ?? "nil"
+        let version = store.chatAvatarVersionByChatId[chat.id] ?? 0
+        return "\(pathPart)#\(version)"
+    }
+
     private var avatarIdentity: AvatarCacheKey {
-        AvatarCacheKey(kind: .chat, id: chat.id, size: 34, scale: AvatarScale.current)
+        AvatarCacheKey(
+            kind: .chat,
+            id: chat.id,
+            size: 34,
+            scale: AvatarScale.current,
+            revision: avatarRevision
+        )
     }
 
     var body: some View {
@@ -193,6 +230,7 @@ struct ChatRow: View {
             AvatarCircle(
                 title: chat.title,
                 identityKey: avatarIdentity,
+                reloadToken: avatarRevision,
                 size: 34,
                 font: .caption.weight(.semibold),
                 imageProvider: {

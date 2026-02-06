@@ -36,6 +36,10 @@ extension TelegramStore {
 
     @MainActor
     func optimizeStorage(maxBytes: Int64) {
+        if storageExtrasInFlight.contains(where: { $0.hasPrefix("storage:optimize:") }) {
+            return
+        }
+
         let extra = "storage:optimize:\(UUID().uuidString)"
         let req = storageManager.makeOptimizeStorageRequest(extra: extra, maxBytes: maxBytes)
 

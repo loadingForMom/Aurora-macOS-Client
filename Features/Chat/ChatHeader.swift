@@ -9,6 +9,8 @@ import SwiftUI
 import AppKit
 
 struct ChatHeader: View {
+    @EnvironmentObject private var store: TelegramStore
+
     let title: String
     let isGroup: Bool
     let chatId: Int64
@@ -20,6 +22,12 @@ struct ChatHeader: View {
     let avatarPath: String?
 
     var onToggleInspector: () -> Void
+
+    private var avatarRevision: String {
+        let pathPart = avatarPath ?? "nil"
+        let version = store.chatAvatarVersionByChatId[chatId] ?? 0
+        return "\(pathPart)#\(version)"
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -44,12 +52,15 @@ struct ChatHeader: View {
                             kind: .chat,
                             id: chatId,
                             size: 28,
-                            scale: NSScreen.main?.backingScaleFactor ?? 2.0
+                            scale: NSScreen.main?.backingScaleFactor ?? 2.0,
+                            revision: avatarRevision
                         ),
+                        reloadToken: avatarRevision,
                         size: 28,
                         font: .system(size: 11, weight: .semibold, design: .rounded),
                         imageProvider: {
-                            avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
+                            store.chatAvatarNSImage(chatId: chatId, pointSize: 28, preferHiRes: false)
+                            ?? avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
                         }
                     )
                     .overlay(Circle().strokeBorder(.white.opacity(0.14), lineWidth: 1))

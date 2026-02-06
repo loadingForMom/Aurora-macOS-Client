@@ -7,12 +7,12 @@
 
 import SwiftUI
 import Foundation
-import AppKit
 
 struct MessagesPane: View {
     @ObservedObject var store: TelegramStore
     let chat: TGChat
     @ObservedObject var viewModel: ChatMessagesViewModel
+    @Binding var isPagingHistory: Bool
 
     @State private var rows: [Row] = []
     @State private var windowMessages: [TGMessage] = []
@@ -33,10 +33,11 @@ struct MessagesPane: View {
     @State private var revealTimeX: CGFloat = 0
     @State private var lastAutoScrollAnimatedAtNs: UInt64 = 0
     @State private var didCrossPaginationThreshold: Bool = false
+    @State private var lastTopSentinelMinY: CGFloat = -.greatestFiniteMagnitude
     private let groupGap: Int = 5 * 60
     private let majorGap: Int = 60 * 60
     private let autoScrollAnimationCooldownNs: UInt64 = 220_000_000
-    private let paginationTopThreshold: CGFloat = 140
+    private let paginationTopThreshold: CGFloat = 260
     private let heavyEffectsCutoffMessages: Int = 700
 
     private static let rowBuildWorker = RowsBuildWorker()
@@ -307,6 +308,7 @@ struct MessagesPane: View {
 
         pagingEnabled = false
         pagingInFlight = false
+        isPagingHistory = false
         pendingRestoreAnchorMessageId = nil
         paginationBaselineFirstMessageId = nil
         lastPaginationAnchorMessageId = nil
@@ -319,6 +321,7 @@ struct MessagesPane: View {
         revealTimeX = 0
         lastAutoScrollAnimatedAtNs = 0
         didCrossPaginationThreshold = false
+        lastTopSentinelMinY = -.greatestFiniteMagnitude
     }
 
     @MainActor
@@ -353,28 +356,36 @@ struct MessagesPane: View {
     }
 
     @MainActor
-    private func requestOlderHistoryIfNeeded() {
-        guard pagingEnabled else { return }
-        guard !pagingInFlight else { return }
-        guard !store.isLoadingHistory else { return }
-        guard let anchorMessageId = windowMessages.first?.id, anchorMessageId > 0 else { return }
-        guard lastPaginationAnchorMessageId != anchorMessageId else { return }
+    private func requestOlderHistoryIfNeeded() -> Bool {
+        guard didInitialScrollToBottom else { return false }
+        guard pagingEnabled else { return false }
+        guard !pagingInFlight else { return false }
+        guard !store.isLoadingHistory else { return false }
+        guard let anchorMessageId = windowMessages.first?.id, anchorMessageId > 0 else { return false }
+        guard lastPaginationAnchorMessageId != anchorMessageId else { return false }
 
         lastPaginationAnchorMessageId = anchorMessageId
         pendingRestoreAnchorMessageId = anchorMessageId
         paginationBaselineFirstMessageId = anchorMessageId
         pagingInFlight = true
+        isPagingHistory = true
 
         store.loadMoreHistory(chatId: chat.id, anchorMessageId: anchorMessageId)
+        return true
     }
 
     @MainActor
     private func handleTopSentinelOffset(_ minY: CGFloat) {
+        lastTopSentinelMinY = minY
+        guard didInitialScrollToBottom else {
+            didCrossPaginationThreshold = false
+            return
+        }
         let nearTop = minY >= -paginationTopThreshold
         if nearTop {
             guard !didCrossPaginationThreshold else { return }
-            didCrossPaginationThreshold = true
-            requestOlderHistoryIfNeeded()
+            let started = requestOlderHistoryIfNeeded()
+            didCrossPaginationThreshold = started
             return
         }
         didCrossPaginationThreshold = false
@@ -383,8 +394,10 @@ struct MessagesPane: View {
     @MainActor
     private func clearPagingState() {
         pagingInFlight = false
+        isPagingHistory = false
         pendingRestoreAnchorMessageId = nil
         paginationBaselineFirstMessageId = nil
+        didCrossPaginationThreshold = false
     }
 
     private func scrollToBottomSentinel(_ proxy: ScrollViewProxy, animated: Bool) {
@@ -411,20 +424,6 @@ struct MessagesPane: View {
     }
 
     @MainActor
-    private func performInitialJumpIfNeeded(_ proxy: ScrollViewProxy) {
-        guard !didInitialScrollToBottom else { return }
-
-        DispatchQueue.main.async {
-            guard !didInitialScrollToBottom else { return }
-            scrollToBottomSentinel(proxy, animated: false)
-            didInitialScrollToBottom = true
-            pagingEnabled = true
-            isAtBottom = true
-            newIncomingCount = 0
-        }
-    }
-
-    @MainActor
     private func handleWindowMessagesChange(
         oldMessages: [TGMessage],
         newMessages: [TGMessage],
@@ -438,17 +437,36 @@ struct MessagesPane: View {
                 scrollToMessageTop(proxy, messageId: anchorId)
             }
             clearPagingState()
+            handleTopSentinelOffset(lastTopSentinelMinY)
         }
 
-        guard didInitialScrollToBottom else { return }
+        if !didInitialScrollToBottom {
+            guard !newMessages.isEmpty else { return }
+            DispatchQueue.main.async {
+                guard !didInitialScrollToBottom else { return }
+                scrollToBottomSentinel(proxy, animated: false)
+                didInitialScrollToBottom = true
+                pagingEnabled = true
+                isAtBottom = true
+                newIncomingCount = 0
+                handleTopSentinelOffset(lastTopSentinelMinY)
+            }
+            return
+        }
 
         let oldLastId = oldMessages.last?.id
         let newLastId = newMessages.last?.id
         guard newLastId != oldLastId else { return }
 
+        let firstChanged = oldMessages.first?.id != newMessages.first?.id
+        let delta = max(1, abs(newMessages.count - oldMessages.count))
+
         if isAtBottom {
             let nowNs = DispatchTime.now().uptimeNanoseconds
-            let shouldAnimate = (nowNs &- lastAutoScrollAnimatedAtNs) >= autoScrollAnimationCooldownNs
+            let isBulkMutation = firstChanged || delta > 2
+            let shouldAnimate = !isBulkMutation
+                && !store.isLoadingHistory
+                && (nowNs &- lastAutoScrollAnimatedAtNs) >= autoScrollAnimationCooldownNs
             scrollToBottomSentinel(proxy, animated: shouldAnimate)
             if shouldAnimate {
                 lastAutoScrollAnimatedAtNs = nowNs
@@ -458,8 +476,7 @@ struct MessagesPane: View {
         }
 
         guard let last = newMessages.last, !last.isOutgoing else { return }
-        let delta = max(1, newMessages.count - oldMessages.count)
-        newIncomingCount += delta
+        newIncomingCount += max(1, newMessages.count - oldMessages.count)
     }
 
     @ViewBuilder
@@ -491,14 +508,11 @@ struct MessagesPane: View {
                     Color.clear
                         .frame(height: 1)
                         .id(topSentinelId)
-                        .background(
-                            GeometryReader { geometry in
-                                Color.clear.preference(
-                                    key: TopSentinelOffsetPreferenceKey.self,
-                                    value: geometry.frame(in: .named(scrollSpaceName)).minY
-                                )
+                        .onAppear {
+                            Task { @MainActor in
+                                _ = requestOlderHistoryIfNeeded()
                             }
-                        )
+                        }
 
                     ForEach(rows) { row in
                         rowView(row)
@@ -519,10 +533,18 @@ struct MessagesPane: View {
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 14)
+                .background(
+                    GeometryReader { geometry in
+                        Color.clear.preference(
+                            key: ContentMinYPreferenceKey.self,
+                            value: geometry.frame(in: .named(scrollSpaceName)).minY
+                        )
+                    }
+                )
             }
             .coordinateSpace(name: scrollSpaceName)
-            .defaultScrollAnchor(.bottom)
             .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
+            .opacity((didInitialScrollToBottom || windowMessages.isEmpty) ? 1 : 0)
             .overlay(alignment: .bottomTrailing) {
                 if newIncomingCount > 0 && !isAtBottom {
                     Button {
@@ -551,10 +573,8 @@ struct MessagesPane: View {
             .task(id: chat.id) {
                 resetStateForChat()
                 applyWindowMessages(viewModel.messages)
-                await Task.yield()
-                performInitialJumpIfNeeded(proxy)
             }
-            .onPreferenceChange(TopSentinelOffsetPreferenceKey.self) { minY in
+            .onPreferenceChange(ContentMinYPreferenceKey.self) { minY in
                 handleTopSentinelOffset(minY)
             }
             .onChange(of: viewModel.messages) { _, newMessages in
@@ -568,14 +588,17 @@ struct MessagesPane: View {
                 )
             }
             .onChange(of: store.isLoadingHistory) { _, isLoading in
-                guard !isLoading, pagingInFlight else { return }
-                if windowMessages.first?.id == paginationBaselineFirstMessageId {
+                guard !isLoading else { return }
+                if pagingInFlight, windowMessages.first?.id == paginationBaselineFirstMessageId {
                     clearPagingState()
                 }
+                // Retry immediately if user is already near top and previous attempt was blocked.
+                handleTopSentinelOffset(lastTopSentinelMinY)
             }
             .onDisappear {
                 rowBuildTask?.cancel()
                 rowBuildTask = nil
+                isPagingHistory = false
             }
         }
         .id(chat.id)
@@ -637,7 +660,7 @@ struct MessageGroup: Identifiable, Hashable, Sendable {
     var messages: [TGMessage]
 }
 
-private struct TopSentinelOffsetPreferenceKey: PreferenceKey {
+private struct ContentMinYPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = -.greatestFiniteMagnitude
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {

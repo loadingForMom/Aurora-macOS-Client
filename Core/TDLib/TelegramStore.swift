@@ -61,6 +61,7 @@ final class TelegramStore: ObservableObject {
     // MARK: - Chat avatars (paths)
 
     @Published var chatAvatarPathByChatId: [Int64: String] = [:]
+    @Published var chatAvatarVersionByChatId: [Int64: Int] = [:]
     private var pendingAvatarPathUpdates: [Int64: String?] = [:]
     private var avatarPathPublishTask: Task<Void, Never>?
     private let avatarPathPublishDelayNs: UInt64 = 40_000_000
@@ -242,10 +243,6 @@ final class TelegramStore: ObservableObject {
                 return !forceReload && self.historyWindowLimitByChatId[chatId] != nil
             }
             if hasWindow {
-                return
-            }
-
-            if !forceReload, self.databaseRepository.messageCount(chatId: chatId) > 0 {
                 return
             }
 
@@ -621,6 +618,7 @@ final class TelegramStore: ObservableObject {
         avatarPathPublishTask = nil
         pendingAvatarPathUpdates = [:]
         chatAvatarPathByChatId = [:]
+        chatAvatarVersionByChatId = [:]
         chatAvatarMetaByChatId = [:]
         chatIdByAvatarFileId = [:]
         requestedAvatarFileIds = []
@@ -731,6 +729,12 @@ final class TelegramStore: ObservableObject {
         }
         pendingAvatarPathUpdates[chatId] = normalized
         scheduleAvatarPathPublishIfNeeded()
+    }
+
+    @MainActor
+    func bumpChatAvatarVersion(chatId: Int64) {
+        let current = chatAvatarVersionByChatId[chatId] ?? 0
+        chatAvatarVersionByChatId[chatId] = current &+ 1
     }
 
     @MainActor

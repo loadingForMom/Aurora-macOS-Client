@@ -9,6 +9,7 @@ import Combine
 @MainActor
 final class ChatMessagesViewModel: ObservableObject {
     @Published private(set) var messages: [TGMessage] = []
+    @Published private(set) var isBootstrapping: Bool = true
 
     private let store: TelegramStore
     private let chatId: Int64
@@ -29,6 +30,7 @@ final class ChatMessagesViewModel: ObservableObject {
 
     private func startStreaming() {
         streamTask?.cancel()
+        isBootstrapping = true
 
         let chatId = self.chatId
         let initialWindow = windowSize
@@ -51,9 +53,15 @@ final class ChatMessagesViewModel: ObservableObject {
                     await MainActor.run { [weak self] in
                         guard let self else { return }
                         if self.messages == pending {
+                            if self.isBootstrapping {
+                                self.isBootstrapping = false
+                            }
                             return
                         }
                         self.messages = pending
+                        if self.isBootstrapping {
+                            self.isBootstrapping = false
+                        }
                     }
                 }
             }

@@ -129,6 +129,15 @@ final class AvatarService {
         chatAvatarMetaByChatId: inout [Int64: ChatAvatarMeta],
         chatIdByAvatarFileId: inout [Int32: Int64]
     ) {
+        if let previous = chatAvatarMetaByChatId[chatId] {
+            if let previousSmall = previous.smallFileId, chatIdByAvatarFileId[previousSmall] == chatId {
+                chatIdByAvatarFileId.removeValue(forKey: previousSmall)
+            }
+            if let previousBig = previous.bigFileId, chatIdByAvatarFileId[previousBig] == chatId {
+                chatIdByAvatarFileId.removeValue(forKey: previousBig)
+            }
+        }
+
         var meta = chatAvatarMetaByChatId[chatId] ?? ChatAvatarMeta()
         meta.smallFileId = smallFileId
         meta.bigFileId = bigFileId
@@ -156,15 +165,14 @@ final class AvatarService {
         path: String,
         chatAvatarMetaByChatId: inout [Int64: ChatAvatarMeta]
     ) -> String? {
-        var meta = chatAvatarMetaByChatId[chatId] ?? ChatAvatarMeta()
+        guard var meta = chatAvatarMetaByChatId[chatId] else { return nil }
 
         if meta.smallFileId == fileId {
             meta.smallPath = path
         } else if meta.bigFileId == fileId {
             meta.bigPath = path
         } else {
-            if meta.smallPath == nil { meta.smallPath = path }
-            else if meta.bigPath == nil { meta.bigPath = path }
+            return meta.smallPath ?? meta.bigPath
         }
 
         chatAvatarMetaByChatId[chatId] = meta

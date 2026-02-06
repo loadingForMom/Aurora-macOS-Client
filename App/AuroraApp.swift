@@ -15,7 +15,10 @@ struct AuroraApp: App {
         WindowGroup {
             ContentView(store: store)
                 .environmentObject(store)
+                .frame(minWidth: 780, minHeight: 620)
         }
+        .defaultSize(width: 980, height: 680)
+        .windowResizability(.contentMinSize)
         .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
             InspectorCommands()

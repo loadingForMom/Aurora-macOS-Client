@@ -13,7 +13,7 @@ struct ContentView: View {
     @StateObject private var chatListViewModel: ChatListViewModel
 
     @State private var searchText: String = ""
-    @State private var inspectorShown: Bool = true
+    @State private var inspectorShown: Bool = false
     @State private var listSelection: Int64? = nil
 
     private func filteredChats(_ base: [TGChat], query: String) -> [TGChat] {
@@ -72,21 +72,14 @@ struct ContentView: View {
             } detail: {
                 Group {
                     if let chat = selectedChat {
-                        ChatScreen(store: store, chat: chat)
+                        ChatScreen(
+                            store: store,
+                            chat: chat,
+                            avatarPath: avatarPath(for: chat.id),
+                            onToggleInspector: { inspectorShown.toggle() }
+                        )
                             .id(chat.id)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .toolbar {
-                                ToolbarItem(placement: .principal) {
-                                    ChatTitleButtonInline(
-                                        title: chat.title,
-                                        chatId: chat.id,
-                                        avatarPath: avatarPath(for: chat.id)
-                                    )
-                                    .onTapGesture {
-                                        inspectorShown.toggle()
-                                    }
-                                }
-                            }
                     } else {
                         ContentUnavailableView("Select a chat", systemImage: "bubble.left.and.bubble.right")
                             .foregroundStyle(.secondary)
@@ -160,9 +153,17 @@ struct ContentView: View {
 }
 
 struct ChatTitleButtonInline: View {
+    @EnvironmentObject private var store: TelegramStore
+
     let title: String
     let chatId: Int64
     let avatarPath: String?
+
+    private var avatarRevision: String {
+        let pathPart = avatarPath ?? "nil"
+        let version = store.chatAvatarVersionByChatId[chatId] ?? 0
+        return "\(pathPart)#\(version)"
+    }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -172,12 +173,15 @@ struct ChatTitleButtonInline: View {
                     kind: .chat,
                     id: chatId,
                     size: 28,
-                    scale: NSScreen.main?.backingScaleFactor ?? 2.0
+                    scale: NSScreen.main?.backingScaleFactor ?? 2.0,
+                    revision: avatarRevision
                 ),
+                reloadToken: avatarRevision,
                 size: 28,
                 font: .system(size: 11, weight: .semibold, design: .rounded),
                 imageProvider: {
-                    avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
+                    store.chatAvatarNSImage(chatId: chatId, pointSize: 28, preferHiRes: false)
+                    ?? avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
                 }
             )
             .overlay(Circle().strokeBorder(Color.primary.opacity(0.06), lineWidth: 1))
