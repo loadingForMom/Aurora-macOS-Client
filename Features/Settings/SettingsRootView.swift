@@ -481,8 +481,8 @@ private struct DataAndStorageSettingsView: View {
             guard !didRequestInitialStats else { return }
             guard store.isAuthorized else { return }
             didRequestInitialStats = true
-            await store.applyCacheLimitBytes(cacheLimitBytes)
-            await store.refreshStorageStatistics()
+            store.applyCacheLimitBytes(cacheLimitBytes)
+            store.refreshStorageStatistics()
         }
         .onChange(of: store.isAuthorized) { _, isAuthorized in
             guard isAuthorized else { return }

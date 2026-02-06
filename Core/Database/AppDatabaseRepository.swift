@@ -7,13 +7,13 @@ import Foundation
 import GRDB
 import OSLog
 
-struct DatabaseStats: Hashable {
+nonisolated struct DatabaseStats: Hashable {
     let chats: Int
     let messages: Int
     let users: Int
 }
 
-final class AppDatabaseRepository {
+nonisolated final class AppDatabaseRepository: @unchecked Sendable {
     private let log = Logger(subsystem: "com.aurora.app", category: "db")
     private let dbWriter: DatabaseWriter
 

@@ -8,7 +8,7 @@
 import Foundation
 import Dispatch
 
-enum Config {
+nonisolated enum Config {
     static var apiId: Int {
         Int(ProcessInfo.processInfo.environment["TELEGRAM_API_ID"] ?? "") ?? 0
     }
@@ -18,7 +18,7 @@ enum Config {
     }
 }
 
-enum SwiftUIPublishTrace {
+nonisolated enum SwiftUIPublishTrace {
 #if DEBUG
     private static let enabledFlag: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["TRACE_SWIFTUI_PUBLISH"]?
@@ -163,7 +163,7 @@ enum SwiftUIPublishTrace {
 #endif
 }
 
-final class ViewUpdatePhaseTracker {
+nonisolated final class ViewUpdatePhaseTracker: @unchecked Sendable {
     static let shared = ViewUpdatePhaseTracker()
 
     private let lock = NSLock()

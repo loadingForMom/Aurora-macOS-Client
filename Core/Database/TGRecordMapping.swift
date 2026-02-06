@@ -7,7 +7,7 @@ import Foundation
 import GRDB
 
 extension TGChat {
-    init(row: Row) {
+    nonisolated init(row: Row) {
         let id: Int64 = row["chat_id"]
         let title: String = row["title"]
         let kindRaw: String = row["kind"]
@@ -32,7 +32,7 @@ extension TGChat {
 }
 
 extension TGMessage {
-    init(row: Row) {
+    nonisolated init(row: Row) {
         let chatId: Int64 = row["chat_id"]
         let messageId: Int64 = row["message_id"]
         let date: Int = row["date"]
@@ -74,7 +74,7 @@ extension TGMessage {
 }
 
 extension TGMessage {
-    static func deserializeSendState(state: String?, error: String?) -> TGMessageSendState {
+    nonisolated static func deserializeSendState(state: String?, error: String?) -> TGMessageSendState {
         switch state {
         case "pending":
             return .pending

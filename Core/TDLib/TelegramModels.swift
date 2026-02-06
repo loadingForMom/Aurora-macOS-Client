@@ -7,7 +7,7 @@
 
 import Foundation
 
-enum TGChatKind: String, Hashable {
+nonisolated enum TGChatKind: String, Hashable {
     case privateChat
     case basicGroup
     case supergroup
@@ -28,7 +28,7 @@ enum TGChatKind: String, Hashable {
     }
 }
 
-struct TGChat: Identifiable, Hashable {
+nonisolated struct TGChat: Identifiable, Hashable {
     let id: Int64
     var title: String
     var kind: TGChatKind
@@ -72,7 +72,7 @@ struct TGChat: Identifiable, Hashable {
     }
 }
 
-struct TGUser: Identifiable, Hashable {
+nonisolated struct TGUser: Identifiable, Hashable {
     let id: Int64
     var firstName: String
     var lastName: String
@@ -86,14 +86,14 @@ struct TGUser: Identifiable, Hashable {
     }
 }
 
-enum TGMessageSendState: Hashable, Sendable {
+nonisolated enum TGMessageSendState: Hashable, Sendable {
     case sent
     case pending
     case sending
     case failed(errorText: String)
 }
 
-struct TGMessage: Identifiable, Hashable, Sendable {
+nonisolated struct TGMessage: Identifiable, Hashable, Sendable {
     let id: Int64
     let chatId: Int64
     let date: Int
@@ -211,23 +211,23 @@ struct TGMessage: Identifiable, Hashable, Sendable {
     }
 }
 
-enum MessageStableId: Hashable, Sendable {
+nonisolated enum MessageStableId: Hashable, Sendable {
     case server(Int64)
     case local(UUID)
 }
 
-struct MessageKey: Hashable, Sendable {
+nonisolated struct MessageKey: Hashable, Sendable {
     let chatId: Int64
     let stableId: MessageStableId
 }
 
-struct TGTextEntity: Hashable, Sendable {
+nonisolated struct TGTextEntity: Hashable, Sendable {
     let type: TGTextEntityType
     let offset: Int
     let length: Int
 }
 
-enum TGTextEntityType: Hashable, Sendable {
+nonisolated enum TGTextEntityType: Hashable, Sendable {
     case bold
     case italic
     case underline
