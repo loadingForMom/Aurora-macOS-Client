@@ -86,6 +86,45 @@ extension TelegramStore {
         return ids.map { $0.int64Value }
     }
 
+    struct BlockedMessageSendersResponse {
+        let extra: String
+        let totalCount: Int
+        let senders: [BlockedSenderRef]
+    }
+
+    func parseBlockedMessageSendersResponse(_ upd: String) -> BlockedMessageSendersResponse? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "messageSenders" else { return nil }
+        guard let extra = obj["@extra"] as? String else { return nil }
+        guard extra.hasPrefix("blockedSenders:main:") else { return nil }
+
+        let totalCount = (obj["total_count"] as? NSNumber)?.intValue ?? 0
+        let rawSenders = obj["senders"] as? [Any] ?? []
+        let senders = rawSenders.compactMap(parseBlockedSenderRef)
+
+        return BlockedMessageSendersResponse(
+            extra: extra,
+            totalCount: totalCount,
+            senders: senders
+        )
+    }
+
+    private func parseBlockedSenderRef(_ raw: Any) -> BlockedSenderRef? {
+        guard let sender = raw as? [String: Any] else { return nil }
+        guard let type = sender["@type"] as? String else { return nil }
+
+        switch type {
+        case "messageSenderUser":
+            guard let userId = (sender["user_id"] as? NSNumber)?.int64Value else { return nil }
+            return .user(userId)
+        case "messageSenderChat":
+            guard let chatId = (sender["chat_id"] as? NSNumber)?.int64Value else { return nil }
+            return .chat(chatId)
+        default:
+            return nil
+        }
+    }
+
     /// Returns (chat, lastMessage, smallFileId, bigFileId, bestExistingPath)
     func parseChatObject(_ upd: String) -> (TGChat, TGMessage?, Int32?, Int32?, String?)? {
         guard let obj = parseJSON(upd) else { return nil }

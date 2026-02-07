@@ -21,6 +21,7 @@ struct MessagesPane: View {
 
     @State private var pagingEnabled: Bool = false
     @State private var pagingInFlight: Bool = false
+    @State private var restoreAnchorAfterPaging: Bool = false
     @State private var pendingRestoreAnchorMessageId: Int64? = nil
     @State private var paginationBaselineFirstMessageId: Int64? = nil
 
@@ -33,6 +34,8 @@ struct MessagesPane: View {
     @State private var lastAutoScrollAnimatedAtNs: UInt64 = 0
     @State private var didCrossPaginationThreshold: Bool = false
     @State private var lastTopSentinelMinY: CGFloat = -.greatestFiniteMagnitude
+    @State private var isTopSentinelVisible: Bool = false
+    @State private var pendingTopVisibleRetryAfterLoading: Bool = false
     private let groupGap: Int = 5 * 60
     private let majorGap: Int = 60 * 60
     private let autoScrollAnimationCooldownNs: UInt64 = 220_000_000
@@ -45,6 +48,16 @@ struct MessagesPane: View {
     private var topSentinelId: String { "top:\(chat.id)" }
     private var bottomSentinelId: String { "bottom:\(chat.id)" }
     private var optimizeBubbleEffects: Bool { windowMessages.count >= heavyEffectsCutoffMessages }
+    private var isViewportUnderfilledForPaging: Bool {
+        didInitialScrollToBottom &&
+        isTopSentinelVisible &&
+        isAtBottom &&
+        !windowMessages.isEmpty
+    }
+    private var showTopHistoryLoader: Bool {
+        (pagingInFlight || store.isLoadingHistory) &&
+        (isTopSentinelVisible || isViewportUnderfilledForPaging)
+    }
 
     private struct RowBuildResult: Sendable {
         let filteredMessages: [TGMessage]
@@ -307,6 +320,7 @@ struct MessagesPane: View {
 
         pagingEnabled = false
         pagingInFlight = false
+        restoreAnchorAfterPaging = false
         isPagingHistory = false
         pendingRestoreAnchorMessageId = nil
         paginationBaselineFirstMessageId = nil
@@ -320,6 +334,8 @@ struct MessagesPane: View {
         lastAutoScrollAnimatedAtNs = 0
         didCrossPaginationThreshold = false
         lastTopSentinelMinY = -.greatestFiniteMagnitude
+        isTopSentinelVisible = false
+        pendingTopVisibleRetryAfterLoading = false
     }
 
     @MainActor
@@ -392,6 +408,8 @@ struct MessagesPane: View {
 
         pendingRestoreAnchorMessageId = anchorMessageId
         paginationBaselineFirstMessageId = anchorMessageId
+        // Keep the viewport locked only when user is actually pinned at the top.
+        restoreAnchorAfterPaging = isTopSentinelVisible || lastTopSentinelMinY >= -8
         pagingInFlight = true
         isPagingHistory = true
         return true
@@ -441,23 +459,68 @@ struct MessagesPane: View {
             didCrossPaginationThreshold = false
             return
         }
+
         let nearTop = minY >= -paginationTopThreshold
         if nearTop {
             guard !didCrossPaginationThreshold else { return }
-            let started = requestOlderHistoryIfNeeded()
-            didCrossPaginationThreshold = started
+            didCrossPaginationThreshold = true
+            requestOlderHistoryFromTopTrigger(source: "nearTopThreshold")
             return
         }
+
         didCrossPaginationThreshold = false
+    }
+
+    @MainActor
+    private func requestOlderHistoryFromTopTrigger(source: String) {
+        if HistoryTrace.isEnabled(for: chat.id) {
+            HistoryTrace.emit(
+                tag: "HIST_UI",
+                chatId: chat.id,
+                fields: [
+                    ("event", "requestOlderTrigger"),
+                    ("source", source),
+                    ("isTopSentinelVisible", HistoryTrace.boolValue(isTopSentinelVisible)),
+                    ("isAtBottom", HistoryTrace.boolValue(isAtBottom)),
+                    ("isViewportUnderfilled", HistoryTrace.boolValue(isViewportUnderfilledForPaging)),
+                    ("pagingInFlight", HistoryTrace.boolValue(pagingInFlight)),
+                    ("storeLoadingHistory", HistoryTrace.boolValue(store.isLoadingHistory)),
+                    ("uiTopMessageId", HistoryTrace.optionalInt64(windowMessages.first?.id))
+                ],
+                rateKey: "ui:\(chat.id):trigger:\(source)",
+                rateLimitMs: 120
+            )
+        }
+
+        let started = requestOlderHistoryIfNeeded()
+        if started {
+            pendingTopVisibleRetryAfterLoading = false
+            return
+        }
+        if isTopSentinelVisible && didInitialScrollToBottom && store.isLoadingHistory {
+            pendingTopVisibleRetryAfterLoading = true
+        }
+    }
+
+    @MainActor
+    private func maybeRequestOlderForUnderfilledViewport(source: String) {
+        guard isViewportUnderfilledForPaging else { return }
+        guard !pagingInFlight else { return }
+
+        if store.isLoadingHistory {
+            pendingTopVisibleRetryAfterLoading = true
+            return
+        }
+        requestOlderHistoryFromTopTrigger(source: source)
     }
 
     @MainActor
     private func clearPagingState() {
         pagingInFlight = false
+        restoreAnchorAfterPaging = false
         isPagingHistory = false
         pendingRestoreAnchorMessageId = nil
         paginationBaselineFirstMessageId = nil
-        didCrossPaginationThreshold = false
     }
 
     private func scrollToBottomSentinel(_ proxy: ScrollViewProxy, animated: Bool) {
@@ -493,11 +556,12 @@ struct MessagesPane: View {
            let baseline = paginationBaselineFirstMessageId,
            let newFirstId = newMessages.first?.id,
            newFirstId != baseline {
-            if let anchorId = pendingRestoreAnchorMessageId {
+            if restoreAnchorAfterPaging, let anchorId = pendingRestoreAnchorMessageId {
                 scrollToMessageTop(proxy, messageId: anchorId)
             }
             clearPagingState()
             handleTopSentinelOffset(lastTopSentinelMinY)
+            maybeRequestOlderForUnderfilledViewport(source: "pagingCompleted")
         }
 
         if !didInitialScrollToBottom {
@@ -510,6 +574,10 @@ struct MessagesPane: View {
                 isAtBottom = true
                 newIncomingCount = 0
                 handleTopSentinelOffset(lastTopSentinelMinY)
+                if isTopSentinelVisible || newMessages.count <= 1 {
+                    requestOlderHistoryFromTopTrigger(source: "initialWindow")
+                }
+                maybeRequestOlderForUnderfilledViewport(source: "initialWindowUnderfilled")
             }
             return
         }
@@ -569,10 +637,27 @@ struct MessagesPane: View {
                         .frame(height: 1)
                         .id(topSentinelId)
                         .onAppear {
+                            isTopSentinelVisible = true
                             Task { @MainActor in
-                                _ = requestOlderHistoryIfNeeded()
+                                guard didInitialScrollToBottom else { return }
+                                requestOlderHistoryFromTopTrigger(source: "topSentinelAppear")
                             }
                         }
+                        .onDisappear {
+                            isTopSentinelVisible = false
+                            pendingTopVisibleRetryAfterLoading = false
+                        }
+
+                    if showTopHistoryLoader {
+                        HStack {
+                            Spacer(minLength: 0)
+                            ProgressView()
+                                .controlSize(.small)
+                                .progressViewStyle(.circular)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.vertical, 4)
+                    }
 
                     ForEach(rows) { row in
                         rowView(row)
@@ -652,8 +737,16 @@ struct MessagesPane: View {
                 if pagingInFlight, windowMessages.first?.id == paginationBaselineFirstMessageId {
                     clearPagingState()
                 }
-                // Retry immediately if user is already near top and previous attempt was blocked.
-                handleTopSentinelOffset(lastTopSentinelMinY)
+                let shouldRetryPendingTopRequest =
+                    pendingTopVisibleRetryAfterLoading &&
+                    didInitialScrollToBottom &&
+                    isTopSentinelVisible &&
+                    !pagingInFlight
+                if shouldRetryPendingTopRequest {
+                    pendingTopVisibleRetryAfterLoading = false
+                    requestOlderHistoryFromTopTrigger(source: "historyLoadingCompletedRetry")
+                }
+                maybeRequestOlderForUnderfilledViewport(source: "historyLoadingCompletedUnderfilled")
             }
             .onDisappear {
                 rowBuildTask?.cancel()

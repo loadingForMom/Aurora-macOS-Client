@@ -46,6 +46,7 @@ extension TelegramStore {
             uiTopKind: nil,
             storeMinIdVisible: nil
         )
+        markHistoryPaginationRequestQueued(chatId: chatId)
         syncHistoryLoadingFlagForSelectedChat()
         sendChatHistory(
             chatId: chatId,
@@ -60,6 +61,7 @@ extension TelegramStore {
     func loadInitialHistory(chatId: Int64) {
         reachedHistoryStart.remove(chatId)
         resetHistoryNoProgress(chatId: chatId)
+        resetHistoryPaginationContext(chatId: chatId)
         setMessageWindow(chatId: chatId, windowSize: initialHistoryWindowLimit)
 
         // Bump generation so stale history responses can't overwrite a newer timeline.
@@ -85,6 +87,7 @@ extension TelegramStore {
             uiTopKind: nil,
             storeMinIdVisible: nil
         )
+        markHistoryPaginationRequestQueued(chatId: chatId)
         syncHistoryLoadingFlagForSelectedChat()
         sendChatHistory(
             chatId: chatId,
@@ -113,13 +116,17 @@ extension TelegramStore {
         let reachedWindowCap = currentLimit >= maxHistoryWindowLimit
         let nowNs = DispatchTime.now().uptimeNanoseconds
         let pausedUntilNs = historyCooldownUntilNs(chatId: chatId, nowNs: nowNs)
+        let effectiveAnchorMessageId = resolvedHistoryAnchor(
+            chatId: chatId,
+            requestedAnchorMessageId: anchorMessageId
+        )
 
         if hasReachedStart {
             traceHistorySkip(
                 chatId: chatId,
                 reason: "older",
                 skipReason: "endReached",
-                anchorMessageId: anchorMessageId,
+                anchorMessageId: effectiveAnchorMessageId,
                 flags: [
                     ("hasReachedStart", HistoryTrace.boolValue(hasReachedStart)),
                     ("hasOlderInFlight", HistoryTrace.boolValue(hasOlderInFlight)),
@@ -127,15 +134,16 @@ extension TelegramStore {
                     ("maxLimit", String(maxHistoryWindowLimit))
                 ]
             )
+            syncHistoryPaginationCanLoadMore(chatId: chatId)
             return false
         }
 
-        if anchorMessageId <= 0 {
+        if effectiveAnchorMessageId <= 0 {
             traceHistorySkip(
                 chatId: chatId,
                 reason: "older",
                 skipReason: "noAnchor",
-                anchorMessageId: anchorMessageId,
+                anchorMessageId: effectiveAnchorMessageId,
                 flags: [
                     ("hasReachedStart", HistoryTrace.boolValue(hasReachedStart)),
                     ("hasOlderInFlight", HistoryTrace.boolValue(hasOlderInFlight)),
@@ -151,7 +159,7 @@ extension TelegramStore {
                 chatId: chatId,
                 reason: "older",
                 skipReason: "inFlight",
-                anchorMessageId: anchorMessageId,
+                anchorMessageId: effectiveAnchorMessageId,
                 flags: [
                     ("hasReachedStart", HistoryTrace.boolValue(hasReachedStart)),
                     ("hasOlderInFlight", HistoryTrace.boolValue(hasOlderInFlight)),
@@ -167,7 +175,7 @@ extension TelegramStore {
                 chatId: chatId,
                 reason: "older",
                 skipReason: "other",
-                anchorMessageId: anchorMessageId,
+                anchorMessageId: effectiveAnchorMessageId,
                 flags: [
                     ("cause", "maxWindowLimit"),
                     ("hasReachedStart", HistoryTrace.boolValue(hasReachedStart)),
@@ -184,7 +192,7 @@ extension TelegramStore {
                 chatId: chatId,
                 reason: "older",
                 skipReason: "cooldown",
-                anchorMessageId: anchorMessageId,
+                anchorMessageId: effectiveAnchorMessageId,
                 flags: [
                     ("pausedUntil", historyPausedUntilString(untilNs: pausedUntilNs, nowNs: nowNs)),
                     ("cooldownSecondsRemaining", String(historyRemainingCooldownSeconds(untilNs: pausedUntilNs, nowNs: nowNs)))
@@ -202,7 +210,7 @@ extension TelegramStore {
         historyJobs[extra] = HistoryJob(
             chatId: chatId,
             kind: .older,
-            anchorMessageId: anchorMessageId,
+            anchorMessageId: effectiveAnchorMessageId,
             requestedLimit: tdLimit,
             windowLimit: target,
             onlyLocal: false,
@@ -212,13 +220,14 @@ extension TelegramStore {
             uiTopKind: uiTopKind,
             storeMinIdVisible: storeMinIdVisible
         )
+        markHistoryPaginationRequestQueued(chatId: chatId)
         syncHistoryLoadingFlagForSelectedChat()
 
         // TDLib getChatHistory(chat_id, from_message_id, offset, limit, only_local).
         // offset=0 may include the anchor message; we dedupe by message_id later.
         sendChatHistory(
             chatId: chatId,
-            fromMessageId: anchorMessageId,
+            fromMessageId: effectiveAnchorMessageId,
             offset: 0,
             limit: tdLimit,
             onlyLocal: false,
@@ -235,6 +244,9 @@ extension TelegramStore {
         }
         initialRemoteRequestedGenerationByChatId.removeValue(forKey: chatId)
         resetHistoryNoProgress(chatId: chatId)
+        var paginationState = historyPaginationState(chatId: chatId)
+        paginationState.isLoadingMore = false
+        historyPaginationStateByChatId[chatId] = paginationState
         syncHistoryLoadingFlagForSelectedChat()
     }
 
@@ -272,6 +284,7 @@ extension TelegramStore {
                     ("cooldownSecondsRemaining", String(historyRemainingCooldownSeconds(untilNs: pausedUntilNs, nowNs: nowNs)))
                 ]
             )
+            applyHistoryPaginationError(extra: extra, message: "History cooldown is active")
             discardHistoryJob(extra: extra)
             syncHistoryLoadingFlagForSelectedChat()
             return
@@ -456,10 +469,20 @@ extension TelegramStore {
     }
 
     func discardHistoryJob(extra: String) {
-        if let job = historyJobs.removeValue(forKey: extra),
-           job.kind == .initialRemote,
-           initialRemoteRequestedGenerationByChatId[job.chatId] == job.generation {
-            initialRemoteRequestedGenerationByChatId.removeValue(forKey: job.chatId)
+        if let job = historyJobs.removeValue(forKey: extra) {
+            if job.kind == .initialRemote,
+               initialRemoteRequestedGenerationByChatId[job.chatId] == job.generation {
+                initialRemoteRequestedGenerationByChatId.removeValue(forKey: job.chatId)
+            }
+            if !historyJobs.values.contains(where: { $0.chatId == job.chatId }) {
+                var state = historyPaginationState(chatId: job.chatId)
+                state.isLoadingMore = false
+                state.canLoadMore = !reachedHistoryStart.contains(job.chatId)
+                if !state.canLoadMore {
+                    state.nextOffset = nil
+                }
+                historyPaginationStateByChatId[job.chatId] = state
+            }
         }
         historyRequestStartedAtNs.removeValue(forKey: extra)
     }

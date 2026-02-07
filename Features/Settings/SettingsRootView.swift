@@ -70,9 +70,7 @@ struct SettingsRootView: View {
                     case .notifications:
                         NotificationsSettingsView()
                     case .privacy:
-                        PlaceholderSettingsView(title: "Конфиденциальность", items: [
-                            "Настройки конфиденциальности (заглушка)"
-                        ])
+                        PrivacySettingsView(store: store)
                     case .data:
                         DataAndStorageSettingsView(store: store)
                     case .sessions:
@@ -306,6 +304,94 @@ private struct NotificationsSettingsView: View {
                 Toggle("Когда приложение активно", isOn: $whenActive)
             }
         }
+    }
+}
+
+private struct PrivacySettingsView: View {
+    @ObservedObject var store: TelegramStore
+
+    private var pagination: TelegramStore.TDLibPaginationState<TelegramStore.BlockedSenderItem> {
+        store.blockedSendersPagination
+    }
+
+    var body: some View {
+        Form {
+            Section("Заблокированные отправители") {
+                if !store.isAuthorized {
+                    Text("Доступно после входа в Telegram")
+                        .foregroundStyle(.secondary)
+                } else if pagination.items.isEmpty, pagination.isLoadingMore {
+                    HStack {
+                        Spacer()
+                        ProgressView()
+                        Spacer()
+                    }
+                } else if pagination.items.isEmpty {
+                    Text("Список пуст")
+                        .foregroundStyle(.secondary)
+                }
+
+                ForEach(pagination.items) { item in
+                    blockedRow(item)
+                        .onAppear {
+                            guard item.id == pagination.items.last?.id else { return }
+                            _ = store.loadMoreBlockedSenders()
+                        }
+                }
+
+                if pagination.isLoadingMore, !pagination.items.isEmpty {
+                    HStack {
+                        Spacer()
+                        ProgressView()
+                        Spacer()
+                    }
+                }
+
+                if let error = pagination.error, !error.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(error)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        Button("Повторить") {
+                            _ = store.loadMoreBlockedSenders()
+                        }
+                    }
+                    .padding(.vertical, 4)
+                } else if !pagination.canLoadMore, !pagination.items.isEmpty {
+                    Text("Больше нет записей")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .task {
+            guard store.isAuthorized else { return }
+            store.ensureBlockedSendersPaginationStarted()
+        }
+        .onChange(of: store.isAuthorized) { _, isAuthorized in
+            if isAuthorized {
+                store.ensureBlockedSendersPaginationStarted()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func blockedRow(_ item: TelegramStore.BlockedSenderItem) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: item.kind == .user ? "person.crop.circle.fill" : "bubble.left.and.bubble.right.fill")
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+
+            Text(item.title)
+                .lineLimit(1)
+
+            Spacer()
+
+            Text(item.kind == .user ? "Пользователь" : "Чат")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
     }
 }
 

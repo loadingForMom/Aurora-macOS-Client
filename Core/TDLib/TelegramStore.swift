@@ -146,6 +146,47 @@ final class TelegramStore: ObservableObject {
     var userCache: [Int64: TGUser] = [:]
     var userPrefetchInFlight: Set<Int64> = []
 
+    // MARK: - TDLib pagination contexts (Settings)
+
+    struct TDLibPaginationState<Item: Equatable>: Equatable {
+        var items: [Item]
+        var isLoadingMore: Bool
+        var canLoadMore: Bool
+        var offset: Int
+        var error: String?
+    }
+
+    struct BlockedSenderItem: Identifiable, Hashable, Sendable {
+        enum Kind: String, Hashable, Sendable {
+            case user
+            case chat
+        }
+
+        let kind: Kind
+        let peerId: Int64
+        var title: String
+
+        var id: String {
+            "\(kind.rawValue):\(peerId)"
+        }
+    }
+
+    enum BlockedSenderRef: Hashable, Sendable {
+        case user(Int64)
+        case chat(Int64)
+    }
+
+    @Published private(set) var blockedSendersPagination = TDLibPaginationState<BlockedSenderItem>(
+        items: [],
+        isLoadingMore: false,
+        canLoadMore: true,
+        offset: 0,
+        error: nil
+    )
+    private var blockedSendersInFlightExtras: Set<String> = []
+    private var blockedSendersRequestedLimitByExtra: [String: Int] = [:]
+    private var blockedSendersRequestedOffsetByExtra: [String: Int] = [:]
+
     // MARK: - History jobs
 
     enum HistoryJobKind { case initialLocal, initialRemote, older }
@@ -187,6 +228,7 @@ final class TelegramStore: ObservableObject {
     var historyMetrics = HistoryMetrics()
     var historyGlobalPausedUntilNs: UInt64 = 0
     var historyPausedUntilNsByChatId: [Int64: UInt64] = [:]
+    var historyPaginationStateByChatId: [Int64: HistoryPaginationContextState] = [:]
 
     // MARK: - Init
 
@@ -270,6 +312,197 @@ final class TelegramStore: ObservableObject {
         }
         prefetchUserIfNeeded(userId: id)
         return "User \(id)"
+    }
+
+    @MainActor
+    func ensureBlockedSendersPaginationStarted() {
+        guard blockedSendersPagination.items.isEmpty else { return }
+        _ = loadMoreBlockedSenders()
+    }
+
+    @MainActor
+    func reloadBlockedSendersPagination() {
+        blockedSendersInFlightExtras.removeAll(keepingCapacity: false)
+        blockedSendersRequestedLimitByExtra.removeAll(keepingCapacity: false)
+        blockedSendersRequestedOffsetByExtra.removeAll(keepingCapacity: false)
+        blockedSendersPagination = TDLibPaginationState(
+            items: [],
+            isLoadingMore: false,
+            canLoadMore: true,
+            offset: 0,
+            error: nil
+        )
+        _ = loadMoreBlockedSenders()
+    }
+
+    @MainActor
+    @discardableResult
+    func loadMoreBlockedSenders(limit: Int = 50) -> Bool {
+        guard !blockedSendersPagination.isLoadingMore else { return false }
+        guard blockedSendersPagination.canLoadMore else { return false }
+        guard isRequestAuthorizedSnapshot() else {
+            blockedSendersPagination.error = "Требуется авторизация в Telegram"
+            return false
+        }
+
+        let normalizedLimit = max(1, min(limit, 200))
+        let requestOffset = blockedSendersPagination.offset
+        let extra = "blockedSenders:main:\(UUID().uuidString)"
+
+        blockedSendersInFlightExtras.insert(extra)
+        blockedSendersRequestedLimitByExtra[extra] = normalizedLimit
+        blockedSendersRequestedOffsetByExtra[extra] = requestOffset
+        blockedSendersPagination.isLoadingMore = true
+        blockedSendersPagination.error = nil
+
+        enqueueTDLibRequest(
+            [
+                "@type": "getBlockedMessageSenders",
+                "@extra": extra,
+                "block_list": [
+                    "@type": "blockListMain"
+                ],
+                "offset": requestOffset,
+                "limit": normalizedLimit
+            ],
+            typeOverride: "getBlockedMessageSenders",
+            priority: .high
+        )
+        return true
+    }
+
+    @MainActor
+    func handleBlockedSendersResponse(extra: String, totalCount: Int, senders: [BlockedSenderRef]) {
+        guard blockedSendersInFlightExtras.remove(extra) != nil else { return }
+        let _ = blockedSendersRequestedLimitByExtra.removeValue(forKey: extra)
+        let requestOffset = blockedSendersRequestedOffsetByExtra.removeValue(forKey: extra) ?? blockedSendersPagination.offset
+
+        let incomingItems = senders.map { blockedSenderItem(for: $0) }
+        let mergedItems = mergeBlockedSenderItems(existing: blockedSendersPagination.items, incoming: incomingItems)
+
+        let nextOffset = requestOffset + senders.count
+        let canLoadMore = senders.isEmpty ? false : (nextOffset < totalCount)
+
+        blockedSendersPagination = TDLibPaginationState(
+            items: mergedItems,
+            isLoadingMore: false,
+            canLoadMore: canLoadMore,
+            offset: nextOffset,
+            error: nil
+        )
+    }
+
+    @MainActor
+    func handleBlockedSendersError(extra: String, message: String) {
+        guard blockedSendersInFlightExtras.remove(extra) != nil else { return }
+        blockedSendersRequestedLimitByExtra.removeValue(forKey: extra)
+        blockedSendersRequestedOffsetByExtra.removeValue(forKey: extra)
+        blockedSendersPagination.isLoadingMore = false
+        blockedSendersPagination.error = message
+    }
+
+    @MainActor
+    func refreshBlockedSenderTitle(userId: Int64) {
+        var items = blockedSendersPagination.items
+        var changed = false
+        for index in items.indices {
+            guard items[index].kind == .user, items[index].peerId == userId else { continue }
+            let title = resolveBlockedSenderTitle(kind: .user, peerId: userId)
+            if items[index].title != title {
+                items[index].title = title
+                changed = true
+            }
+        }
+        guard changed else { return }
+        blockedSendersPagination.items = items
+    }
+
+    @MainActor
+    func refreshBlockedSenderTitle(chatId: Int64, preferredTitle: String? = nil) {
+        var items = blockedSendersPagination.items
+        var changed = false
+        for index in items.indices {
+            guard items[index].kind == .chat, items[index].peerId == chatId else { continue }
+            let title = preferredTitle ?? resolveBlockedSenderTitle(kind: .chat, peerId: chatId)
+            if items[index].title != title {
+                items[index].title = title
+                changed = true
+            }
+        }
+        guard changed else { return }
+        blockedSendersPagination.items = items
+    }
+
+    @MainActor
+    private func blockedSenderItem(for sender: BlockedSenderRef) -> BlockedSenderItem {
+        switch sender {
+        case let .user(userId):
+            return BlockedSenderItem(
+                kind: .user,
+                peerId: userId,
+                title: resolveBlockedSenderTitle(kind: .user, peerId: userId)
+            )
+        case let .chat(chatId):
+            return BlockedSenderItem(
+                kind: .chat,
+                peerId: chatId,
+                title: resolveBlockedSenderTitle(kind: .chat, peerId: chatId)
+            )
+        }
+    }
+
+    @MainActor
+    private func resolveBlockedSenderTitle(kind: BlockedSenderItem.Kind, peerId: Int64) -> String {
+        switch kind {
+        case .user:
+            if let cached = userCache[peerId] {
+                return cached.displayName
+            }
+            if let persisted = databaseRepository.fetchUser(userId: peerId) {
+                if userCache[peerId] != persisted {
+                    userCache[peerId] = persisted
+                }
+                return persisted.displayName
+            }
+            Task { [weak self] in
+                await self?.requestUserIfNeeded(peerId)
+            }
+            return "User \(peerId)"
+        case .chat:
+            if let chat = databaseRepository.fetchChat(chatId: peerId), !chat.title.isEmpty {
+                return chat.title
+            }
+            if !pendingChatInfoRequests.contains(peerId) {
+                pendingChatInfoRequests.insert(peerId)
+                enqueueTDLibRequest(
+                    [
+                        "@type": "getChat",
+                        "chat_id": peerId
+                    ],
+                    typeOverride: "getChat"
+                )
+            }
+            return "Chat \(peerId)"
+        }
+    }
+
+    private func mergeBlockedSenderItems(
+        existing: [BlockedSenderItem],
+        incoming: [BlockedSenderItem]
+    ) -> [BlockedSenderItem] {
+        var merged = existing
+        var existingIds = Set(existing.map(\.id))
+        for item in incoming {
+            if existingIds.contains(item.id) {
+                if let index = merged.firstIndex(where: { $0.id == item.id }), merged[index] != item {
+                    merged[index] = item
+                }
+                continue
+            }
+            merged.append(item)
+            existingIds.insert(item.id)
+        }
+        return merged
     }
 
     @MainActor
@@ -673,6 +906,18 @@ final class TelegramStore: ObservableObject {
         historyMetrics = HistoryMetrics()
         historyGlobalPausedUntilNs = 0
         historyPausedUntilNsByChatId = [:]
+        historyPaginationStateByChatId = [:]
+
+        blockedSendersPagination = TDLibPaginationState(
+            items: [],
+            isLoadingMore: false,
+            canLoadMore: true,
+            offset: 0,
+            error: nil
+        )
+        blockedSendersInFlightExtras = []
+        blockedSendersRequestedLimitByExtra = [:]
+        blockedSendersRequestedOffsetByExtra = [:]
 
         didLoadInitialData = false
         didSendTdlibParameters = false

@@ -92,6 +92,7 @@ extension TelegramStore {
             requestedUserIds.remove(u.id)
             let myPhotoToDownload: Int32? = await MainActor.run {
                 userCache[u.id] = u
+                refreshBlockedSenderTitle(userId: u.id)
                 guard let meId = myUserId, meId == u.id else { return nil }
                 if let p = photoPath {
                     myProfilePhotoPath = p
@@ -143,7 +144,10 @@ extension TelegramStore {
 
         if let user = parseUserObject(upd) {
             requestedUserIds.remove(user.id)
-            await MainActor.run { userCache[user.id] = user }
+            await MainActor.run {
+                userCache[user.id] = user
+                refreshBlockedSenderTitle(userId: user.id)
+            }
             await databaseBatchWriter.enqueue(.upsertUser(user))
         }
 
@@ -240,6 +244,13 @@ extension TelegramStore {
 
     func handleResponse(_ resp: String) async {
         if let err = parseTdError(resp) {
+            if let extra = err.extra, extra.hasPrefix("blockedSenders:main:") {
+                await MainActor.run {
+                    handleBlockedSendersError(extra: extra, message: err.message)
+                }
+                return
+            }
+
             if let extra = err.extra,
                extra.hasPrefix("history:") {
                 let context = parseHistoryExtraContext(extra)
@@ -250,6 +261,7 @@ extension TelegramStore {
                 if isFloodWaitCandidate {
                     let seconds = max(1, parseFloodWaitSeconds(message: err.message, extra: err.extra) ?? 1)
                     let pausedUntilNs = applyHistoryFloodWaitCooldown(chatId: context?.chatId, seconds: seconds)
+                    applyHistoryPaginationError(extra: extra, message: err.message)
                     discardHistoryJob(extra: extra)
                     syncHistoryLoadingFlagForSelectedChat()
 
@@ -269,6 +281,24 @@ extension TelegramStore {
                     )
                     return
                 }
+
+                applyHistoryPaginationError(extra: extra, message: err.message)
+                discardHistoryJob(extra: extra)
+                syncHistoryLoadingFlagForSelectedChat()
+                HistoryTrace.emit(
+                    tag: "HIST_ERR",
+                    chatId: context?.chatId,
+                    fields: [
+                        ("type", "REQUEST_FAILED"),
+                        ("code", String(err.code)),
+                        ("message", err.message),
+                        ("chatId", HistoryTrace.optionalInt64(context?.chatId)),
+                        ("requestId", context?.requestId ?? "null"),
+                        ("reason", context?.reason ?? "other"),
+                        ("extra", extra)
+                    ]
+                )
+                return
             }
 
             if let extra = err.extra, extra.hasPrefix("storage:") {
@@ -304,6 +334,17 @@ extension TelegramStore {
             td.send(#"{"@type":"loadChats","@extra":"loadChats:main","chat_list":{"@type":"chatListMain"},"limit":200}"#)
         }
 
+        if let blocked = parseBlockedMessageSendersResponse(resp) {
+            await MainActor.run {
+                handleBlockedSendersResponse(
+                    extra: blocked.extra,
+                    totalCount: blocked.totalCount,
+                    senders: blocked.senders
+                )
+            }
+            return
+        }
+
         if let ids = parseChatsResponse(resp) {
             for id in ids {
                 td.send(#"{"@type":"getChat","chat_id":\#(id)}"#)
@@ -335,6 +376,7 @@ extension TelegramStore {
 
             await MainActor.run {
                 registerChatAvatar(chatId: chat.id, smallFileId: smallId, bigFileId: bigId, initialBestPath: bestPath)
+                refreshBlockedSenderTitle(chatId: chat.id, preferredTitle: chat.title)
             }
 
             let shouldAutoSelect = await MainActor.run { selectedChatId == nil }
@@ -354,6 +396,7 @@ extension TelegramStore {
             let myPhotoToDownload: Int32? = await MainActor.run {
                 myUserId = me.id
                 userCache[me.id] = me
+                refreshBlockedSenderTitle(userId: me.id)
                 if let p = photoPath {
                     myProfilePhotoPath = p
                 }
@@ -371,7 +414,10 @@ extension TelegramStore {
 
         if let user = parseUserObject(resp) {
             requestedUserIds.remove(user.id)
-            await MainActor.run { userCache[user.id] = user }
+            await MainActor.run {
+                userCache[user.id] = user
+                refreshBlockedSenderTitle(userId: user.id)
+            }
             await databaseBatchWriter.enqueue(.upsertUser(user))
         }
 
@@ -577,6 +623,7 @@ extension TelegramStore {
                     if shouldMarkEnd {
                         reachedHistoryStart.insert(job.chatId)
                         resetHistoryNoProgress(chatId: job.chatId)
+                        syncHistoryPaginationCanLoadMore(chatId: job.chatId)
                     }
                 } else {
                     let visibleMinAdvanced =
@@ -589,7 +636,37 @@ extension TelegramStore {
                 }
             }
 
+            applyHistoryPaginationResponse(
+                job: job,
+                responseMessages: res.messages,
+                mergedMessages: messagesToMerge
+            )
+
             historyJobs.removeValue(forKey: res.extra)
+
+            if job.kind == .initialRemote {
+                let paginationState = historyPaginationState(chatId: job.chatId)
+                let minimalInitialBatchThreshold = min(5, job.requestedLimit)
+                let shouldAutoloadOlder =
+                    selectedChatId == job.chatId &&
+                    paginationState.canLoadMore &&
+                    !paginationState.isLoadingMore &&
+                    returnedCount <= max(1, minimalInitialBatchThreshold)
+
+                if shouldAutoloadOlder,
+                   let nextAnchor = paginationState.nextOffset,
+                   nextAnchor > 0 {
+                    _ = _loadMoreHistory_impl(
+                        chatId: job.chatId,
+                        anchorMessageId: nextAnchor,
+                        pageSize: job.requestedLimit,
+                        uiTopMessageId: nil,
+                        uiTopKind: nil,
+                        storeMinIdVisible: nextAnchor,
+                        anchorSource: .storeMin
+                    )
+                }
+            }
 
             if job.kind == .initialLocal {
                 let localCount = res.messages.count
