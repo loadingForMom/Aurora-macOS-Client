@@ -9,7 +9,12 @@ import SwiftUI
 
 @main
 struct AuroraApp: App {
-    @StateObject private var store = TelegramStore()
+    @StateObject private var store: TelegramStore
+
+    init() {
+        AppSessionLogRecorder.shared.startIfNeeded()
+        _store = StateObject(wrappedValue: TelegramStore())
+    }
 
     var body: some Scene {
         WindowGroup {

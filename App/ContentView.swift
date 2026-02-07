@@ -142,6 +142,7 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             store.flushDatabaseNow()
             SwiftUIPublishTrace.emitSummary()
+            AppSessionLogRecorder.shared.finalizeIfNeeded(reason: "NSApplication.willTerminateNotification")
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { _ in
             store.flushDatabaseNow()

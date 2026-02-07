@@ -3,6 +3,8 @@
 xcuserdata/
 DerivedData/
 .build/
+Logs/
+Aurora.env
 *.swp
 *.orig
 .derivedData/
