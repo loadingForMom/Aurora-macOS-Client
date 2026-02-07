@@ -7,6 +7,135 @@
 
 import SwiftUI
 import AppKit
+import Combine
+
+enum HeaderPlateStyle: String, CaseIterable, Identifiable {
+    case systemGlass = "systemGlass"
+    case ultraThinMaterial = "ultraThinMaterial"
+    case thinMaterial = "thinMaterial"
+    case regularMaterial = "regularMaterial"
+    case thickMaterial = "thickMaterial"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .systemGlass:
+            return "System Glass"
+        case .ultraThinMaterial:
+            return "Ultra Thin"
+        case .thinMaterial:
+            return "Thin"
+        case .regularMaterial:
+            return "Regular"
+        case .thickMaterial:
+            return "Thick"
+        }
+    }
+}
+
+final class ChatHeaderDebugState: ObservableObject {
+    static let defaultAvatarSize: Double = 34
+    static let defaultAvatarOverlap: Double = 3
+    static let defaultAvatarLowering: Double = 8
+    static let defaultToolbarOffsetY: Double = 6
+    static let defaultInspectorGlassOffsetY: Double = 0
+    static let defaultHeaderPlateOffsetX: Double = 0
+    static let defaultHeaderPlateOffsetY: Double = 0
+    static let defaultHeaderPlatePaddingX: Double = 14
+    static let defaultHeaderPlatePaddingY: Double = 6
+    static let defaultHeaderPlateCornerRadius: Double = 14
+    static let defaultHeaderPlateStyle: HeaderPlateStyle = .systemGlass
+    static let defaultHeaderPlateIntensity: Double = 0.38
+    static let defaultHeaderPlateOpacity: Double = 0.78
+
+    @Published var isEnabled: Bool = true
+    @Published var avatarSize: Double = defaultAvatarSize
+    @Published var avatarOverlap: Double = defaultAvatarOverlap
+    @Published var avatarLowering: Double = defaultAvatarLowering
+    @Published var toolbarOffsetY: Double = defaultToolbarOffsetY
+    @Published var inspectorGlassOffsetY: Double = defaultInspectorGlassOffsetY
+    @Published var headerPlateOffsetX: Double = defaultHeaderPlateOffsetX
+    @Published var headerPlateOffsetY: Double = defaultHeaderPlateOffsetY
+    @Published var headerPlatePaddingX: Double = defaultHeaderPlatePaddingX
+    @Published var headerPlatePaddingY: Double = defaultHeaderPlatePaddingY
+    @Published var headerPlateCornerRadius: Double = defaultHeaderPlateCornerRadius
+    @Published var headerPlateStyleRawValue: String = defaultHeaderPlateStyle.rawValue
+    @Published var headerPlateIntensity: Double = defaultHeaderPlateIntensity
+    @Published var headerPlateOpacity: Double = defaultHeaderPlateOpacity
+
+    var resolvedAvatarSize: CGFloat {
+        CGFloat(isEnabled ? avatarSize : Self.defaultAvatarSize)
+    }
+
+    var resolvedAvatarOverlap: CGFloat {
+        CGFloat(isEnabled ? avatarOverlap : Self.defaultAvatarOverlap)
+    }
+
+    var resolvedAvatarLowering: CGFloat {
+        CGFloat(isEnabled ? avatarLowering : Self.defaultAvatarLowering)
+    }
+
+    var resolvedAvatarLift: CGFloat {
+        max(0, resolvedAvatarSize - resolvedAvatarOverlap - resolvedAvatarLowering)
+    }
+
+    var resolvedToolbarOffsetY: CGFloat {
+        CGFloat(isEnabled ? toolbarOffsetY : Self.defaultToolbarOffsetY)
+    }
+
+    var resolvedInspectorGlassOffsetY: CGFloat {
+        CGFloat(isEnabled ? inspectorGlassOffsetY : Self.defaultInspectorGlassOffsetY)
+    }
+
+    var resolvedHeaderPlateOffsetX: CGFloat {
+        CGFloat(isEnabled ? headerPlateOffsetX : Self.defaultHeaderPlateOffsetX)
+    }
+
+    var resolvedHeaderPlateOffsetY: CGFloat {
+        CGFloat(isEnabled ? headerPlateOffsetY : Self.defaultHeaderPlateOffsetY)
+    }
+
+    var resolvedHeaderPlatePaddingX: CGFloat {
+        CGFloat(isEnabled ? headerPlatePaddingX : Self.defaultHeaderPlatePaddingX)
+    }
+
+    var resolvedHeaderPlatePaddingY: CGFloat {
+        CGFloat(isEnabled ? headerPlatePaddingY : Self.defaultHeaderPlatePaddingY)
+    }
+
+    var resolvedHeaderPlateCornerRadius: CGFloat {
+        CGFloat(isEnabled ? headerPlateCornerRadius : Self.defaultHeaderPlateCornerRadius)
+    }
+
+    var resolvedHeaderPlateStyle: HeaderPlateStyle {
+        .systemGlass
+    }
+
+    var resolvedHeaderPlateIntensity: Double {
+        isEnabled ? headerPlateIntensity : Self.defaultHeaderPlateIntensity
+    }
+
+    var resolvedHeaderPlateOpacity: Double {
+        isEnabled ? headerPlateOpacity : Self.defaultHeaderPlateOpacity
+    }
+
+    func reset() {
+        avatarSize = Self.defaultAvatarSize
+        avatarOverlap = Self.defaultAvatarOverlap
+        avatarLowering = Self.defaultAvatarLowering
+        toolbarOffsetY = Self.defaultToolbarOffsetY
+        inspectorGlassOffsetY = Self.defaultInspectorGlassOffsetY
+        headerPlateOffsetX = Self.defaultHeaderPlateOffsetX
+        headerPlateOffsetY = Self.defaultHeaderPlateOffsetY
+        headerPlatePaddingX = Self.defaultHeaderPlatePaddingX
+        headerPlatePaddingY = Self.defaultHeaderPlatePaddingY
+        headerPlateCornerRadius = Self.defaultHeaderPlateCornerRadius
+        headerPlateStyleRawValue = Self.defaultHeaderPlateStyle.rawValue
+        headerPlateIntensity = Self.defaultHeaderPlateIntensity
+        headerPlateOpacity = Self.defaultHeaderPlateOpacity
+    }
+}
 
 struct ContentView: View {
     @ObservedObject var store: TelegramStore
@@ -155,6 +284,8 @@ struct ContentView: View {
 
 struct ChatTitleButtonInline: View {
     @EnvironmentObject private var store: TelegramStore
+    @EnvironmentObject private var headerDebug: ChatHeaderDebugState
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     let title: String
     let chatId: Int64
@@ -167,33 +298,96 @@ struct ChatTitleButtonInline: View {
     }
 
     var body: some View {
-        HStack(spacing: 8) {
+        let avatarSize = headerDebug.resolvedAvatarSize
+        let avatarLift = headerDebug.resolvedAvatarLift
+        let plateOffsetX = headerDebug.resolvedHeaderPlateOffsetX
+        let plateOffsetY = headerDebug.resolvedHeaderPlateOffsetY
+        let platePaddingX = headerDebug.resolvedHeaderPlatePaddingX
+        let platePaddingY = headerDebug.resolvedHeaderPlatePaddingY
+        let plateCornerRadius = headerDebug.resolvedHeaderPlateCornerRadius
+        let plateStyle = headerDebug.resolvedHeaderPlateStyle
+        let plateIntensity = headerDebug.resolvedHeaderPlateIntensity
+        let plateOpacity = headerDebug.resolvedHeaderPlateOpacity
+
+        ZStack(alignment: .top) {
+            Text(title)
+                .font(.headline)
+                .lineLimit(1)
+                .padding(.horizontal, platePaddingX)
+                .padding(.vertical, platePaddingY)
+                .background {
+                    HeaderTitlePlateBackground(
+                        style: plateStyle,
+                        cornerRadius: plateCornerRadius,
+                        intensity: plateIntensity,
+                        opacity: plateOpacity,
+                        reduceTransparency: reduceTransparency
+                    )
+                }
+                .overlay(
+                    RoundedRectangle(cornerRadius: plateCornerRadius, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                )
+                .offset(x: plateOffsetX, y: plateOffsetY)
+
             AvatarCircle(
                 title: title,
                 identityKey: AvatarCacheKey(
                     kind: .chat,
                     id: chatId,
-                    size: 28,
+                    size: avatarSize,
                     scale: NSScreen.main?.backingScaleFactor ?? 2.0,
                     revision: avatarRevision
                 ),
                 reloadToken: avatarRevision,
-                size: 28,
+                size: avatarSize,
                 font: .system(size: 11, weight: .semibold, design: .rounded),
                 imageProvider: {
-                    store.chatAvatarNSImage(chatId: chatId, pointSize: 28, preferHiRes: false)
+                    store.chatAvatarNSImage(chatId: chatId, pointSize: avatarSize, preferHiRes: false)
                     ?? avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
                 }
             )
             .overlay(Circle().strokeBorder(Color.primary.opacity(0.06), lineWidth: 1))
-
-            Text(title)
-                .font(.headline)
-                .lineLimit(1)
+            .offset(y: -avatarLift)
         }
         .contentShape(Rectangle())
         .padding(.vertical, 2)
         .padding(.horizontal, 6)
+    }
+}
+
+private struct HeaderTitlePlateBackground: View {
+    let style: HeaderPlateStyle
+    let cornerRadius: CGFloat
+    let intensity: Double
+    let opacity: Double
+    let reduceTransparency: Bool
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+
+        ZStack {
+            if reduceTransparency {
+                shape.fill(Color(nsColor: .windowBackgroundColor).opacity(0.95))
+            } else {
+                switch style {
+                case .systemGlass:
+                    Color.clear.glassEffect(in: shape)
+                    shape.fill(.ultraThinMaterial).opacity(0.42 * intensity)
+                case .ultraThinMaterial:
+                    shape.fill(.ultraThinMaterial)
+                case .thinMaterial:
+                    shape.fill(.thinMaterial)
+                case .regularMaterial:
+                    shape.fill(.regularMaterial)
+                case .thickMaterial:
+                    shape.fill(.thickMaterial)
+                }
+            }
+
+            shape.fill(Color.white.opacity(0.12 * intensity))
+        }
+        .opacity(opacity)
     }
 }
 

@@ -22,28 +22,34 @@ struct ChatTitleButton: View {
     }
 
     var body: some View {
-        HStack(spacing: 10) {
-            AvatarCircle(
-                title: title,
-                identityKey: AvatarCacheKey(
-                    kind: .chat,
-                    id: chatId,
-                    size: 26,
-                    scale: NSScreen.main?.backingScaleFactor ?? 2.0,
-                    revision: avatarRevision
-                ),
-                reloadToken: avatarRevision,
-                size: 26,
-                font: .caption.weight(.semibold),
-                imageProvider: {
-                    store.chatAvatarNSImage(chatId: chatId, pointSize: 26, preferHiRes: false)
-                    ?? avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
-                }
-            )
-            Text(title)
-                .font(.headline)
-                .lineLimit(1)
-        }
+        let avatarSize: CGFloat = 26
+        let avatarOverlap: CGFloat = 3
+        let avatarLowering: CGFloat = 8
+        let avatarLift = max(0, avatarSize - avatarOverlap - avatarLowering)
+
+        Text(title)
+            .font(.headline)
+            .lineLimit(1)
+            .overlay(alignment: .top) {
+                AvatarCircle(
+                    title: title,
+                    identityKey: AvatarCacheKey(
+                        kind: .chat,
+                        id: chatId,
+                        size: avatarSize,
+                        scale: NSScreen.main?.backingScaleFactor ?? 2.0,
+                        revision: avatarRevision
+                    ),
+                    reloadToken: avatarRevision,
+                    size: avatarSize,
+                    font: .caption.weight(.semibold),
+                    imageProvider: {
+                        store.chatAvatarNSImage(chatId: chatId, pointSize: avatarSize, preferHiRes: false)
+                        ?? avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
+                    }
+                )
+                .offset(y: -avatarLift)
+            }
         .padding(.vertical, 2)
         .padding(.horizontal, 6)
         .contentShape(Rectangle())

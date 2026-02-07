@@ -24,9 +24,12 @@ struct MessagesPane: View {
     @State private var restoreAnchorAfterPaging: Bool = false
     @State private var pendingRestoreAnchorMessageId: Int64? = nil
     @State private var paginationBaselineFirstMessageId: Int64? = nil
+    @State private var lastRequestedTopAnchorMessageId: Int64? = nil
 
     @State private var isAtBottom: Bool = true
     @State private var newIncomingCount: Int = 0
+    @State private var visibleMessageIds: Set<Int64> = []
+    @State private var visibleReportTask: Task<Void, Never>? = nil
 
     @State private var didInitialScrollToBottom: Bool = false
 
@@ -41,6 +44,7 @@ struct MessagesPane: View {
     private let autoScrollAnimationCooldownNs: UInt64 = 220_000_000
     private let paginationTopThreshold: CGFloat = 260
     private let heavyEffectsCutoffMessages: Int = 700
+    private let revealTimeMaxX: CGFloat = 72
 
     private static let rowBuildWorker = RowsBuildWorker()
     private let scrollSpaceName = "messages-scroll-space"
@@ -324,9 +328,14 @@ struct MessagesPane: View {
         isPagingHistory = false
         pendingRestoreAnchorMessageId = nil
         paginationBaselineFirstMessageId = nil
+        lastRequestedTopAnchorMessageId = nil
 
         isAtBottom = true
         newIncomingCount = 0
+        visibleReportTask?.cancel()
+        visibleReportTask = nil
+        visibleMessageIds = []
+        store.resetVisibleMessageTracking(chatId: chat.id)
 
         didInitialScrollToBottom = false
 
@@ -387,8 +396,21 @@ struct MessagesPane: View {
             tracePagingSkip(skipReason: "inFlight", anchorMessageId: windowMessages.first?.id)
             return false
         }
+        let paginationState = store.historyPaginationState(chatId: chat.id)
+        guard paginationState.canLoadMore else {
+            tracePagingSkip(skipReason: "endReached", anchorMessageId: windowMessages.first?.id)
+            return false
+        }
+        guard !paginationState.isLoadingMore else {
+            tracePagingSkip(skipReason: "inFlight", anchorMessageId: windowMessages.first?.id)
+            return false
+        }
         guard let anchorMessageId = windowMessages.first?.id, anchorMessageId > 0 else {
             tracePagingSkip(skipReason: "noAnchor", anchorMessageId: windowMessages.first?.id)
+            return false
+        }
+        if lastRequestedTopAnchorMessageId == anchorMessageId {
+            tracePagingSkip(skipReason: "cooldown", anchorMessageId: anchorMessageId)
             return false
         }
 
@@ -408,8 +430,9 @@ struct MessagesPane: View {
 
         pendingRestoreAnchorMessageId = anchorMessageId
         paginationBaselineFirstMessageId = anchorMessageId
-        // Keep the viewport locked only when user is actually pinned at the top.
-        restoreAnchorAfterPaging = isTopSentinelVisible || lastTopSentinelMinY >= -8
+        lastRequestedTopAnchorMessageId = anchorMessageId
+        // Keep viewport stable while prepending older messages.
+        restoreAnchorAfterPaging = true
         pagingInFlight = true
         isPagingHistory = true
         return true
@@ -523,6 +546,75 @@ struct MessagesPane: View {
         paginationBaselineFirstMessageId = nil
     }
 
+    @MainActor
+    private func handleMessageVisibilityChange(messageId: Int64, isVisible: Bool) {
+        guard messageId > 0 else { return }
+        if isVisible {
+            let inserted = visibleMessageIds.insert(messageId).inserted
+            guard inserted else { return }
+        } else {
+            guard visibleMessageIds.remove(messageId) != nil else { return }
+        }
+        scheduleVisibleMessagesReport()
+    }
+
+    @MainActor
+    private func pruneVisibleMessageIdsToWindow() {
+        let validIds = Set(windowMessages.filter { $0.id > 0 }.map(\.id))
+        let pruned = visibleMessageIds.intersection(validIds)
+        guard pruned != visibleMessageIds else { return }
+        visibleMessageIds = pruned
+        scheduleVisibleMessagesReport()
+    }
+
+    @MainActor
+    private func scheduleVisibleMessagesReport() {
+        visibleReportTask?.cancel()
+
+        let chatId = chat.id
+        let ids = Array(visibleMessageIds).sorted()
+        guard !ids.isEmpty else {
+            store.resetVisibleMessageTracking(chatId: chatId)
+            return
+        }
+
+        visibleReportTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard !Task.isCancelled else { return }
+
+            let currentIds = Array(visibleMessageIds).sorted()
+            guard !currentIds.isEmpty else {
+                store.resetVisibleMessageTracking(chatId: chatId)
+                return
+            }
+
+            store.reportVisibleMessages(
+                chatId: chatId,
+                minMessageId: currentIds.first,
+                maxMessageId: currentIds.last,
+                messageIds: currentIds
+            )
+        }
+    }
+
+    @MainActor
+    private func handleTimeRevealDragChanged(_ value: DragGesture.Value) {
+        let horizontal = abs(value.translation.width) > abs(value.translation.height) * 1.15
+        guard horizontal else { return }
+        let reveal = min(revealTimeMaxX, max(0, -value.translation.width))
+        if abs(reveal - revealTimeX) > 0.5 {
+            revealTimeX = reveal
+        }
+    }
+
+    @MainActor
+    private func handleTimeRevealDragEnded() {
+        guard revealTimeX > 0 else { return }
+        withAnimation(.easeOut(duration: 0.16)) {
+            revealTimeX = 0
+        }
+    }
+
     private func scrollToBottomSentinel(_ proxy: ScrollViewProxy, animated: Bool) {
         if animated {
             withAnimation(.easeOut(duration: 0.18)) {
@@ -559,9 +651,9 @@ struct MessagesPane: View {
             if restoreAnchorAfterPaging, let anchorId = pendingRestoreAnchorMessageId {
                 scrollToMessageTop(proxy, messageId: anchorId)
             }
+            lastRequestedTopAnchorMessageId = nil
             clearPagingState()
             handleTopSentinelOffset(lastTopSentinelMinY)
-            maybeRequestOlderForUnderfilledViewport(source: "pagingCompleted")
         }
 
         if !didInitialScrollToBottom {
@@ -574,10 +666,7 @@ struct MessagesPane: View {
                 isAtBottom = true
                 newIncomingCount = 0
                 handleTopSentinelOffset(lastTopSentinelMinY)
-                if isTopSentinelVisible || newMessages.count <= 1 {
-                    requestOlderHistoryFromTopTrigger(source: "initialWindow")
-                }
-                maybeRequestOlderForUnderfilledViewport(source: "initialWindowUnderfilled")
+                maybeRequestOlderForUnderfilledViewport(source: "initialScrollToBottom")
             }
             return
         }
@@ -600,6 +689,7 @@ struct MessagesPane: View {
                 lastAutoScrollAnimatedAtNs = nowNs
             }
             newIncomingCount = 0
+            maybeRequestOlderForUnderfilledViewport(source: "atBottomMutation")
             return
         }
 
@@ -623,7 +713,13 @@ struct MessagesPane: View {
                 group: group,
                 optimizeForLargeTimeline: optimizeBubbleEffects,
                 revealTimeX: revealTimeX,
-                jellyScrollImpulse: 0
+                jellyScrollImpulse: 0,
+                onMessageAppear: { messageId in
+                    handleMessageVisibilityChange(messageId: messageId, isVisible: true)
+                },
+                onMessageDisappear: { messageId in
+                    handleMessageVisibilityChange(messageId: messageId, isVisible: false)
+                }
             )
             .id(group.id)
         }
@@ -638,10 +734,7 @@ struct MessagesPane: View {
                         .id(topSentinelId)
                         .onAppear {
                             isTopSentinelVisible = true
-                            Task { @MainActor in
-                                guard didInitialScrollToBottom else { return }
-                                requestOlderHistoryFromTopTrigger(source: "topSentinelAppear")
-                            }
+                            maybeRequestOlderForUnderfilledViewport(source: "topSentinelVisible")
                         }
                         .onDisappear {
                             isTopSentinelVisible = false
@@ -671,6 +764,7 @@ struct MessagesPane: View {
                             if newIncomingCount != 0 {
                                 newIncomingCount = 0
                             }
+                            maybeRequestOlderForUnderfilledViewport(source: "bottomSentinelVisible")
                         }
                         .onDisappear {
                             isAtBottom = false
@@ -715,22 +809,34 @@ struct MessagesPane: View {
                     .padding(.bottom, 84)
                 }
             }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 8)
+                    .onChanged { value in
+                        handleTimeRevealDragChanged(value)
+                    }
+                    .onEnded { _ in
+                        handleTimeRevealDragEnded()
+                    }
+            )
             .task(id: chat.id) {
                 resetStateForChat()
                 applyWindowMessages(viewModel.messages)
             }
             .onPreferenceChange(ContentMinYPreferenceKey.self) { minY in
                 handleTopSentinelOffset(minY)
+                maybeRequestOlderForUnderfilledViewport(source: "contentOffsetChanged")
             }
             .onChange(of: viewModel.messages) { _, newMessages in
                 applyWindowMessages(newMessages)
             }
             .onChange(of: windowMessages) { oldMessages, newMessages in
+                pruneVisibleMessageIdsToWindow()
                 handleWindowMessagesChange(
                     oldMessages: oldMessages,
                     newMessages: newMessages,
                     proxy: proxy
                 )
+                maybeRequestOlderForUnderfilledViewport(source: "windowMessagesChanged")
             }
             .onChange(of: store.isLoadingHistory) { _, isLoading in
                 guard !isLoading else { return }
@@ -746,12 +852,16 @@ struct MessagesPane: View {
                     pendingTopVisibleRetryAfterLoading = false
                     requestOlderHistoryFromTopTrigger(source: "historyLoadingCompletedRetry")
                 }
-                maybeRequestOlderForUnderfilledViewport(source: "historyLoadingCompletedUnderfilled")
+                maybeRequestOlderForUnderfilledViewport(source: "historyLoadingCompleted")
             }
             .onDisappear {
                 rowBuildTask?.cancel()
                 rowBuildTask = nil
                 isPagingHistory = false
+                visibleReportTask?.cancel()
+                visibleReportTask = nil
+                visibleMessageIds = []
+                store.resetVisibleMessageTracking(chatId: chat.id)
             }
         }
         .id(chat.id)

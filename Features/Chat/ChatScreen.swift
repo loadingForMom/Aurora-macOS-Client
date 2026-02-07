@@ -10,6 +10,7 @@ import AppKit
 
 struct ChatScreen: View {
     @ObservedObject var store: TelegramStore
+    @EnvironmentObject private var headerDebug: ChatHeaderDebugState
     let chat: TGChat
     let avatarPath: String?
     let onToggleInspector: () -> Void
@@ -83,26 +84,27 @@ struct ChatScreen: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
             }
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    HStack(spacing: 8) {
-                        ChatTitleButtonInline(
-                            title: chat.title,
-                            chatId: chat.id,
-                            avatarPath: avatarPath
-                        )
-                        .onTapGesture {
-                            onToggleInspector()
-                        }
-
-                        ZStack {
-                            MacSpinningIndicator()
-                                .frame(width: 14, height: 14)
-                                .opacity(loadingIndicatorVisible ? 1 : 0)
-                        }
-                        .frame(width: 14, height: 14)
+            .overlay(alignment: .top) {
+                HStack(spacing: 8) {
+                    ChatTitleButtonInline(
+                        title: chat.title,
+                        chatId: chat.id,
+                        avatarPath: avatarPath
+                    )
+                    .onTapGesture {
+                        onToggleInspector()
                     }
+
+                    ZStack {
+                        MacSpinningIndicator()
+                            .frame(width: 14, height: 14)
+                            .opacity(loadingIndicatorVisible ? 1 : 0)
+                    }
+                    .frame(width: 14, height: 14)
                 }
+                .padding(.top, headerDebug.resolvedToolbarOffsetY)
+                .padding(.horizontal, 16)
+                .frame(maxWidth: .infinity)
             }
             .task(id: chat.id) {
                 draft = ""

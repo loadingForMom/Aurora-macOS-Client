@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import AppKit
 
 struct MessageBubble: View {
     let msg: TGMessage
@@ -81,12 +82,12 @@ struct MessageBubble: View {
                 }
                 .frame(maxWidth: .infinity, alignment: msg.isOutgoing ? .trailing : .leading)
                 .offset(y: jellyOffsetY)
-                .modifier(OutgoingContextMenuModifier(enabled: !optimizeForPerformance, msg: msg, onRetry: onRetry, onDelete: onDelete))
+                .modifier(MessageContextMenuModifier(enabled: !optimizeForPerformance, msg: msg, onRetry: onRetry, onDelete: onDelete))
             }
         }
     }
 
-    private struct OutgoingContextMenuModifier: ViewModifier {
+    private struct MessageContextMenuModifier: ViewModifier {
         let enabled: Bool
         let msg: TGMessage
         let onRetry: () -> Void
@@ -96,6 +97,13 @@ struct MessageBubble: View {
         func body(content: Content) -> some View {
             if enabled {
                 content.contextMenu {
+                    if let copyText = msg.textForRendering?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !copyText.isEmpty {
+                        Button("Copy") {
+                            copyToPasteboard(copyText)
+                        }
+                    }
+
                     if msg.isOutgoing {
                         if case .failed = msg.sendState, msg.canRetry {
                             Button("Retry") { onRetry() }
@@ -106,6 +114,12 @@ struct MessageBubble: View {
             } else {
                 content
             }
+        }
+
+        private func copyToPasteboard(_ value: String) {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(value, forType: .string)
         }
     }
 

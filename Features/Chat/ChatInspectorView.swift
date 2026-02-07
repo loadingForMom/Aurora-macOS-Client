@@ -15,6 +15,22 @@ private enum _InspectorCS {
     static let scroll = "InspectorScroll"
 }
 
+private enum _InspectorLiquidGlass {
+    static let enabledKey = "inspector_liquid_enabled"
+    static let glassStrengthKey = "inspector_liquid_glass_strength"
+    static let tintStrengthKey = "inspector_liquid_tint_strength"
+    static let posterBlurKey = "inspector_liquid_poster_blur"
+    static let actionsBlurKey = "inspector_liquid_actions_blur"
+    static let chromeOpacityKey = "inspector_liquid_chrome_opacity"
+
+    static let enabledDefault = true
+    static let glassStrengthDefault = 0.82
+    static let tintStrengthDefault = 0.18
+    static let posterBlurDefault = 4.0
+    static let actionsBlurDefault = 1.2
+    static let chromeOpacityDefault = 0.92
+}
+
 private struct _PinnedTitleSlotProbe: View {
     let title: String
     let topPadding: CGFloat
@@ -50,6 +66,13 @@ struct ChatInspectorView: View {
     @EnvironmentObject private var store: TelegramStore
     let chat: TGChat
 
+    @AppStorage(_InspectorLiquidGlass.enabledKey) private var liquidGlassEnabled = _InspectorLiquidGlass.enabledDefault
+    @AppStorage(_InspectorLiquidGlass.glassStrengthKey) private var liquidGlassStrength = _InspectorLiquidGlass.glassStrengthDefault
+    @AppStorage(_InspectorLiquidGlass.tintStrengthKey) private var liquidGlassTint = _InspectorLiquidGlass.tintStrengthDefault
+    @AppStorage(_InspectorLiquidGlass.posterBlurKey) private var liquidPosterBlur = _InspectorLiquidGlass.posterBlurDefault
+    @AppStorage(_InspectorLiquidGlass.actionsBlurKey) private var liquidActionsBlur = _InspectorLiquidGlass.actionsBlurDefault
+    @AppStorage(_InspectorLiquidGlass.chromeOpacityKey) private var liquidChromeOpacity = _InspectorLiquidGlass.chromeOpacityDefault
+
     private let heroHeight: CGFloat = 340
     private let overlapFraction: CGFloat = 0.58
     private let pinnedChromeHeight: CGFloat = 280
@@ -63,7 +86,9 @@ struct ChatInspectorView: View {
     private var blurRange: CGFloat { appearThreshold + appearRange }
     private var actionsFadeStart: CGFloat { appearThreshold + appearRange }
     private let actionsFadeRange: CGFloat = 50
-    private let maxPosterBlur: CGFloat = 18
+    private var maxPosterBlur: CGFloat {
+        CGFloat(liquidGlassEnabled ? liquidPosterBlur : 18)
+    }
 
     @State private var heroTitleScrollMinY: CGFloat = .nan
     @State private var pinnedTitleScrollMinY: CGFloat = .nan
@@ -113,7 +138,11 @@ struct ChatInspectorView: View {
     }
 
     private var chromeAlpha: Double {
-        pow(Double(handoffProgress), 1.6)
+        let base = pow(Double(handoffProgress), 1.6)
+        if liquidGlassEnabled {
+            return (base * liquidChromeOpacity).clamped(0, 1)
+        }
+        return base
     }
 
     private var posterBlurRadius: CGFloat {
@@ -133,7 +162,8 @@ struct ChatInspectorView: View {
     private var actionsBlur: CGFloat {
         let p = actionsFadeProgress
         if p <= 0.02 { return 0 }
-        return 2.2 * p
+        let maxBlur = liquidGlassEnabled ? CGFloat(liquidActionsBlur) : 2.2
+        return maxBlur * p
     }
 
     private var heroTitleOpacity: Double {
@@ -234,7 +264,10 @@ struct ChatInspectorView: View {
                     headerHeight: heroHeight,
                     overlapFraction: overlapFraction,
                     posterBlurRadius: posterBlurRadius,
-                    frostAmount: blurProgress
+                    frostAmount: blurProgress,
+                    liquidGlassEnabled: liquidGlassEnabled,
+                    liquidGlassStrength: CGFloat(liquidGlassStrength),
+                    liquidGlassTint: CGFloat(liquidGlassTint)
                 )
                 .ignoresSafeArea()
 
@@ -330,7 +363,10 @@ struct ChatInspectorView: View {
                     topPadding: pinnedTopPadding,
                     avatarSize: pinnedAvatarSize,
                     titleSpacing: pinnedTitleSpacing,
-                    chromeAlpha: chromeAlpha
+                    chromeAlpha: chromeAlpha,
+                    liquidGlassEnabled: liquidGlassEnabled,
+                    liquidGlassStrength: CGFloat(liquidGlassStrength),
+                    liquidGlassTint: CGFloat(liquidGlassTint)
                 )
                 .ignoresSafeArea(.container, edges: .top)
                 .allowsHitTesting(false)
@@ -352,11 +388,17 @@ private struct PosterBackground: View {
 
     let posterBlurRadius: CGFloat
     let frostAmount: CGFloat // 0..1
+    let liquidGlassEnabled: Bool
+    let liquidGlassStrength: CGFloat
+    let liquidGlassTint: CGFloat
 
     var body: some View {
         GeometryReader { geo in
             let totalHeight = geo.size.height
             let width = geo.size.width
+            let stripBlurRadius = liquidGlassEnabled
+                ? (10 + (posterBlurRadius * 0.35))
+                : (24 + (posterBlurRadius * 0.80))
 
             ZStack(alignment: .top) {
                 VStack(spacing: 0) {
@@ -375,7 +417,7 @@ private struct PosterBackground: View {
                             Image(nsImage: strip)
                                 .resizable(resizingMode: .stretch)
                                 .frame(width: width, height: max(0, totalHeight - headerHeight))
-                                .blur(radius: 24 + (posterBlurRadius * 0.80), opaque: true)
+                                .blur(radius: stripBlurRadius, opaque: true)
                                 .overlay(Color.black.opacity(0.03))
                                 .overlay(
                                     LinearGradient(
@@ -419,9 +461,22 @@ private struct PosterBackground: View {
     }
 
     private var photoMaterialBlend: some View {
+        let strength = liquidGlassStrength.clamped(0, 1.5)
+        let tint = liquidGlassTint.clamped(0, 1)
+
         let base: AnyView = {
             if reduceTransparency {
                 return AnyView(Rectangle().fill(Color(nsColor: .windowBackgroundColor).opacity(0.22)))
+            } else if liquidGlassEnabled {
+                return AnyView(
+                    Color.clear
+                        .glassEffect(in: Rectangle())
+                        .overlay(
+                            Rectangle()
+                                .fill(.ultraThinMaterial)
+                                .opacity(0.14 + (0.30 * strength))
+                        )
+                )
             } else {
                 return AnyView(Rectangle().fill(.ultraThinMaterial))
             }
@@ -429,8 +484,8 @@ private struct PosterBackground: View {
 
         return base
             .overlay(colorScheme == .dark
-                     ? Color.black.opacity(0.08)
-                     : Color(nsColor: .windowBackgroundColor).opacity(0.04))
+                     ? Color.black.opacity(0.04 + (0.18 * tint))
+                     : Color(nsColor: .windowBackgroundColor).opacity(0.02 + (0.11 * tint)))
             .mask(
                 LinearGradient(
                     stops: [
@@ -450,6 +505,8 @@ private struct PosterBackground: View {
     }
 
     private func overlapBlurOverlay(totalHeight: CGFloat, width: CGFloat) -> some View {
+        let strength = liquidGlassStrength.clamped(0, 1.5)
+        let tint = liquidGlassTint.clamped(0, 1)
         let overlapHeight = headerHeight * overlapFraction
         let overlayTop = headerHeight - overlapHeight
         let overlayHeight = max(0, totalHeight - overlayTop)
@@ -476,6 +533,16 @@ private struct PosterBackground: View {
         let base: AnyView = {
             if reduceTransparency {
                 return AnyView(Rectangle().fill(Color(nsColor: .windowBackgroundColor).opacity(0.92)))
+            } else if liquidGlassEnabled {
+                return AnyView(
+                    Color.clear
+                        .glassEffect(in: Rectangle())
+                        .overlay(
+                            Rectangle()
+                                .fill(.thinMaterial)
+                                .opacity(0.14 + (0.34 * strength))
+                        )
+                )
             } else {
                 return AnyView(Rectangle().fill(.ultraThinMaterial))
             }
@@ -485,8 +552,8 @@ private struct PosterBackground: View {
             base
                 .frame(width: width, height: overlayHeight)
                 .overlay(colorScheme == .dark
-                         ? Color.black.opacity(0.03)
-                         : Color(nsColor: .windowBackgroundColor).opacity(0.06))
+                         ? Color.black.opacity(0.02 + (0.10 * tint))
+                         : Color(nsColor: .windowBackgroundColor).opacity(0.03 + (0.14 * tint)))
                 .mask(
                     LinearGradient(
                         stops: [
@@ -642,6 +709,7 @@ private struct HeroActionButton: View {
 private struct PinnedHeaderChrome: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
+    @EnvironmentObject private var headerDebug: ChatHeaderDebugState
 
     let title: String
     let avatar: NSImage?
@@ -652,10 +720,14 @@ private struct PinnedHeaderChrome: View {
     let titleSpacing: CGFloat
 
     let chromeAlpha: Double
+    let liquidGlassEnabled: Bool
+    let liquidGlassStrength: CGFloat
+    let liquidGlassTint: CGFloat
 
     var body: some View {
         ZStack(alignment: .top) {
             chromeBackground
+                .offset(y: headerDebug.resolvedInspectorGlassOffsetY)
                 .opacity(chromeAlpha)
 
             VStack(spacing: titleSpacing) {
@@ -675,9 +747,22 @@ private struct PinnedHeaderChrome: View {
     }
 
     private var chromeBackground: some View {
+        let strength = liquidGlassStrength.clamped(0, 1.5)
+        let tint = liquidGlassTint.clamped(0, 1)
+
         let base: AnyView = {
             if reduceTransparency {
                 return AnyView(Rectangle().fill(Color(nsColor: .windowBackgroundColor).opacity(0.95)))
+            } else if liquidGlassEnabled {
+                return AnyView(
+                    Color.clear
+                        .glassEffect(in: Rectangle())
+                        .overlay(
+                            Rectangle()
+                                .fill(.regularMaterial)
+                                .opacity(0.10 + (0.28 * strength))
+                        )
+                )
             } else {
                 return AnyView(Color.clear.glassEffect(in: Rectangle()))
             }
@@ -693,7 +778,7 @@ private struct PinnedHeaderChrome: View {
                     startPoint: .top,
                     endPoint: .bottom
                 )
-                .opacity(0.70)
+                .opacity(0.52 + (0.24 * tint))
             )
             .overlay(
                 Group {
@@ -701,8 +786,12 @@ private struct PinnedHeaderChrome: View {
                         EmptyView()
                     } else {
                         Rectangle()
-                            .fill(.ultraThinMaterial)
-                            .overlay(colorScheme == .dark ? Color.black.opacity(0.06) : Color.clear)
+                            .fill(liquidGlassEnabled ? .thinMaterial : .ultraThinMaterial)
+                            .overlay(
+                                colorScheme == .dark
+                                    ? Color.black.opacity(liquidGlassEnabled ? (0.03 + (0.08 * tint)) : 0.06)
+                                    : Color.clear
+                            )
                             .mask(
                                 LinearGradient(
                                     stops: [

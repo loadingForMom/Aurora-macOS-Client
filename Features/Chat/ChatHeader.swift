@@ -45,37 +45,42 @@ struct ChatHeader: View {
             Spacer(minLength: 0)
 
             Button(action: onToggleInspector) {
-                HStack(spacing: 10) {
+                let avatarSize: CGFloat = 28
+                let avatarOverlap: CGFloat = 3
+                let avatarLowering: CGFloat = 8
+                let avatarLift = max(0, avatarSize - avatarOverlap - avatarLowering)
+
+                VStack(spacing: 2) {
+                    Text(title)
+                        .font(.headline)
+                        .lineLimit(1)
+
+                    if isGroup {
+                        Text("Group")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .overlay(alignment: .top) {
                     AvatarCircle(
                         title: title,
                         identityKey: AvatarCacheKey(
                             kind: .chat,
                             id: chatId,
-                            size: 28,
+                            size: avatarSize,
                             scale: NSScreen.main?.backingScaleFactor ?? 2.0,
                             revision: avatarRevision
                         ),
                         reloadToken: avatarRevision,
-                        size: 28,
+                        size: avatarSize,
                         font: .system(size: 11, weight: .semibold, design: .rounded),
                         imageProvider: {
-                            store.chatAvatarNSImage(chatId: chatId, pointSize: 28, preferHiRes: false)
+                            store.chatAvatarNSImage(chatId: chatId, pointSize: avatarSize, preferHiRes: false)
                             ?? avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
                         }
                     )
                     .overlay(Circle().strokeBorder(.white.opacity(0.14), lineWidth: 1))
-
-                    VStack(spacing: 2) {
-                        Text(title)
-                            .font(.headline)
-                            .lineLimit(1)
-
-                        if isGroup {
-                            Text("Group")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
+                    .offset(y: -avatarLift)
                 }
                 .padding(.vertical, 4)
                 .padding(.horizontal, 8)

@@ -587,8 +587,23 @@ private struct DataAndStorageSettingsView: View {
 }
 
 private struct AppearanceSettingsView: View {
+    private enum InspectorLiquidDefaults {
+        static let enabled = true
+        static let glassStrength = 0.82
+        static let tintStrength = 0.18
+        static let posterBlur = 4.0
+        static let actionsBlur = 1.2
+        static let chromeOpacity = 0.92
+    }
+
     @AppStorage("appearance_text_size") private var textSize: Double = 14
     @AppStorage("appearance_night_theme") private var nightTheme = false
+    @AppStorage("inspector_liquid_enabled") private var inspectorLiquidEnabled = InspectorLiquidDefaults.enabled
+    @AppStorage("inspector_liquid_glass_strength") private var inspectorLiquidGlassStrength = InspectorLiquidDefaults.glassStrength
+    @AppStorage("inspector_liquid_tint_strength") private var inspectorLiquidTintStrength = InspectorLiquidDefaults.tintStrength
+    @AppStorage("inspector_liquid_poster_blur") private var inspectorLiquidPosterBlur = InspectorLiquidDefaults.posterBlur
+    @AppStorage("inspector_liquid_actions_blur") private var inspectorLiquidActionsBlur = InspectorLiquidDefaults.actionsBlur
+    @AppStorage("inspector_liquid_chrome_opacity") private var inspectorLiquidChromeOpacity = InspectorLiquidDefaults.chromeOpacity
 
     var body: some View {
         Form {
@@ -602,6 +617,90 @@ private struct AppearanceSettingsView: View {
                 Slider(value: $textSize, in: 11...22, step: 1)
                 Toggle("Смена темы ночью", isOn: $nightTheme)
             }
+
+            Section("Liquid Glass (инспектор)") {
+                Toggle("Нативное стекло в правом инспекторе", isOn: $inspectorLiquidEnabled)
+
+                LiquidSettingSliderRow(
+                    title: "Интенсивность стекла",
+                    value: $inspectorLiquidGlassStrength,
+                    range: 0...1.5,
+                    step: 0.01,
+                    fractionDigits: 2
+                )
+                .disabled(!inspectorLiquidEnabled)
+
+                LiquidSettingSliderRow(
+                    title: "Тонировка стекла",
+                    value: $inspectorLiquidTintStrength,
+                    range: 0...0.65,
+                    step: 0.01,
+                    fractionDigits: 2
+                )
+                .disabled(!inspectorLiquidEnabled)
+
+                LiquidSettingSliderRow(
+                    title: "Мягкость постера",
+                    value: $inspectorLiquidPosterBlur,
+                    range: 0...10,
+                    step: 0.1,
+                    fractionDigits: 1
+                )
+                .disabled(!inspectorLiquidEnabled)
+
+                LiquidSettingSliderRow(
+                    title: "Размытие действий",
+                    value: $inspectorLiquidActionsBlur,
+                    range: 0...3.5,
+                    step: 0.05,
+                    fractionDigits: 2
+                )
+                .disabled(!inspectorLiquidEnabled)
+
+                LiquidSettingSliderRow(
+                    title: "Прозрачность pinned chrome",
+                    value: $inspectorLiquidChromeOpacity,
+                    range: 0.25...1,
+                    step: 0.01,
+                    fractionDigits: 2
+                )
+                .disabled(!inspectorLiquidEnabled)
+
+                Button("Сбросить параметры Liquid Glass") {
+                    resetInspectorLiquidDefaults()
+                }
+            }
+        }
+    }
+
+    private func resetInspectorLiquidDefaults() {
+        inspectorLiquidEnabled = InspectorLiquidDefaults.enabled
+        inspectorLiquidGlassStrength = InspectorLiquidDefaults.glassStrength
+        inspectorLiquidTintStrength = InspectorLiquidDefaults.tintStrength
+        inspectorLiquidPosterBlur = InspectorLiquidDefaults.posterBlur
+        inspectorLiquidActionsBlur = InspectorLiquidDefaults.actionsBlur
+        inspectorLiquidChromeOpacity = InspectorLiquidDefaults.chromeOpacity
+    }
+}
+
+private struct LiquidSettingSliderRow: View {
+    let title: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let fractionDigits: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(value, format: .number.precision(.fractionLength(fractionDigits)))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            Slider(value: $value, in: range, step: step)
         }
     }
 }
