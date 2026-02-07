@@ -104,7 +104,7 @@ nonisolated struct TGMessage: Identifiable, Hashable, Sendable {
     
 
     /// Preview / fallback text (what you already used everywhere).
-    let text: String
+    var text: String
 
     /// correctness-first rendering payload
     let contentType: String

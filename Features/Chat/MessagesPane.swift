@@ -23,7 +23,6 @@ struct MessagesPane: View {
     @State private var pagingInFlight: Bool = false
     @State private var pendingRestoreAnchorMessageId: Int64? = nil
     @State private var paginationBaselineFirstMessageId: Int64? = nil
-    @State private var lastPaginationAnchorMessageId: Int64? = nil
 
     @State private var isAtBottom: Bool = true
     @State private var newIncomingCount: Int = 0
@@ -311,7 +310,6 @@ struct MessagesPane: View {
         isPagingHistory = false
         pendingRestoreAnchorMessageId = nil
         paginationBaselineFirstMessageId = nil
-        lastPaginationAnchorMessageId = nil
 
         isAtBottom = true
         newIncomingCount = 0
@@ -357,21 +355,83 @@ struct MessagesPane: View {
 
     @MainActor
     private func requestOlderHistoryIfNeeded() -> Bool {
-        guard didInitialScrollToBottom else { return false }
-        guard pagingEnabled else { return false }
-        guard !pagingInFlight else { return false }
-        guard !store.isLoadingHistory else { return false }
-        guard let anchorMessageId = windowMessages.first?.id, anchorMessageId > 0 else { return false }
-        guard lastPaginationAnchorMessageId != anchorMessageId else { return false }
+        guard didInitialScrollToBottom else {
+            tracePagingSkip(skipReason: "cooldown", anchorMessageId: windowMessages.first?.id)
+            return false
+        }
+        guard pagingEnabled else {
+            tracePagingSkip(skipReason: "cooldown", anchorMessageId: windowMessages.first?.id)
+            return false
+        }
+        guard !pagingInFlight else {
+            tracePagingSkip(skipReason: "inFlight", anchorMessageId: windowMessages.first?.id)
+            return false
+        }
+        guard !store.isLoadingHistory else {
+            tracePagingSkip(skipReason: "inFlight", anchorMessageId: windowMessages.first?.id)
+            return false
+        }
+        guard let anchorMessageId = windowMessages.first?.id, anchorMessageId > 0 else {
+            tracePagingSkip(skipReason: "noAnchor", anchorMessageId: windowMessages.first?.id)
+            return false
+        }
 
-        lastPaginationAnchorMessageId = anchorMessageId
+        let uiTopMessageId = windowMessages.first?.id
+        let started = store.loadMoreHistory(
+            chatId: chat.id,
+            anchorMessageId: anchorMessageId,
+            uiTopMessageId: uiTopMessageId,
+            uiTopKind: topElementKindForHistoryTrace(),
+            storeMinIdVisible: uiTopMessageId,
+            anchorSource: .uiTop
+        )
+        guard started else {
+            tracePagingSkip(skipReason: "storeRejected", anchorMessageId: anchorMessageId)
+            return false
+        }
+
         pendingRestoreAnchorMessageId = anchorMessageId
         paginationBaselineFirstMessageId = anchorMessageId
         pagingInFlight = true
         isPagingHistory = true
-
-        store.loadMoreHistory(chatId: chat.id, anchorMessageId: anchorMessageId)
         return true
+    }
+
+    private func topElementKindForHistoryTrace() -> String? {
+        guard let first = rows.first else { return nil }
+        switch first {
+        case .group:
+            if let topMessageId = windowMessages.first?.id, topMessageId <= 0 {
+                return "placeholder"
+            }
+            return "message"
+        case .dayHeader, .timeSeparator:
+            return "separator"
+        }
+    }
+
+    @MainActor
+    private func tracePagingSkip(skipReason: String, anchorMessageId: Int64?) {
+        guard HistoryTrace.isEnabled(for: chat.id) else { return }
+        HistoryTrace.emit(
+            tag: "HIST_SKIP",
+            chatId: chat.id,
+            fields: [
+                ("reason", "older"),
+                ("skipReason", skipReason),
+                ("anchorMessageId", HistoryTrace.optionalInt64(anchorMessageId)),
+                ("didInitialScrollToBottom", HistoryTrace.boolValue(didInitialScrollToBottom)),
+                ("pagingEnabled", HistoryTrace.boolValue(pagingEnabled)),
+                ("pagingInFlight", HistoryTrace.boolValue(pagingInFlight)),
+                ("storeLoadingHistory", HistoryTrace.boolValue(store.isLoadingHistory)),
+                ("paginationBaselineFirstMessageId", HistoryTrace.optionalInt64(paginationBaselineFirstMessageId)),
+                ("uiTopMessageId", HistoryTrace.optionalInt64(windowMessages.first?.id)),
+                ("uiTopKind", topElementKindForHistoryTrace() ?? "null"),
+                ("isAtBottom", HistoryTrace.boolValue(isAtBottom))
+            ],
+            rateKey: "ui:\(chat.id):\(skipReason)",
+            rateLimitMs: 500
+        )
     }
 
     @MainActor

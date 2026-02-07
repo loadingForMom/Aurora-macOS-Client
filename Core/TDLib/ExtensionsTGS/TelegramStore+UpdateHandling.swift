@@ -240,6 +240,37 @@ extension TelegramStore {
 
     func handleResponse(_ resp: String) async {
         if let err = parseTdError(resp) {
+            if let extra = err.extra,
+               extra.hasPrefix("history:") {
+                let context = parseHistoryExtraContext(extra)
+                let isFloodWaitCandidate =
+                    err.code == 420 ||
+                    err.message.uppercased().contains("FLOOD_WAIT") ||
+                    extra.uppercased().contains("FLOOD_WAIT")
+                if isFloodWaitCandidate {
+                    let seconds = max(1, parseFloodWaitSeconds(message: err.message, extra: err.extra) ?? 1)
+                    let pausedUntilNs = applyHistoryFloodWaitCooldown(chatId: context?.chatId, seconds: seconds)
+                    discardHistoryJob(extra: extra)
+                    syncHistoryLoadingFlagForSelectedChat()
+
+                    HistoryTrace.emit(
+                        tag: "HIST_ERR",
+                        chatId: context?.chatId,
+                        fields: [
+                            ("type", "FLOOD_WAIT"),
+                            ("seconds", String(seconds)),
+                            ("code", String(err.code)),
+                            ("chatId", HistoryTrace.optionalInt64(context?.chatId)),
+                            ("requestId", context?.requestId ?? "null"),
+                            ("reason", context?.reason ?? "other"),
+                            ("extra", extra),
+                            ("pausedUntil", historyPausedUntilString(untilNs: pausedUntilNs))
+                        ]
+                    )
+                    return
+                }
+            }
+
             if let extra = err.extra, extra.hasPrefix("storage:") {
                 _ = await MainActor.run {
                     storageExtrasInFlight.remove(extra)
@@ -386,10 +417,13 @@ extension TelegramStore {
                 historyMetrics.maxLatencyMs = max(historyMetrics.maxLatencyMs, latencyMs)
             }
 
+            let storeBefore = await messageStore.historyTraceSnapshot(chatId: job.chatId)
+            let returnedCount = res.messages.count
+            let returnedMinId = res.messages.min(by: { $0.id < $1.id })?.id
+            let returnedMaxId = res.messages.max(by: { $0.id < $1.id })?.id
+
 #if DEBUG
-            let minId = res.messages.min(by: { $0.id < $1.id })?.id
-            let maxId = res.messages.max(by: { $0.id < $1.id })?.id
-            log.debug("getChatHistory chatId=\(job.chatId, privacy: .public) anchorMessageId=\(job.anchorMessageId, privacy: .public) limit=\(job.requestedLimit, privacy: .public) returned=\(res.messages.count, privacy: .public) minId=\(minId ?? 0, privacy: .public) maxId=\(maxId ?? 0, privacy: .public) latencyMs=\(latencyMs ?? -1, privacy: .public)")
+            log.debug("getChatHistory chatId=\(job.chatId, privacy: .public) anchorMessageId=\(job.anchorMessageId, privacy: .public) limit=\(job.requestedLimit, privacy: .public) returned=\(returnedCount, privacy: .public) minId=\(returnedMinId ?? 0, privacy: .public) maxId=\(returnedMaxId ?? 0, privacy: .public) latencyMs=\(latencyMs ?? -1, privacy: .public)")
 #endif
 #if DEBUG
             if let mismatch = res.messages.first(where: { $0.chatId != job.chatId }) {
@@ -403,14 +437,126 @@ extension TelegramStore {
             } else {
                 messagesToMerge = res.messages
             }
+            let hasOlderInResponse = job.kind == .older && res.messages.contains(where: { $0.id < job.anchorMessageId })
 
+            let changedCount: Int
             if !messagesToMerge.isEmpty {
-                _ = await messageStore.mergeMessages(
+                changedCount = await messageStore.mergeMessages(
                     chatId: job.chatId,
                     messages: messagesToMerge,
                     windowLimit: job.windowLimit
                 )
                 await databaseBatchWriter.enqueue(.upsertMessages(messagesToMerge))
+            } else {
+                changedCount = 0
+            }
+
+            let storeAfter = await messageStore.historyTraceSnapshot(chatId: job.chatId)
+            let mergedNewCount = max(0, storeAfter.rawCount - storeBefore.rawCount)
+            let dedupDroppedCount = max(0, messagesToMerge.count - mergedNewCount)
+
+            if HistoryTrace.isEnabled(for: job.chatId) {
+                let reason = historyReason(for: job.kind)
+                HistoryTrace.emit(
+                    tag: "HIST_RSP",
+                    chatId: job.chatId,
+                    fields: [
+                        ("reason", reason),
+                        ("requestId", historyRequestId(from: res.extra)),
+                        ("extra", res.extra),
+                        ("anchorMessageId", String(job.anchorMessageId)),
+                        ("requestedLimit", String(job.requestedLimit)),
+                        ("returnedCount", String(returnedCount)),
+                        ("returnedMinId", HistoryTrace.optionalInt64(returnedMinId)),
+                        ("returnedMaxId", HistoryTrace.optionalInt64(returnedMaxId)),
+                        ("latencyMs", HistoryTrace.optionalDouble(latencyMs, decimals: 2)),
+                        ("storeMinIdBefore", String(storeBefore.rawMinId)),
+                        ("storeMaxIdBefore", String(storeBefore.rawMaxId)),
+                        ("storeCountBefore", String(storeBefore.rawCount)),
+                        ("storeMinIdAfter", String(storeAfter.rawMinId)),
+                        ("storeMaxIdAfter", String(storeAfter.rawMaxId)),
+                        ("storeCountAfter", String(storeAfter.rawCount)),
+                        ("mergedNewCount", String(mergedNewCount)),
+                        ("dedupDroppedCount", String(dedupDroppedCount)),
+                        ("changedCount", String(changedCount)),
+                        ("storeVisibleMinIdBefore", String(storeBefore.visibleMinId)),
+                        ("storeVisibleMinIdAfter", String(storeAfter.visibleMinId))
+                    ]
+                )
+
+                if let returnedMinId, let returnedMaxId, storeBefore.rawMinId != 0 {
+                    if returnedMaxId < storeBefore.rawMinId || returnedMinId > storeBefore.rawMinId {
+                        HistoryTrace.emit(
+                            tag: "HIST_WARN",
+                            chatId: job.chatId,
+                            fields: [
+                                ("type", "RANGE_DISJOINT"),
+                                ("reason", reason),
+                                ("requestId", historyRequestId(from: res.extra)),
+                                ("storeMinIdBefore", String(storeBefore.rawMinId)),
+                                ("returnedMinId", String(returnedMinId)),
+                                ("returnedMaxId", String(returnedMaxId))
+                            ],
+                            rateKey: "warn:range:\(job.chatId)",
+                            rateLimitMs: 250
+                        )
+                    }
+
+                    if reason == "older", returnedMaxId < storeBefore.rawMinId {
+                        let gap = storeBefore.rawMinId - returnedMaxId
+                        if gap > 1_000_000_000 {
+                            HistoryTrace.emit(
+                                tag: "HIST_WARN",
+                                chatId: job.chatId,
+                                fields: [
+                                    ("type", "POTENTIAL_GAP"),
+                                    ("reason", reason),
+                                    ("requestId", historyRequestId(from: res.extra)),
+                                    ("storeMinIdBefore", String(storeBefore.rawMinId)),
+                                    ("returnedMaxId", String(returnedMaxId)),
+                                    ("gap", String(gap))
+                                ]
+                            )
+                        }
+                    }
+                }
+
+                if reason == "older", returnedCount == 0 {
+                    HistoryTrace.emit(
+                        tag: "HIST_WARN",
+                        chatId: job.chatId,
+                        fields: [
+                            ("type", "END_REACHED_CANDIDATE"),
+                            ("reason", reason),
+                            ("requestId", historyRequestId(from: res.extra)),
+                            ("endReachedCandidate", "true"),
+                            ("cause", "returnedCountZero"),
+                            ("requestedLimit", String(job.requestedLimit)),
+                            ("returnedCount", String(returnedCount))
+                        ],
+                        rateKey: "warn:end:\(job.chatId):empty",
+                        rateLimitMs: 1_000
+                    )
+                }
+
+                if returnedCount < job.requestedLimit, !job.onlyLocal {
+                    HistoryTrace.emit(
+                        tag: "HIST_WARN",
+                        chatId: job.chatId,
+                        fields: [
+                            ("type", "END_REACHED_CANDIDATE"),
+                            ("reason", reason),
+                            ("requestId", historyRequestId(from: res.extra)),
+                            ("endReachedCandidate", "true"),
+                            ("cause", "returnedLessThanRequestedLimit"),
+                            ("requestedLimit", String(job.requestedLimit)),
+                            ("returnedCount", String(returnedCount)),
+                            ("only_local", HistoryTrace.boolValue(job.onlyLocal))
+                        ],
+                        rateKey: "warn:end:\(job.chatId):short",
+                        rateLimitMs: 1_000
+                    )
+                }
             }
 
             let senderIds = Set(messagesToMerge.compactMap(\.senderUserId))
@@ -420,8 +566,26 @@ extension TelegramStore {
 
             if job.kind == .older {
                 if messagesToMerge.isEmpty {
-                    reachedHistoryStart.insert(job.chatId)
                     historyMetrics.olderResponsesWithoutOlder += 1
+                    let noProgressAttempts = registerHistoryNoProgress(
+                        chatId: job.chatId,
+                        anchorMessageId: job.anchorMessageId
+                    )
+                    let shouldMarkEnd =
+                        returnedCount == 0 ||
+                        (returnedCount < job.requestedLimit && noProgressAttempts >= 2)
+                    if shouldMarkEnd {
+                        reachedHistoryStart.insert(job.chatId)
+                        resetHistoryNoProgress(chatId: job.chatId)
+                    }
+                } else {
+                    let visibleMinAdvanced =
+                        storeBefore.visibleMinId > 0 &&
+                        storeAfter.visibleMinId > 0 &&
+                        storeAfter.visibleMinId < storeBefore.visibleMinId
+                    if changedCount > 0 || visibleMinAdvanced || hasOlderInResponse {
+                        resetHistoryNoProgress(chatId: job.chatId)
+                    }
                 }
             }
 

@@ -149,6 +149,7 @@ final class TelegramStore: ObservableObject {
     // MARK: - History jobs
 
     enum HistoryJobKind { case initialLocal, initialRemote, older }
+    enum PaginationAnchorSource: String { case storeMin, uiTop, other }
 
     struct HistoryJob {
         let chatId: Int64
@@ -158,6 +159,10 @@ final class TelegramStore: ObservableObject {
         let windowLimit: Int
         let onlyLocal: Bool
         let generation: Int
+        let anchorSource: PaginationAnchorSource
+        let uiTopMessageId: Int64?
+        let uiTopKind: String?
+        let storeMinIdVisible: Int64?
     }
 
     struct HistoryMetrics {
@@ -178,7 +183,10 @@ final class TelegramStore: ObservableObject {
     var historyGenerationByChatId: [Int64: Int] = [:]
     var initialRemoteRequestedGenerationByChatId: [Int64: Int] = [:]
     var historyRequestStartedAtNs: [String: UInt64] = [:]
+    var historyNoProgressByChatId: [Int64: (anchorMessageId: Int64, attempts: Int)] = [:]
     var historyMetrics = HistoryMetrics()
+    var historyGlobalPausedUntilNs: UInt64 = 0
+    var historyPausedUntilNsByChatId: [Int64: UInt64] = [:]
 
     // MARK: - Init
 
@@ -489,8 +497,25 @@ final class TelegramStore: ObservableObject {
     func editMessageText(chatId: Int64, messageId: Int64, newText: String) { _editMessageText_impl(chatId: chatId, messageId: messageId, newText: newText) }
 
     // History paging (implemented in +History)
-    func loadMoreHistory(chatId: Int64, anchorMessageId: Int64, pageSize: Int = 80) {
-        _loadMoreHistory_impl(chatId: chatId, anchorMessageId: anchorMessageId, pageSize: pageSize)
+    @discardableResult
+    func loadMoreHistory(
+        chatId: Int64,
+        anchorMessageId: Int64,
+        pageSize: Int = 50,
+        uiTopMessageId: Int64? = nil,
+        uiTopKind: String? = nil,
+        storeMinIdVisible: Int64? = nil,
+        anchorSource: PaginationAnchorSource = .other
+    ) -> Bool {
+        _loadMoreHistory_impl(
+            chatId: chatId,
+            anchorMessageId: anchorMessageId,
+            pageSize: pageSize,
+            uiTopMessageId: uiTopMessageId,
+            uiTopKind: uiTopKind,
+            storeMinIdVisible: storeMinIdVisible,
+            anchorSource: anchorSource
+        )
     }
 
     // Storage (implemented in +Storage)
@@ -644,7 +669,10 @@ final class TelegramStore: ObservableObject {
         historyGenerationByChatId = [:]
         initialRemoteRequestedGenerationByChatId = [:]
         historyRequestStartedAtNs = [:]
+        historyNoProgressByChatId = [:]
         historyMetrics = HistoryMetrics()
+        historyGlobalPausedUntilNs = 0
+        historyPausedUntilNsByChatId = [:]
 
         didLoadInitialData = false
         didSendTdlibParameters = false
@@ -1198,6 +1226,15 @@ final class TDLibDownloadLimiter {
 }
 
 actor MessageStore {
+    struct HistoryTraceSnapshot: Sendable {
+        let rawMinId: Int64
+        let rawMaxId: Int64
+        let rawCount: Int
+        let visibleMinId: Int64
+        let visibleMaxId: Int64
+        let visibleCount: Int
+    }
+
     private struct ChatState {
         var messagesById: [Int64: TGMessage] = [:]
         var orderedMessageIds: [Int64] = []
@@ -1217,6 +1254,39 @@ actor MessageStore {
     init(publishDebounceMs: UInt64 = 33, maxMessagesPerChat: Int = 6_000) {
         self.publishDebounceNs = publishDebounceMs * 1_000_000
         self.maxMessagesPerChat = maxMessagesPerChat
+    }
+
+    func historyTraceSnapshot(chatId: Int64) -> HistoryTraceSnapshot {
+        guard var chat = chatStateById[chatId] else {
+            return HistoryTraceSnapshot(
+                rawMinId: 0,
+                rawMaxId: 0,
+                rawCount: 0,
+                visibleMinId: 0,
+                visibleMaxId: 0,
+                visibleCount: 0
+            )
+        }
+        normalizeOrderedIdsIfNeeded(chat: &chat)
+        chatStateById[chatId] = chat
+
+        let rawMinId = chat.orderedMessageIds.first ?? 0
+        let rawMaxId = chat.orderedMessageIds.last ?? 0
+        let rawCount = chat.messagesById.count
+
+        let visible = snapshot(for: chat)
+        let visibleMinId = visible.first?.id ?? 0
+        let visibleMaxId = visible.last?.id ?? 0
+        let visibleCount = visible.count
+
+        return HistoryTraceSnapshot(
+            rawMinId: rawMinId,
+            rawMaxId: rawMaxId,
+            rawCount: rawCount,
+            visibleMinId: visibleMinId,
+            visibleMaxId: visibleMaxId,
+            visibleCount: visibleCount
+        )
     }
 
     func subscribe(chatId: Int64, windowLimit: Int) -> AsyncStream<[TGMessage]> {
@@ -1295,47 +1365,13 @@ actor MessageStore {
     }
 
     @discardableResult
-    func applyContent(chatId: Int64, messageId: Int64, text: String) async -> Bool {
+    func applyContent(chatId: Int64, messageId: Int64, text: String) -> Bool {
         guard var chat = chatStateById[chatId],
               var message = chat.messagesById[messageId]
         else { return false }
         normalizeOrderedIdsIfNeeded(chat: &chat)
         guard message.text != text else { return false }
-        let id = message.id
-        let date = message.date
-        let isOutgoing = message.isOutgoing
-        let senderUserId = message.senderUserId
-        let contentType = message.contentType
-        let rawText = message.rawText
-        let entities = message.entities
-        let sendState = message.sendState
-        let replyToMessageId = message.replyToMessageId
-        let localId = message.localId
-        let sendingId = message.sendingId
-        let editedAt = message.editedAt
-        let canRetry = message.canRetry
-        let retryCount = message.retryCount
-        let nextRetryAt = message.nextRetryAt
-        let newMessage = TGMessage(
-            id: id,
-            chatId: chatId,
-            date: date,
-            isOutgoing: isOutgoing,
-            senderUserId: senderUserId,
-            text: text,
-            contentType: contentType,
-            rawText: rawText,
-            entities: entities,
-            sendState: sendState,
-            replyToMessageId: replyToMessageId,
-            localId: localId,
-            sendingId: sendingId,
-            editedAt: editedAt,
-            canRetry: canRetry,
-            retryCount: retryCount,
-            nextRetryAt: nextRetryAt
-        )
-        message = newMessage
+        message.text = text
         chat.messagesById[messageId] = message
         chatStateById[chatId] = chat
         debugLogMutation(label: "content", chatId: chatId, changed: 1)
@@ -1397,12 +1433,15 @@ actor MessageStore {
             return
         }
         chat.publishTask?.cancel()
-        SwiftUIPublishTrace.storeEvent(
-            name: "publish_scheduled",
-            chatId: chatId,
-            details: "source=MessageStore delayMs=\(publishDebounceNs / 1_000_000) subscribers=\(chat.continuations.count)",
-            reason: "messageStore"
-        )
+        let subscribersCount = chat.continuations.count
+        Task { @MainActor in
+            SwiftUIPublishTrace.storeEvent(
+                name: "publish_scheduled",
+                chatId: chatId,
+                details: "source=MessageStore delayMs=\(publishDebounceNs / 1_000_000) subscribers=\(subscribersCount)",
+                reason: "messageStore"
+            )
+        }
         chat.publishTask = Task { [weak self] in
             guard let self else { return }
             try? await Task.sleep(nanoseconds: self.publishDebounceNs)
@@ -1416,24 +1455,29 @@ actor MessageStore {
         normalizeOrderedIdsIfNeeded(chat: &chat)
         chat.publishTask = nil
         let newSnapshot = snapshot(for: chat)
+        let subscribersCount = chat.continuations.count
         let firstId = newSnapshot.first.map(\.id).map(String.init) ?? "n/a"
         let lastId = newSnapshot.last.map(\.id).map(String.init) ?? "n/a"
-        SwiftUIPublishTrace.storeEvent(
-            name: "snapshot_ready",
-            chatId: chatId,
-            details: "source=MessageStore count=\(newSnapshot.count) first=\(firstId) last=\(lastId) subscribers=\(chat.continuations.count)",
-            reason: "messageSnapshotStream"
-        )
+        Task { @MainActor in
+            SwiftUIPublishTrace.storeEvent(
+                name: "snapshot_ready",
+                chatId: chatId,
+                details: "source=MessageStore count=\(newSnapshot.count) first=\(firstId) last=\(lastId) subscribers=\(subscribersCount)",
+                reason: "messageSnapshotStream"
+            )
+        }
         guard newSnapshot != chat.lastPublishedSnapshot else {
             chatStateById[chatId] = chat
             return
         }
-        SwiftUIPublishTrace.storeEvent(
-            name: "publish_fire",
-            chatId: chatId,
-            details: "source=MessageStore count=\(newSnapshot.count) subscribers=\(chat.continuations.count)",
-            reason: "messageSnapshotStream"
-        )
+        Task { @MainActor in
+            SwiftUIPublishTrace.storeEvent(
+                name: "publish_fire",
+                chatId: chatId,
+                details: "source=MessageStore count=\(newSnapshot.count) subscribers=\(subscribersCount)",
+                reason: "messageSnapshotStream"
+            )
+        }
         chat.lastPublishedSnapshot = newSnapshot
         let continuations = chat.continuations.values
         chatStateById[chatId] = chat

@@ -13,6 +13,12 @@ nonisolated struct DatabaseStats: Hashable {
     let users: Int
 }
 
+nonisolated struct MessageBounds: Hashable {
+    let minId: Int64
+    let maxId: Int64
+    let count: Int
+}
+
 nonisolated final class AppDatabaseRepository: @unchecked Sendable {
     private let log = Logger(subsystem: "com.aurora.app", category: "db")
     private let dbWriter: DatabaseWriter
@@ -749,7 +755,7 @@ nonisolated final class AppDatabaseRepository: @unchecked Sendable {
         }
     }
 
-    func messageCount(chatId: Int64) -> Int {
+    nonisolated func messageCount(chatId: Int64) -> Int {
         do {
             return try dbWriter.read { db in
                 let count = try Int.fetchOne(
@@ -762,6 +768,49 @@ nonisolated final class AppDatabaseRepository: @unchecked Sendable {
         } catch {
             log.error("messageCount failed: \(String(describing: error), privacy: .public)")
             return 0
+        }
+    }
+
+    func fetchMessageBounds(chatId: Int64) -> MessageBounds {
+        do {
+            return try dbWriter.read { db in
+                let count = try Int.fetchOne(
+                    db,
+                    sql: "SELECT COUNT(*) FROM messages WHERE chat_id = ?",
+                    arguments: [chatId]
+                ) ?? 0
+                guard count > 0 else {
+                    return MessageBounds(minId: 0, maxId: 0, count: 0)
+                }
+
+                let orderExpr = "(CASE WHEN message_id > 0 THEN message_id ELSE 9000000000000000000 + message_id END)"
+                let minId = try Int64.fetchOne(
+                    db,
+                    sql: """
+                    SELECT message_id
+                    FROM messages
+                    WHERE chat_id = ?
+                    ORDER BY \(orderExpr) ASC
+                    LIMIT 1
+                    """,
+                    arguments: [chatId]
+                ) ?? 0
+                let maxId = try Int64.fetchOne(
+                    db,
+                    sql: """
+                    SELECT message_id
+                    FROM messages
+                    WHERE chat_id = ?
+                    ORDER BY \(orderExpr) DESC
+                    LIMIT 1
+                    """,
+                    arguments: [chatId]
+                ) ?? 0
+                return MessageBounds(minId: minId, maxId: maxId, count: count)
+            }
+        } catch {
+            log.error("fetchMessageBounds failed: \(String(describing: error), privacy: .public)")
+            return MessageBounds(minId: 0, maxId: 0, count: 0)
         }
     }
 

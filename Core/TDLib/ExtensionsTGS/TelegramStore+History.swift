@@ -7,10 +7,19 @@ import Dispatch
 import os
 
 extension TelegramStore {
+    struct HistoryExtraContext {
+        let chatId: Int64
+        let reason: String
+        let requestId: String
+    }
 
     private var initialHistoryWindowLimit: Int { 160 }
+    private var initialHistoryPageSize: Int { 50 }
     private var maxHistoryWindowLimit: Int { 5_000 }
     private var maxTdlibHistoryLimit: Int { 100 }
+    private var historyAnchorJumpDiffThreshold: Int64 { 1_000_000_000 }
+    private var historySkipTraceRateLimitMs: UInt64 { 500 }
+    private var historyFloodWaitDefaultSeconds: Int { 1 }
 
     func requestInitialRemoteHistoryIfNeeded(
         chatId: Int64,
@@ -31,7 +40,11 @@ extension TelegramStore {
             requestedLimit: requestedLimit,
             windowLimit: windowLimit,
             onlyLocal: false,
-            generation: generation
+            generation: generation,
+            anchorSource: .other,
+            uiTopMessageId: nil,
+            uiTopKind: nil,
+            storeMinIdVisible: nil
         )
         syncHistoryLoadingFlagForSelectedChat()
         sendChatHistory(
@@ -46,6 +59,7 @@ extension TelegramStore {
 
     func loadInitialHistory(chatId: Int64) {
         reachedHistoryStart.remove(chatId)
+        resetHistoryNoProgress(chatId: chatId)
         setMessageWindow(chatId: chatId, windowSize: initialHistoryWindowLimit)
 
         // Bump generation so stale history responses can't overwrite a newer timeline.
@@ -55,17 +69,21 @@ extension TelegramStore {
         historyWindowLimitByChatId[chatId] = initialHistoryWindowLimit
         cancelHistoryJobs(for: chatId)
 
-        let extra = "history:\(chatId):initial:local:\(UUID().uuidString)"
+        let extra = "history:\(chatId):initial:remote:\(UUID().uuidString)"
         let windowLimit = historyWindowLimitByChatId[chatId] ?? initialHistoryWindowLimit
-        let tdLimit = min(maxTdlibHistoryLimit, windowLimit)
+        let tdLimit = min(maxTdlibHistoryLimit, max(1, min(initialHistoryPageSize, windowLimit)))
         historyJobs[extra] = HistoryJob(
             chatId: chatId,
-            kind: .initialLocal,
+            kind: .initialRemote,
             anchorMessageId: 0,
             requestedLimit: tdLimit,
             windowLimit: windowLimit,
-            onlyLocal: true,
-            generation: generation
+            onlyLocal: false,
+            generation: generation,
+            anchorSource: .other,
+            uiTopMessageId: nil,
+            uiTopKind: nil,
+            storeMinIdVisible: nil
         )
         syncHistoryLoadingFlagForSelectedChat()
         sendChatHistory(
@@ -73,23 +91,112 @@ extension TelegramStore {
             fromMessageId: 0,
             offset: 0,
             limit: tdLimit,
-            onlyLocal: true,
+            onlyLocal: false,
             extra: extra
         )
     }
 
-    func _loadMoreHistory_impl(chatId: Int64, anchorMessageId: Int64, pageSize: Int) {
-        if reachedHistoryStart.contains(chatId) { return }
-        if anchorMessageId <= 0 { return }
-        if historyJobs.values.contains(where: { $0.chatId == chatId && $0.kind == .older }) { return }
-
+    @discardableResult
+    func _loadMoreHistory_impl(
+        chatId: Int64,
+        anchorMessageId: Int64,
+        pageSize: Int,
+        uiTopMessageId: Int64? = nil,
+        uiTopKind: String? = nil,
+        storeMinIdVisible: Int64? = nil,
+        anchorSource: PaginationAnchorSource = .other
+    ) -> Bool {
+        let hasReachedStart = reachedHistoryStart.contains(chatId)
+        let hasOlderInFlight = historyJobs.values.contains(where: { $0.chatId == chatId && $0.kind == .older })
+        let normalizedPageSize = max(1, pageSize)
         let currentLimit = historyWindowLimitByChatId[chatId] ?? initialHistoryWindowLimit
-        if currentLimit >= maxHistoryWindowLimit { return }
+        let reachedWindowCap = currentLimit >= maxHistoryWindowLimit
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        let pausedUntilNs = historyCooldownUntilNs(chatId: chatId, nowNs: nowNs)
 
-        let target = min(maxHistoryWindowLimit, currentLimit + pageSize)
+        if hasReachedStart {
+            traceHistorySkip(
+                chatId: chatId,
+                reason: "older",
+                skipReason: "endReached",
+                anchorMessageId: anchorMessageId,
+                flags: [
+                    ("hasReachedStart", HistoryTrace.boolValue(hasReachedStart)),
+                    ("hasOlderInFlight", HistoryTrace.boolValue(hasOlderInFlight)),
+                    ("currentLimit", String(currentLimit)),
+                    ("maxLimit", String(maxHistoryWindowLimit))
+                ]
+            )
+            return false
+        }
+
+        if anchorMessageId <= 0 {
+            traceHistorySkip(
+                chatId: chatId,
+                reason: "older",
+                skipReason: "noAnchor",
+                anchorMessageId: anchorMessageId,
+                flags: [
+                    ("hasReachedStart", HistoryTrace.boolValue(hasReachedStart)),
+                    ("hasOlderInFlight", HistoryTrace.boolValue(hasOlderInFlight)),
+                    ("currentLimit", String(currentLimit)),
+                    ("maxLimit", String(maxHistoryWindowLimit))
+                ]
+            )
+            return false
+        }
+
+        if hasOlderInFlight {
+            traceHistorySkip(
+                chatId: chatId,
+                reason: "older",
+                skipReason: "inFlight",
+                anchorMessageId: anchorMessageId,
+                flags: [
+                    ("hasReachedStart", HistoryTrace.boolValue(hasReachedStart)),
+                    ("hasOlderInFlight", HistoryTrace.boolValue(hasOlderInFlight)),
+                    ("currentLimit", String(currentLimit)),
+                    ("maxLimit", String(maxHistoryWindowLimit))
+                ]
+            )
+            return false
+        }
+
+        if reachedWindowCap {
+            traceHistorySkip(
+                chatId: chatId,
+                reason: "older",
+                skipReason: "other",
+                anchorMessageId: anchorMessageId,
+                flags: [
+                    ("cause", "maxWindowLimit"),
+                    ("hasReachedStart", HistoryTrace.boolValue(hasReachedStart)),
+                    ("hasOlderInFlight", HistoryTrace.boolValue(hasOlderInFlight)),
+                    ("currentLimit", String(currentLimit)),
+                    ("maxLimit", String(maxHistoryWindowLimit))
+                ]
+            )
+            return false
+        }
+
+        if pausedUntilNs > nowNs {
+            traceHistorySkip(
+                chatId: chatId,
+                reason: "older",
+                skipReason: "cooldown",
+                anchorMessageId: anchorMessageId,
+                flags: [
+                    ("pausedUntil", historyPausedUntilString(untilNs: pausedUntilNs, nowNs: nowNs)),
+                    ("cooldownSecondsRemaining", String(historyRemainingCooldownSeconds(untilNs: pausedUntilNs, nowNs: nowNs)))
+                ]
+            )
+            return false
+        }
+
+        let target = min(maxHistoryWindowLimit, currentLimit + normalizedPageSize)
         historyWindowLimitByChatId[chatId] = target
         setMessageWindow(chatId: chatId, windowSize: target)
-        let tdLimit = min(maxTdlibHistoryLimit, max(1, pageSize + 1))
+        let tdLimit = min(maxTdlibHistoryLimit, normalizedPageSize)
 
         let extra = "history:\(chatId):older:\(UUID().uuidString)"
         historyJobs[extra] = HistoryJob(
@@ -99,12 +206,16 @@ extension TelegramStore {
             requestedLimit: tdLimit,
             windowLimit: target,
             onlyLocal: false,
-            generation: historyGenerationByChatId[chatId] ?? 0
+            generation: historyGenerationByChatId[chatId] ?? 0,
+            anchorSource: anchorSource,
+            uiTopMessageId: uiTopMessageId,
+            uiTopKind: uiTopKind,
+            storeMinIdVisible: storeMinIdVisible
         )
         syncHistoryLoadingFlagForSelectedChat()
 
         // TDLib getChatHistory(chat_id, from_message_id, offset, limit, only_local).
-        // offset=0 includes the anchor message; we request limit+1 and dedupe by message_id.
+        // offset=0 may include the anchor message; we dedupe by message_id later.
         sendChatHistory(
             chatId: chatId,
             fromMessageId: anchorMessageId,
@@ -113,6 +224,7 @@ extension TelegramStore {
             onlyLocal: false,
             extra: extra
         )
+        return true
     }
 
     func cancelHistoryJobs(for chatId: Int64) {
@@ -122,6 +234,7 @@ extension TelegramStore {
             historyRequestStartedAtNs.removeValue(forKey: k)
         }
         initialRemoteRequestedGenerationByChatId.removeValue(forKey: chatId)
+        resetHistoryNoProgress(chatId: chatId)
         syncHistoryLoadingFlagForSelectedChat()
     }
 
@@ -143,7 +256,28 @@ extension TelegramStore {
     }
 
     func sendChatHistory(chatId: Int64, fromMessageId: Int64, offset: Int, limit: Int, onlyLocal: Bool, extra: String) {
-        historyRequestStartedAtNs[extra] = DispatchTime.now().uptimeNanoseconds
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        let pausedUntilNs = historyCooldownUntilNs(chatId: chatId, nowNs: nowNs)
+        if pausedUntilNs > nowNs {
+            let job = historyJobs[extra]
+            traceHistorySkip(
+                chatId: chatId,
+                reason: historyReason(for: job?.kind),
+                skipReason: "cooldown",
+                anchorMessageId: fromMessageId,
+                flags: [
+                    ("requestId", historyRequestId(from: extra)),
+                    ("extra", extra),
+                    ("pausedUntil", historyPausedUntilString(untilNs: pausedUntilNs, nowNs: nowNs)),
+                    ("cooldownSecondsRemaining", String(historyRemainingCooldownSeconds(untilNs: pausedUntilNs, nowNs: nowNs)))
+                ]
+            )
+            discardHistoryJob(extra: extra)
+            syncHistoryLoadingFlagForSelectedChat()
+            return
+        }
+
+        historyRequestStartedAtNs[extra] = nowNs
         if onlyLocal {
             historyMetrics.requestsLocal += 1
         } else {
@@ -156,6 +290,67 @@ extension TelegramStore {
         log.debug("history request queued chatId=\(chatId, privacy: .public) from=\(fromMessageId, privacy: .public) offset=\(offset, privacy: .public) limit=\(limit, privacy: .public) local=\(onlyLocal, privacy: .public) inFlight=\(inFlightCount, privacy: .public)")
 #endif
 
+        let traceEnabled = HistoryTrace.isEnabled(for: chatId)
+        if traceEnabled {
+            let job = historyJobs[extra]
+            let bounds = databaseRepository.fetchMessageBounds(chatId: chatId)
+            let reason = historyReason(for: job?.kind)
+            let inFlightCountForChat = historyInFlightCount(chatId: chatId)
+            let uiTopMessageId = job?.uiTopMessageId
+            let uiTopKind = job?.uiTopKind ?? "null"
+            let storeMinIdVisible = job?.storeMinIdVisible
+            let anchorSource = job?.anchorSource.rawValue ?? PaginationAnchorSource.other.rawValue
+            let uiTopDiff: Int64? = {
+                guard let uiTopMessageId, bounds.minId != 0 else { return nil }
+                return uiTopMessageId - bounds.minId
+            }()
+
+            HistoryTrace.emit(
+                tag: "HIST_REQ",
+                chatId: chatId,
+                fields: [
+                    ("reason", reason),
+                    ("requestId", historyRequestId(from: extra)),
+                    ("extra", extra),
+                    ("from_message_id", String(fromMessageId)),
+                    ("offset", String(offset)),
+                    ("limit", String(limit)),
+                    ("only_local", HistoryTrace.boolValue(onlyLocal)),
+                    ("inFlightCount", String(inFlightCountForChat)),
+                    ("storeMinId", String(bounds.minId)),
+                    ("storeMaxId", String(bounds.maxId)),
+                    ("storeCount", String(bounds.count)),
+                    ("storeMinIdRaw", String(bounds.minId)),
+                    ("storeMinIdVisible", HistoryTrace.optionalInt64(storeMinIdVisible)),
+                    ("uiTopMessageId", HistoryTrace.optionalInt64(uiTopMessageId)),
+                    ("uiTopKind", uiTopKind),
+                    ("uiTopVsStoreMinDiff", HistoryTrace.optionalInt64(uiTopDiff)),
+                    ("paginationAnchorSource", anchorSource)
+                ]
+            )
+
+            if reason == "older", bounds.minId > 0 {
+                let diff = bounds.minId - fromMessageId
+                let jumpByRatio = fromMessageId < Int64(Double(bounds.minId) * 0.98)
+                let jumpByDiff = diff > historyAnchorJumpDiffThreshold
+                if diff > 0, (jumpByRatio || jumpByDiff) {
+                    HistoryTrace.emit(
+                        tag: "HIST_WARN",
+                        chatId: chatId,
+                        fields: [
+                            ("type", "ANCHOR_JUMP_TOO_OLD"),
+                            ("reason", reason),
+                            ("requestId", historyRequestId(from: extra)),
+                            ("storeMinId", String(bounds.minId)),
+                            ("from_message_id", String(fromMessageId)),
+                            ("diff", String(diff)),
+                            ("paginationAnchorSource", anchorSource)
+                        ]
+                    )
+                }
+            }
+        }
+
         let req: [String: Any] = [
             "@type": "getChatHistory",
             "@extra": extra,
@@ -166,6 +361,192 @@ extension TelegramStore {
             "only_local": onlyLocal
         ]
         enqueueTDLibRequest(req, typeOverride: "getChatHistory", priority: .high)
+    }
+
+    func historyReason(for kind: HistoryJobKind?) -> String {
+        guard let kind else { return "other" }
+        switch kind {
+        case .initialLocal:
+            return "initial_local"
+        case .initialRemote:
+            return "initial_remote"
+        case .older:
+            return "older"
+        }
+    }
+
+    func historyRequestId(from extra: String) -> String {
+        extra.split(separator: ":").last.map(String.init) ?? extra
+    }
+
+    func parseHistoryExtraContext(_ extra: String) -> HistoryExtraContext? {
+        let parts = extra.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 4 else { return nil }
+        guard parts[0] == "history" else { return nil }
+        guard let chatId = Int64(parts[1]) else { return nil }
+
+        let reason: String
+        if parts.count >= 5, parts[2] == "initial", parts[3] == "local" {
+            reason = "initial_local"
+        } else if parts.count >= 5, parts[2] == "initial", parts[3] == "remote" {
+            reason = "initial_remote"
+        } else if parts[2] == "older" {
+            reason = "older"
+        } else {
+            reason = "other"
+        }
+
+        return HistoryExtraContext(
+            chatId: chatId,
+            reason: reason,
+            requestId: historyRequestId(from: extra)
+        )
+    }
+
+    func traceHistorySkip(
+        chatId: Int64,
+        reason: String,
+        skipReason: String,
+        anchorMessageId: Int64,
+        flags: [(String, String)] = []
+    ) {
+        guard HistoryTrace.isEnabled(for: chatId) else { return }
+        var fields: [(String, String)] = [
+            ("reason", reason),
+            ("skipReason", skipReason),
+            ("anchorMessageId", String(anchorMessageId)),
+            ("inFlightCount", String(historyInFlightCount(chatId: chatId))),
+            ("selectedChatId", HistoryTrace.optionalInt64(selectedChatId)),
+            ("isLoadingHistory", HistoryTrace.boolValue(isLoadingHistory)),
+            ("reachedHistoryStart", HistoryTrace.boolValue(reachedHistoryStart.contains(chatId)))
+        ]
+        fields.append(contentsOf: flags)
+        HistoryTrace.emit(
+            tag: "HIST_SKIP",
+            chatId: chatId,
+            fields: fields,
+            rateKey: "store:\(chatId):\(reason):\(skipReason)",
+            rateLimitMs: historySkipTraceRateLimitMs
+        )
+    }
+
+    func historyInFlightCount(chatId: Int64) -> Int {
+        historyJobs.values.reduce(into: 0) { result, job in
+            if job.chatId == chatId {
+                result += 1
+            }
+        }
+    }
+
+    func resetHistoryNoProgress(chatId: Int64) {
+        historyNoProgressByChatId.removeValue(forKey: chatId)
+    }
+
+    @discardableResult
+    func registerHistoryNoProgress(chatId: Int64, anchorMessageId: Int64) -> Int {
+        let current = historyNoProgressByChatId[chatId]
+        let attempts: Int
+        if let current, current.anchorMessageId == anchorMessageId {
+            attempts = current.attempts + 1
+        } else {
+            attempts = 1
+        }
+        historyNoProgressByChatId[chatId] = (anchorMessageId: anchorMessageId, attempts: attempts)
+        return attempts
+    }
+
+    func discardHistoryJob(extra: String) {
+        if let job = historyJobs.removeValue(forKey: extra),
+           job.kind == .initialRemote,
+           initialRemoteRequestedGenerationByChatId[job.chatId] == job.generation {
+            initialRemoteRequestedGenerationByChatId.removeValue(forKey: job.chatId)
+        }
+        historyRequestStartedAtNs.removeValue(forKey: extra)
+    }
+
+    func historyCooldownUntilNs(chatId: Int64, nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> UInt64 {
+        if historyGlobalPausedUntilNs <= nowNs {
+            historyGlobalPausedUntilNs = 0
+        }
+        if let perChat = historyPausedUntilNsByChatId[chatId], perChat <= nowNs {
+            historyPausedUntilNsByChatId.removeValue(forKey: chatId)
+        }
+        return max(historyGlobalPausedUntilNs, historyPausedUntilNsByChatId[chatId] ?? 0)
+    }
+
+    @discardableResult
+    func applyHistoryFloodWaitCooldown(chatId: Int64?, seconds: Int) -> UInt64 {
+        let clampedSeconds = max(historyFloodWaitDefaultSeconds, seconds)
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        let deltaNs = UInt64(clampedSeconds) * 1_000_000_000
+        let pausedUntilNs = nowNs > (UInt64.max - deltaNs) ? UInt64.max : (nowNs + deltaNs)
+        historyGlobalPausedUntilNs = max(historyGlobalPausedUntilNs, pausedUntilNs)
+        if let chatId {
+            historyPausedUntilNsByChatId[chatId] = max(historyPausedUntilNsByChatId[chatId] ?? 0, pausedUntilNs)
+        }
+        return pausedUntilNs
+    }
+
+    func historyRemainingCooldownSeconds(untilNs: UInt64, nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Int {
+        guard untilNs > nowNs else { return 0 }
+        let remainingNs = untilNs - nowNs
+        let roundedUp = (remainingNs + 999_999_999) / 1_000_000_000
+        return Int(min(roundedUp, UInt64(Int.max)))
+    }
+
+    func historyPausedUntilString(untilNs: UInt64, nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> String {
+        guard untilNs > nowNs else { return "null" }
+        let remainingNs = untilNs - nowNs
+        let pausedUntilDate = Date().addingTimeInterval(Double(remainingNs) / 1_000_000_000.0)
+        return ISO8601DateFormatter().string(from: pausedUntilDate)
+    }
+
+    func parseFloodWaitSeconds(message: String, extra: String?) -> Int? {
+        if let fromMessage = extractFloodWaitSeconds(from: message) {
+            return fromMessage
+        }
+        if let extra, let fromExtra = extractFloodWaitSeconds(from: extra) {
+            return fromExtra
+        }
+        return nil
+    }
+
+    private func extractFloodWaitSeconds(from value: String) -> Int? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let upper = trimmed.uppercased()
+
+        if let floodRange = upper.range(of: "FLOOD_WAIT_") {
+            let suffix = upper[floodRange.upperBound...]
+            let digits = suffix.prefix { $0.isNumber }
+            if let parsed = Int(digits), parsed > 0 {
+                return parsed
+            }
+        }
+
+        if upper.contains("FLOOD_WAIT") {
+            let digits = upper.split { !$0.isNumber }.compactMap { Int($0) }
+            if let parsed = digits.first(where: { $0 > 0 }) {
+                return parsed
+            }
+        }
+
+        let patterns = [
+            #"(?i)retry\s+after\s+([0-9]+)"#,
+            #"(?i)wait\s+([0-9]+)"#
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let nsRange = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+            guard let match = regex.firstMatch(in: trimmed, options: [], range: nsRange),
+                  match.numberOfRanges >= 2,
+                  let range = Range(match.range(at: 1), in: trimmed),
+                  let parsed = Int(trimmed[range]),
+                  parsed > 0
+            else { continue }
+            return parsed
+        }
+        return nil
     }
 
 }

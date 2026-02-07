@@ -163,6 +163,116 @@ nonisolated enum SwiftUIPublishTrace {
 #endif
 }
 
+nonisolated enum HistoryTrace {
+#if DEBUG
+    private static let enabledFlag: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DEBUG_HISTORY_TRACE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        else { return false }
+        return raw == "1" || raw.caseInsensitiveCompare("true") == .orderedSame
+    }()
+    private static let chatIdFilter: Int64? = {
+        guard let raw = ProcessInfo.processInfo.environment["DEBUG_HISTORY_TRACE_CHAT_ID"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let value = Int64(raw)
+        else { return nil }
+        return value
+    }()
+    private static let lock = NSLock()
+    private static var lastEmitMsByRateKey: [String: UInt64] = [:]
+#endif
+
+    static var isEnabled: Bool {
+#if DEBUG
+        enabledFlag
+#else
+        false
+#endif
+    }
+
+    static func isEnabled(for chatId: Int64?) -> Bool {
+#if DEBUG
+        guard enabledFlag else { return false }
+        guard let filter = chatIdFilter else { return true }
+        guard let chatId else { return false }
+        return chatId == filter
+#else
+        _ = chatId
+        return false
+#endif
+    }
+
+    static func emit(
+        tag: String,
+        chatId: Int64?,
+        fields: [(String, String)],
+        rateKey: String? = nil,
+        rateLimitMs: UInt64 = 0
+    ) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        let nowMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+        if let rateKey, rateLimitMs > 0 {
+            lock.lock()
+            let last = lastEmitMsByRateKey[rateKey]
+            if let last, nowMs >= last, (nowMs - last) < rateLimitMs {
+                lock.unlock()
+                return
+            }
+            lastEmitMsByRateKey[rateKey] = nowMs
+            lock.unlock()
+        }
+
+        var parts: [String] = [
+            "HISTORY_TRACE",
+            "tag=\(sanitize(tag))",
+            "chatId=\(chatId.map(String.init) ?? "null")"
+        ]
+        for (key, value) in fields {
+            parts.append("\(sanitize(key))=\(sanitize(value))")
+        }
+        print(parts.joined(separator: " "))
+#else
+        _ = tag
+        _ = chatId
+        _ = fields
+        _ = rateKey
+        _ = rateLimitMs
+#endif
+    }
+
+    static func boolValue(_ value: Bool) -> String {
+        value ? "true" : "false"
+    }
+
+    static func optionalInt64(_ value: Int64?) -> String {
+        value.map(String.init) ?? "null"
+    }
+
+    static func optionalInt(_ value: Int?) -> String {
+        value.map(String.init) ?? "null"
+    }
+
+    static func optionalDouble(_ value: Double?, decimals: Int = 2) -> String {
+        guard let value else { return "null" }
+        return String(format: "%.\(decimals)f", value)
+    }
+
+#if DEBUG
+    private static func sanitize(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return "null"
+        }
+        return trimmed
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+            .replacingOccurrences(of: " ", with: "_")
+    }
+#endif
+}
+
 nonisolated final class ViewUpdatePhaseTracker: @unchecked Sendable {
     static let shared = ViewUpdatePhaseTracker()
 
