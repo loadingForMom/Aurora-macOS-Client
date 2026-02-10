@@ -18,6 +18,9 @@ struct MessageBubble: View {
     /// Simplified rendering mode for dense windows.
     let optimizeForPerformance: Bool
 
+    /// Transient lightweight mode while live scrolling.
+    let isScrolling: Bool
+
     var onRetry: () -> Void = {}
     var onDelete: () -> Void = {}
 
@@ -32,6 +35,7 @@ struct MessageBubble: View {
         currentChatId: Int64,
         revealTimeX: CGFloat = 0,
         optimizeForPerformance: Bool = false,
+        isScrolling: Bool = false,
         onRetry: @escaping () -> Void = {},
         onDelete: @escaping () -> Void = {},
         jellyOffsetY: CGFloat = 0
@@ -40,6 +44,7 @@ struct MessageBubble: View {
         self.currentChatId = currentChatId
         self.revealTimeX = revealTimeX
         self.optimizeForPerformance = optimizeForPerformance
+        self.isScrolling = isScrolling
         self.onRetry = onRetry
         self.onDelete = onDelete
         self.jellyOffsetY = jellyOffsetY
@@ -82,7 +87,13 @@ struct MessageBubble: View {
                 }
                 .frame(maxWidth: .infinity, alignment: msg.isOutgoing ? .trailing : .leading)
                 .offset(y: jellyOffsetY)
-                .modifier(MessageContextMenuModifier(enabled: !optimizeForPerformance, msg: msg, onRetry: onRetry, onDelete: onDelete))
+                .modifier(MessageContextMenuModifier(enabled: !(optimizeForPerformance || isScrolling), msg: msg, onRetry: onRetry, onDelete: onDelete))
+            }
+        }
+        .transaction { transaction in
+            if isScrolling {
+                transaction.disablesAnimations = true
+                transaction.animation = nil
             }
         }
     }
@@ -134,13 +145,13 @@ struct MessageBubble: View {
                 rawText: msg.textForRendering,
                 entities: msg.entities,
                 isOutgoing: msg.isOutgoing,
-                textSelectionEnabled: !optimizeForPerformance
+                textSelectionEnabled: !(optimizeForPerformance || isScrolling)
             )
             .padding(.vertical, 8)
             .padding(.horizontal, 12)
             .background(bubbleBackground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay {
-                if !optimizeForPerformance {
+                if !optimizeForPerformance && !isScrolling {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
                 }
@@ -209,7 +220,7 @@ struct MessageBubble: View {
             // Make outgoing bubbles always “Messages blue” on macOS.
             return AnyShapeStyle(Color(nsColor: .systemBlue))
         } else {
-            if optimizeForPerformance {
+            if optimizeForPerformance || isScrolling {
                 return AnyShapeStyle(Color(nsColor: .controlBackgroundColor))
             }
             return AnyShapeStyle(.thinMaterial)

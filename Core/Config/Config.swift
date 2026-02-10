@@ -678,6 +678,35 @@ nonisolated enum ChatPerfTrace {
 #endif
     }
 
+    static func recordContentOnlyFastPath(chatId: Int64) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        collector?.recordContentOnlyFastPath()
+#else
+        _ = chatId
+#endif
+    }
+
+    static func recordScrollState(chatId: Int64, isScrolling: Bool) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        collector?.recordScrollState(isScrolling)
+#else
+        _ = chatId
+        _ = isScrolling
+#endif
+    }
+
+    static func shouldCoalesceLatest(chatId: Int64?) -> Bool {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return false }
+        return collector?.shouldCoalesceLatest() ?? false
+#else
+        _ = chatId
+        return false
+#endif
+    }
+
     static func recordApplyWindowMessages(chatId: Int64, durationMs: Double) {
 #if DEBUG
         guard isEnabled(for: chatId) else { return }
@@ -764,9 +793,17 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
     private var flushTimer: DispatchSourceTimer?
 
     private var windowStartNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    private var isLiveScrolling: Bool = false
+    private var lastScrollStateChangeNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    private var scrollingDurationNs: UInt64 = 0
     private var snapshotReceivedCount: Int = 0
+    private var snapshotReceivedScrollingCount: Int = 0
+    private var snapshotReceivedIdleCount: Int = 0
     private var snapshotAppliedCount: Int = 0
     private var fullRowsRebuildCount: Int = 0
+    private var fullRowsRebuildScrollingCount: Int = 0
+    private var fullRowsRebuildIdleCount: Int = 0
+    private var contentOnlyFastPathCount: Int = 0
     private var incrementalRowsBuildCount: Int = 0
     private var buildRowsDurationMs = DurationAggregate()
     private var applyWindowMessagesDurationMs = DurationAggregate()
@@ -791,6 +828,11 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             self.snapshotReceivedCount += 1
+            if self.isLiveScrolling {
+                self.snapshotReceivedScrollingCount += 1
+            } else {
+                self.snapshotReceivedIdleCount += 1
+            }
         }
     }
 
@@ -808,10 +850,37 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
                 self.incrementalRowsBuildCount += 1
             } else {
                 self.fullRowsRebuildCount += 1
+                if self.isLiveScrolling {
+                    self.fullRowsRebuildScrollingCount += 1
+                } else {
+                    self.fullRowsRebuildIdleCount += 1
+                }
             }
             self.buildRowsDurationMs.record(durationMs)
         }
     }
+
+    func recordContentOnlyFastPath() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.contentOnlyFastPathCount += 1
+        }
+    }
+
+    func recordScrollState(_ isScrolling: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let nowNs = DispatchTime.now().uptimeNanoseconds
+            self.accumulateScrollingDuration(until: nowNs)
+            self.isLiveScrolling = isScrolling
+        }
+    }
+
+    func shouldCoalesceLatest() -> Bool {
+        queue.sync { snapshotCoalesceLatestEnabled }
+    }
+
+    private var snapshotCoalesceLatestEnabled: Bool = false
 
     func recordApplyWindowMessages(_ durationMs: Double) {
         queue.async { [weak self] in
@@ -836,12 +905,16 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
 
     private func flush() {
         let nowNs = DispatchTime.now().uptimeNanoseconds
+        accumulateScrollingDuration(until: nowNs)
         let elapsedSec = max(0.001, Double(nowNs &- windowStartNs) / 1_000_000_000)
+        let scrollingSec = min(elapsedSec, Double(scrollingDurationNs) / 1_000_000_000)
+        let idleSec = max(0.001, elapsedSec - scrollingSec)
 
         let hasActivity =
             snapshotReceivedCount > 0 ||
             snapshotAppliedCount > 0 ||
             fullRowsRebuildCount > 0 ||
+            contentOnlyFastPathCount > 0 ||
             incrementalRowsBuildCount > 0 ||
             buildRowsDurationMs.count > 0 ||
             applyWindowMessagesDurationMs.count > 0 ||
@@ -861,7 +934,39 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
         let medianSnapshotsInPerSec = median(snapshotInRateSamples) ?? 0
         let medianSnapshotsOutPerSec = median(snapshotOutRateSamples) ?? 0
         let fullRebuildsPerSec = Double(fullRowsRebuildCount) / elapsedSec
+        let contentOnlyFastPathPerSec = Double(contentOnlyFastPathCount) / elapsedSec
+        let snapshotsPerSecScrolling = Double(snapshotReceivedScrollingCount) / max(0.001, scrollingSec)
+        let snapshotsPerSecIdle = Double(snapshotReceivedIdleCount) / max(0.001, idleSec)
+        let fullRebuildsPerSecScrolling = Double(fullRowsRebuildScrollingCount) / max(0.001, scrollingSec)
+        let fullRebuildsPerSecIdle = Double(fullRowsRebuildIdleCount) / max(0.001, idleSec)
         let incrementalBuildsPerSec = Double(incrementalRowsBuildCount) / elapsedSec
+
+        if scrollingSec > 0 {
+            let scrollLine = [
+                "CHAT_SCROLL_AGG",
+                "chatId=\(chatLabel)",
+                "windowSec=\(format(elapsedSec))",
+                "scrollSec=\(format(scrollingSec))",
+                "snapshots/s=\(format(snapshotsPerSecScrolling))",
+                "fullRowsRebuilds/s=\(format(fullRebuildsPerSecScrolling))"
+            ].joined(separator: " ")
+            log.debug("\(scrollLine, privacy: .public)")
+        }
+
+        if !snapshotCoalesceLatestEnabled,
+           snapshotsPerSecScrolling > 20 || snapshotsPerSecIdle > 10 {
+            snapshotCoalesceLatestEnabled = true
+            let activationLine = [
+                "CHAT_COALESCE_LATEST",
+                "chatId=\(chatLabel)",
+                "enabled=true",
+                "snapshots/s(scroll)=\(format(snapshotsPerSecScrolling))",
+                "snapshots/s(idle)=\(format(snapshotsPerSecIdle))",
+                "fullRowsRebuilds/s(scroll)=\(format(fullRebuildsPerSecScrolling))",
+                "fullRowsRebuilds/s(idle)=\(format(fullRebuildsPerSecIdle))"
+            ].joined(separator: " ")
+            log.notice("\(activationLine, privacy: .public)")
+        }
 
         let line = [
             "CHAT_PERF",
@@ -871,6 +976,7 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
             "snapshotsApplied/s=\(format(snapshotsOutPerSec))",
             "medianSnapshots/s(before/after)=\(format(medianSnapshotsInPerSec))/\(format(medianSnapshotsOutPerSec))",
             "fullRebuilds/s=\(format(fullRebuildsPerSec))",
+            "contentOnlyFastPath/s=\(format(contentOnlyFastPathPerSec))",
             "incrementalBuilds/s=\(format(incrementalBuildsPerSec))",
             "buildRowsMs(avg/max)=\(format(buildRowsDurationMs.avgMs))/\(format(buildRowsDurationMs.maxMs))",
             "applyWindowMessagesMs(avg/max)=\(format(applyWindowMessagesDurationMs.avgMs))/\(format(applyWindowMessagesDurationMs.maxMs))",
@@ -884,14 +990,32 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
 
     private func resetWindow(nowNs: UInt64) {
         windowStartNs = nowNs
+        lastScrollStateChangeNs = nowNs
+        scrollingDurationNs = 0
         snapshotReceivedCount = 0
+        snapshotReceivedScrollingCount = 0
+        snapshotReceivedIdleCount = 0
         snapshotAppliedCount = 0
         fullRowsRebuildCount = 0
+        fullRowsRebuildScrollingCount = 0
+        fullRowsRebuildIdleCount = 0
+        contentOnlyFastPathCount = 0
         incrementalRowsBuildCount = 0
         buildRowsDurationMs = DurationAggregate()
         applyWindowMessagesDurationMs = DurationAggregate()
         textRenderDurationMs = DurationAggregate()
         avatarThumbDurationMs = DurationAggregate()
+    }
+
+    private func accumulateScrollingDuration(until nowNs: UInt64) {
+        guard nowNs >= lastScrollStateChangeNs else {
+            lastScrollStateChangeNs = nowNs
+            return
+        }
+        if isLiveScrolling {
+            scrollingDurationNs += nowNs - lastScrollStateChangeNs
+        }
+        lastScrollStateChangeNs = nowNs
     }
 
     private func appendRateSample(_ samples: inout [Double], value: Double) {

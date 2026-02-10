@@ -18,6 +18,8 @@ final class ChatMessagesViewModel: ObservableObject {
     private let chatId: Int64
     private let windowSize: Int
     private var streamTask: Task<Void, Never>?
+    private var coalesceLatestApplyTask: Task<Void, Never>?
+    private var pendingLatestSnapshot: [TGMessage]?
 
     init(store: TelegramStore, chatId: Int64, windowSize: Int = 160) {
         self.store = store
@@ -29,10 +31,14 @@ final class ChatMessagesViewModel: ObservableObject {
 
     deinit {
         streamTask?.cancel()
+        coalesceLatestApplyTask?.cancel()
     }
 
     private func startStreaming() {
         streamTask?.cancel()
+        coalesceLatestApplyTask?.cancel()
+        coalesceLatestApplyTask = nil
+        pendingLatestSnapshot = nil
         isBootstrapping = true
 
         let chatId = self.chatId
@@ -46,25 +52,52 @@ final class ChatMessagesViewModel: ObservableObject {
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 ChatPerfTrace.recordSnapshotReceived(chatId: chatId)
+                let shouldCoalesceLatest = ChatPerfTrace.shouldCoalesceLatest(chatId: chatId)
 
                 await MainActor.run { [weak self] in
                     guard let self else { return }
 #if DEBUG
                     self.snapshotReceivedCount += 1
 #endif
-                    if self.messages == snapshot {
-                        if self.isBootstrapping {
-                            self.isBootstrapping = false
-                        }
-                        return
-                    }
-                    self.messages = snapshot
-                    ChatPerfTrace.recordSnapshotApplied(chatId: chatId)
-                    if self.isBootstrapping {
-                        self.isBootstrapping = false
+                    if shouldCoalesceLatest {
+                        self.enqueueLatestSnapshot(snapshot, chatId: chatId)
+                    } else {
+                        self.applySnapshot(snapshot, chatId: chatId)
                     }
                 }
             }
+        }
+    }
+
+    @MainActor
+    private func enqueueLatestSnapshot(_ snapshot: [TGMessage], chatId: Int64) {
+        pendingLatestSnapshot = snapshot
+        guard coalesceLatestApplyTask == nil else { return }
+
+        coalesceLatestApplyTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                guard let latest = self.pendingLatestSnapshot else { break }
+                self.pendingLatestSnapshot = nil
+                self.applySnapshot(latest, chatId: chatId)
+                await Task.yield()
+            }
+            self.coalesceLatestApplyTask = nil
+        }
+    }
+
+    @MainActor
+    private func applySnapshot(_ snapshot: [TGMessage], chatId: Int64) {
+        if messages == snapshot {
+            if isBootstrapping {
+                isBootstrapping = false
+            }
+            return
+        }
+        messages = snapshot
+        ChatPerfTrace.recordSnapshotApplied(chatId: chatId)
+        if isBootstrapping {
+            isBootstrapping = false
         }
     }
 }

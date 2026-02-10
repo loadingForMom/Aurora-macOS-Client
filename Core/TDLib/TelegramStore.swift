@@ -657,6 +657,17 @@ final class TelegramStore: ObservableObject {
         }
     }
 
+    func updateMessageWindowFocus(chatId: Int64, isFollowingLatest: Bool, anchorMessageId: Int64?) {
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            _ = await self.messageStore.setWindowFocus(
+                chatId: chatId,
+                isFollowingLatest: isFollowingLatest,
+                anchorMessageId: anchorMessageId
+            )
+        }
+    }
+
     func primeMessageStore(chatId: Int64, limit: Int) async {
         let fetched = databaseRepository.fetchLatestMessages(chatId: chatId, limit: limit)
         guard !fetched.isEmpty else {
@@ -1480,6 +1491,24 @@ actor MessageStore {
         let visibleCount: Int
     }
 
+    struct DebugWindowSnapshot: Sendable {
+        let windowLimit: Int
+        let orderedCount: Int
+        let modelsCount: Int
+        let visibleCount: Int
+    }
+
+    struct WindowFocusState: Sendable, Equatable {
+        let isFollowingLatest: Bool
+        let anchorMessageId: Int64?
+    }
+
+    private struct MergeInsertionDelta {
+        var prepended: Int = 0
+        var appended: Int = 0
+        var interior: Int = 0
+    }
+
     private struct ChatState {
         var messagesById: [Int64: TGMessage] = [:]
         var orderedMessageIds: [Int64] = []
@@ -1492,13 +1521,23 @@ actor MessageStore {
     private let log = Logger(subsystem: "com.aurora.app", category: "message.store")
     private let publishDebounceNs: UInt64
     private let maxMessagesPerChat: Int
+    private let slidingWindowHardCap: Int
+    private let followingLatestLowWatermarkGap: Int
     private let sortBias: Int64 = 9_000_000_000_000_000_000
     private var chatStateById: [Int64: ChatState] = [:]
+    private var windowFocusByChatId: [Int64: WindowFocusState] = [:]
     private var mutationCount = 0
 
-    init(publishDebounceMs: UInt64 = 33, maxMessagesPerChat: Int = 6_000) {
+    init(
+        publishDebounceMs: UInt64 = 33,
+        maxMessagesPerChat: Int = 6_000,
+        slidingWindowHardCap: Int = 600,
+        followingLatestLowWatermarkGap: Int = 40
+    ) {
         self.publishDebounceNs = publishDebounceMs * 1_000_000
         self.maxMessagesPerChat = maxMessagesPerChat
+        self.slidingWindowHardCap = max(40, slidingWindowHardCap)
+        self.followingLatestLowWatermarkGap = max(0, followingLatestLowWatermarkGap)
     }
 
     func historyTraceSnapshot(chatId: Int64) -> HistoryTraceSnapshot {
@@ -1534,6 +1573,46 @@ actor MessageStore {
         )
     }
 
+    func debugWindowSnapshot(chatId: Int64) -> DebugWindowSnapshot {
+        guard var chat = chatStateById[chatId] else {
+            return DebugWindowSnapshot(
+                windowLimit: 160,
+                orderedCount: 0,
+                modelsCount: 0,
+                visibleCount: 0
+            )
+        }
+        normalizeOrderedIdsIfNeeded(chat: &chat)
+        chatStateById[chatId] = chat
+        let visibleCount = snapshot(for: chat).count
+        return DebugWindowSnapshot(
+            windowLimit: chat.windowLimit,
+            orderedCount: chat.orderedMessageIds.count,
+            modelsCount: chat.messagesById.count,
+            visibleCount: visibleCount
+        )
+    }
+
+    func setWindowFocus(chatId: Int64, isFollowingLatest: Bool, anchorMessageId: Int64?) -> Bool {
+        let normalizedAnchor = anchorMessageId.flatMap { $0 > 0 ? $0 : nil }
+        let focus = WindowFocusState(
+            isFollowingLatest: isFollowingLatest,
+            anchorMessageId: normalizedAnchor
+        )
+        if windowFocusByChatId[chatId] == focus {
+            return false
+        }
+        windowFocusByChatId[chatId] = focus
+        guard var chat = chatStateById[chatId] else { return true }
+        normalizeOrderedIdsIfNeeded(chat: &chat)
+        let trimmed = trimToSlidingWindowIfNeeded(chatId: chatId, chat: &chat, delta: nil)
+        chatStateById[chatId] = chat
+        if trimmed {
+            schedulePublish(chatId: chatId)
+        }
+        return true
+    }
+
     func subscribe(chatId: Int64, windowLimit: Int) -> AsyncStream<[TGMessage]> {
         let id = UUID()
         return AsyncStream<[TGMessage]>(bufferingPolicy: .bufferingNewest(1)) { continuation in
@@ -1554,6 +1633,7 @@ actor MessageStore {
         let bounded = max(40, min(limit, 5_000))
         guard chat.windowLimit != bounded else { return }
         chat.windowLimit = bounded
+        _ = trimToSlidingWindowIfNeeded(chatId: chatId, chat: &chat, delta: nil)
         chatStateById[chatId] = chat
         schedulePublish(chatId: chatId)
     }
@@ -1573,15 +1653,34 @@ actor MessageStore {
             chat.windowLimit = max(chat.windowLimit, min(windowLimit, 5_000))
         }
 
+        let previousMinId = chat.orderedMessageIds.first
+        let previousMaxId = chat.orderedMessageIds.last
+        let previousMinKey = previousMinId.map(orderingKey(for:))
+        let previousMaxKey = previousMaxId.map(orderingKey(for:))
+        var insertionDelta = MergeInsertionDelta()
+
         var changed = 0
         for message in messages where message.chatId == chatId {
+            let existing = chat.messagesById[message.id]
             if upsertMessage(&chat, message: message) {
                 changed += 1
+                guard existing == nil else { continue }
+                let key = orderingKey(for: message.id)
+                if let previousMinKey, key < previousMinKey {
+                    insertionDelta.prepended += 1
+                } else if let previousMaxKey, key > previousMaxKey {
+                    insertionDelta.appended += 1
+                } else if previousMinKey == nil || previousMaxKey == nil {
+                    insertionDelta.appended += 1
+                } else {
+                    insertionDelta.interior += 1
+                }
             }
         }
 
         if changed > 0 {
             pruneIfNeeded(chat: &chat)
+            _ = trimToSlidingWindowIfNeeded(chatId: chatId, chat: &chat, delta: insertionDelta)
         }
         chatStateById[chatId] = chat
         if changed > 0 {
@@ -1647,6 +1746,7 @@ actor MessageStore {
             chat.publishTask?.cancel()
         }
         chatStateById.removeAll(keepingCapacity: false)
+        windowFocusByChatId.removeAll(keepingCapacity: false)
     }
 
     private func attach(
@@ -1658,6 +1758,7 @@ actor MessageStore {
         var chat = chatStateById[chatId] ?? ChatState()
         normalizeOrderedIdsIfNeeded(chat: &chat)
         chat.windowLimit = max(chat.windowLimit, min(windowLimit, 5_000))
+        _ = trimToSlidingWindowIfNeeded(chatId: chatId, chat: &chat, delta: nil)
         chat.continuations[subscriberId] = continuation
         chatStateById[chatId] = chat
         continuation.yield(snapshot(for: chat))
@@ -1764,6 +1865,95 @@ actor MessageStore {
             chat.messagesById.removeValue(forKey: id)
         }
         chat.orderedMessageIds.removeFirst(min(overflow, chat.orderedMessageIds.count))
+    }
+
+    private func trimToSlidingWindowIfNeeded(
+        chatId: Int64,
+        chat: inout ChatState,
+        delta: MergeInsertionDelta?
+    ) -> Bool {
+        let target = max(40, min(chat.windowLimit, slidingWindowHardCap))
+        let count = chat.orderedMessageIds.count
+        guard count > target else { return false }
+
+        let focus = windowFocusByChatId[chatId]
+            ?? WindowFocusState(isFollowingLatest: true, anchorMessageId: nil)
+
+        let overflow = count - target
+        if focus.isFollowingLatest {
+            let preferred = max(40, target - followingLatestLowWatermarkGap)
+            let removal = max(overflow, count - preferred)
+            removePrefix(chat: &chat, count: removal)
+            return true
+        }
+
+        let anchorIndex: Int? = {
+            guard let anchorId = focus.anchorMessageId else { return nil }
+            if let exact = indexOfMessageId(anchorId, in: chat.orderedMessageIds) {
+                return exact
+            }
+            let insertion = insertionIndex(for: anchorId, in: chat.orderedMessageIds)
+            guard insertion < chat.orderedMessageIds.count else {
+                return chat.orderedMessageIds.indices.last
+            }
+            return insertion
+        }()
+
+        guard let anchorIndex else {
+            if let delta, delta.prepended > delta.appended {
+                removeSuffix(chat: &chat, count: overflow)
+            } else {
+                removePrefix(chat: &chat, count: overflow)
+            }
+            return true
+        }
+
+        let anchorOffset: Int = {
+            guard let delta else { return target / 2 }
+            if delta.prepended > delta.appended {
+                return target / 4
+            }
+            if delta.appended > delta.prepended {
+                return (target * 3) / 4
+            }
+            return target / 2
+        }()
+
+        let maxStart = max(0, count - target)
+        let unclampedStart = anchorIndex - anchorOffset
+        let keepStart = min(max(0, unclampedStart), maxStart)
+        let keepEnd = keepStart + target
+        let removeHeadCount = keepStart
+        let removeTailCount = max(0, count - keepEnd)
+        if removeHeadCount > 0 {
+            removePrefix(chat: &chat, count: removeHeadCount)
+        }
+        if removeTailCount > 0 {
+            removeSuffix(chat: &chat, count: removeTailCount)
+        }
+        return true
+    }
+
+    private func removePrefix(chat: inout ChatState, count: Int) {
+        guard count > 0 else { return }
+        let bounded = min(count, chat.orderedMessageIds.count)
+        guard bounded > 0 else { return }
+        let ids = chat.orderedMessageIds.prefix(bounded)
+        for id in ids {
+            chat.messagesById.removeValue(forKey: id)
+        }
+        chat.orderedMessageIds.removeFirst(bounded)
+    }
+
+    private func removeSuffix(chat: inout ChatState, count: Int) {
+        guard count > 0 else { return }
+        let bounded = min(count, chat.orderedMessageIds.count)
+        guard bounded > 0 else { return }
+        let ids = chat.orderedMessageIds.suffix(bounded)
+        for id in ids {
+            chat.messagesById.removeValue(forKey: id)
+        }
+        chat.orderedMessageIds.removeLast(bounded)
     }
 
     private func upsertMessage(_ chat: inout ChatState, message: TGMessage) -> Bool {

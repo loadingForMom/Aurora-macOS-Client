@@ -11,6 +11,7 @@ struct ChatMessageGroupView: View {
     let chat: TGChat
     let group: MessageGroup
     let optimizeForLargeTimeline: Bool
+    let isScrolling: Bool
     let onMessageAppear: (Int64) -> Void
     let onMessageDisappear: (Int64) -> Void
 
@@ -25,6 +26,7 @@ struct ChatMessageGroupView: View {
         chat: TGChat,
         group: MessageGroup,
         optimizeForLargeTimeline: Bool = false,
+        isScrolling: Bool = false,
         revealTimeX: CGFloat = 0,
         jellyScrollImpulse: CGFloat = 0,
         onMessageAppear: @escaping (Int64) -> Void = { _ in },
@@ -34,6 +36,7 @@ struct ChatMessageGroupView: View {
         self.chat = chat
         self.group = group
         self.optimizeForLargeTimeline = optimizeForLargeTimeline
+        self.isScrolling = isScrolling
         self.revealTimeX = revealTimeX
         self.jellyScrollImpulse = jellyScrollImpulse
         self.onMessageAppear = onMessageAppear
@@ -41,6 +44,7 @@ struct ChatMessageGroupView: View {
     }
 
     var body: some View {
+        let lightweightRenderMode = optimizeForLargeTimeline || isScrolling
         let enableJelly = abs(jellyScrollImpulse) > 0.5
             && group.messages.count < 60
         let stretch = enableJelly ? (1 + min(abs(jellyScrollImpulse) / 320, 0.18)) : 1
@@ -63,7 +67,8 @@ struct ChatMessageGroupView: View {
                         msg: msg,
                         currentChatId: chat.id,
                         revealTimeX: revealTimeX,
-                        optimizeForPerformance: optimizeForLargeTimeline,
+                        optimizeForPerformance: lightweightRenderMode,
+                        isScrolling: isScrolling,
                         onRetry: { store.retrySend(message: msg) },
                         onDelete: { store.deleteMessages(chatId: msg.chatId, messageIds: [msg.id], revoke: true) }
                     )
@@ -81,5 +86,11 @@ struct ChatMessageGroupView: View {
         .padding(.vertical, 2)
         .scaleEffect(x: 1, y: stretch, anchor: .bottom)
         .offset(y: y)
+        .transaction { transaction in
+            if isScrolling {
+                transaction.disablesAnimations = true
+                transaction.animation = nil
+            }
+        }
     }
 }

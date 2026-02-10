@@ -8,6 +8,7 @@
 import SwiftUI
 import Foundation
 import AppKit
+import OSLog
 
 struct MessagesPane: View {
     @ObservedObject var store: TelegramStore
@@ -47,16 +48,24 @@ struct MessagesPane: View {
     @State private var isTopSentinelVisible: Bool = false
     @State private var pendingTopVisibleRetryAfterLoading: Bool = false
     @State private var isLiveScrolling: Bool = false
+    @State private var isLightweightScrollRenderMode: Bool = false
+    @State private var lightweightScrollRenderModeResetTask: Task<Void, Never>? = nil
+    @State private var windowingDebugTask: Task<Void, Never>? = nil
+    @State private var windowFocusSyncTask: Task<Void, Never>? = nil
     private let groupGap: Int = 5 * 60
     private let majorGap: Int = 60 * 60
     private let autoScrollAnimationCooldownNs: UInt64 = 220_000_000
+    private let lightweightRenderModeResetDelayNs: UInt64 = 120_000_000
     private let paginationTopThreshold: CGFloat = 260
     private let heavyEffectsCutoffMessages: Int = 700
     private let textPrewarmBudget: Int = 150
     private let revealTimeMaxX: CGFloat = 72
+    private let windowingDebugIntervalNs: UInt64 = 2_000_000_000
+    private let windowFocusSyncDelayNs: UInt64 = 120_000_000
 
     private static let rowBuildWorker = RowsBuildWorker()
     private let scrollSpaceName = "messages-scroll-space"
+    private let windowingLog = Logger(subsystem: "com.aurora.app", category: "chat.windowing")
 
     private var topSentinelId: String { "top:\(chat.id)" }
     private var bottomSentinelId: String { "bottom:\(chat.id)" }
@@ -407,7 +416,7 @@ struct MessagesPane: View {
         MessageTextPipeline.enqueuePrewarm(chatId: chat.id, messages: candidates, style: .bubbleBody)
     }
 
-    nonisolated private static func updatedMessagesByIdForInPlaceUpdate(
+    nonisolated private static func updatedMessagesByIdForContentOnlyUpdate(
         previousMessages: [TGMessage],
         newMessages: [TGMessage]
     ) -> [Int64: TGMessage]? {
@@ -421,12 +430,6 @@ struct MessagesPane: View {
             guard oldMessage.id == newMessage.id else { return nil }
             if oldMessage == newMessage {
                 continue
-            }
-            // Changes that can affect row grouping/layout require full rebuild.
-            if oldMessage.date != newMessage.date ||
-                oldMessage.senderUserId != newMessage.senderUserId ||
-                oldMessage.isOutgoing != newMessage.isOutgoing {
-                return nil
             }
             updatedById[newMessage.id] = newMessage
         }
@@ -482,10 +485,29 @@ struct MessagesPane: View {
     }
 
     @MainActor
+    private func topVisibleMessageIdForPrependAnchor() -> Int64? {
+        guard !visibleMessageIds.isEmpty else { return nil }
+        for message in windowMessages where message.id > 0 {
+            if visibleMessageIds.contains(message.id) {
+                return message.id
+            }
+        }
+        return nil
+    }
+
+    @MainActor
     private func clearPrependPixelAnchor() {
         prependAnchorMessageId = nil
         prependAnchorRowId = nil
         prependAnchorMinYBefore = nil
+    }
+
+    @MainActor
+    private func hasPrependPixelMeasurement(anchorMessageId: Int64) -> Bool {
+        guard prependAnchorMessageId == anchorMessageId else { return false }
+        guard prependAnchorMinYBefore != nil else { return false }
+        guard let currentRowId = Self.rowIdContainingMessage(anchorMessageId, rows: rows) else { return false }
+        return groupRowMinYById[currentRowId] != nil
     }
 
     @MainActor
@@ -516,6 +538,8 @@ struct MessagesPane: View {
         rowBuildTask?.cancel()
         rowBuildTask = nil
         rowBuildToken = UUID()
+        stopWindowingDebugLogging(reason: "reset")
+        cancelWindowFocusSyncTask()
 
         rows = []
         windowMessages = []
@@ -537,6 +561,7 @@ struct MessagesPane: View {
         visibleReportTask = nil
         visibleMessageIds = []
         store.resetVisibleMessageTracking(chatId: chat.id)
+        store.updateMessageWindowFocus(chatId: chat.id, isFollowingLatest: true, anchorMessageId: nil)
 
         didInitialScrollToBottom = false
 
@@ -546,6 +571,9 @@ struct MessagesPane: View {
         lastTopSentinelMinY = -.greatestFiniteMagnitude
         isTopSentinelVisible = false
         pendingTopVisibleRetryAfterLoading = false
+        lightweightScrollRenderModeResetTask?.cancel()
+        lightweightScrollRenderModeResetTask = nil
+        isLightweightScrollRenderMode = false
     }
 
     @MainActor
@@ -555,7 +583,7 @@ struct MessagesPane: View {
         let applyWindowStartNs = traceEnabled ? DispatchTime.now().uptimeNanoseconds : 0
         let applySignpostId = ChatPerfTrace.beginSignpost("applyWindowMessages", chatId: expectedChatId)
         let filteredMessages = messages.filter { $0.chatId == expectedChatId }
-        let newMessageIds = filteredMessages.map(\.id)
+        let currentIds = filteredMessages.map(\.id)
         let token = UUID()
         let previousMessages = windowMessages
         let previousRows = rows
@@ -566,19 +594,19 @@ struct MessagesPane: View {
         rowBuildTask?.cancel()
         rowBuildTask = nil
 
-        if previousMessageIds == newMessageIds,
-           let updatedMessagesById = Self.updatedMessagesByIdForInPlaceUpdate(
+        if previousMessageIds.elementsEqual(currentIds) {
+            let updatedMessagesById = Self.updatedMessagesByIdForContentOnlyUpdate(
                 previousMessages: previousMessages,
                 newMessages: filteredMessages
-           ) {
+            ) ?? [:]
             if !updatedMessagesById.isEmpty {
-                rows = Self.patchRowsForUpdatedMessages(
-                    previousRows: previousRows,
-                    updatedMessagesById: updatedMessagesById
-                )
+                rows = Self.patchRowsForUpdatedMessages(previousRows: previousRows, updatedMessagesById: updatedMessagesById)
             }
             windowMessages = filteredMessages
-            previousMessageIds = newMessageIds
+            previousMessageIds = currentIds
+            if traceEnabled {
+                ChatPerfTrace.recordContentOnlyFastPath(chatId: expectedChatId)
+            }
             if traceEnabled {
                 let applyWindowMessagesDurationMs = ChatPerfTrace.elapsedMs(since: applyWindowStartNs)
                 ChatPerfTrace.recordApplyWindowMessages(chatId: expectedChatId, durationMs: applyWindowMessagesDurationMs)
@@ -665,10 +693,21 @@ struct MessagesPane: View {
             return false
         }
 
-        preparePrependPixelAnchor(messageId: anchorMessageId)
-        pendingRestoreAnchorMessageId = anchorMessageId
+        let pixelAnchorMessageId =
+            pendingRestoreAnchorMessageId ??
+            prependAnchorMessageId ??
+            topVisibleMessageIdForPrependAnchor() ??
+            anchorMessageId
+
+        preparePrependPixelAnchor(messageId: pixelAnchorMessageId)
+        pendingRestoreAnchorMessageId = pixelAnchorMessageId
         paginationBaselineFirstMessageId = anchorMessageId
         lastRequestedTopAnchorMessageId = anchorMessageId
+        store.updateMessageWindowFocus(
+            chatId: chat.id,
+            isFollowingLatest: false,
+            anchorMessageId: pixelAnchorMessageId
+        )
         // Keep viewport stable while prepending older messages.
         restoreAnchorAfterPaging = true
         pagingInFlight = true
@@ -794,6 +833,7 @@ struct MessagesPane: View {
             guard visibleMessageIds.remove(messageId) != nil else { return }
         }
         scheduleVisibleMessagesReport()
+        scheduleWindowFocusSync()
     }
 
     @MainActor
@@ -803,6 +843,7 @@ struct MessagesPane: View {
         guard pruned != visibleMessageIds else { return }
         visibleMessageIds = pruned
         scheduleVisibleMessagesReport()
+        scheduleWindowFocusSync()
     }
 
     @MainActor
@@ -833,6 +874,119 @@ struct MessagesPane: View {
                 messageIds: currentIds
             )
         }
+    }
+
+    @MainActor
+    private func anchorMessageIdForWindowFocus() -> Int64? {
+        if let pendingRestoreAnchorMessageId, pendingRestoreAnchorMessageId > 0 {
+            return pendingRestoreAnchorMessageId
+        }
+
+        let visibleInOrder = windowMessages.compactMap { message -> Int64? in
+            guard message.id > 0 else { return nil }
+            guard visibleMessageIds.contains(message.id) else { return nil }
+            return message.id
+        }
+        if !visibleInOrder.isEmpty {
+            return visibleInOrder[visibleInOrder.count / 2]
+        }
+
+        if let topVisible = topVisibleMessageIdForPrependAnchor(), topVisible > 0 {
+            return topVisible
+        }
+        return windowMessages.last(where: { $0.id > 0 })?.id
+    }
+
+    @MainActor
+    private func cancelWindowFocusSyncTask() {
+        windowFocusSyncTask?.cancel()
+        windowFocusSyncTask = nil
+    }
+
+    @MainActor
+    private func scheduleWindowFocusSync() {
+        cancelWindowFocusSyncTask()
+
+        let chatId = chat.id
+        let isFollowingLatest = isAtBottom
+        let anchorMessageId = isFollowingLatest ? nil : anchorMessageIdForWindowFocus()
+        windowFocusSyncTask = Task { @MainActor [chatId, isFollowingLatest, anchorMessageId] in
+            try? await Task.sleep(nanoseconds: windowFocusSyncDelayNs)
+            guard !Task.isCancelled else { return }
+            store.updateMessageWindowFocus(
+                chatId: chatId,
+                isFollowingLatest: isFollowingLatest,
+                anchorMessageId: anchorMessageId
+            )
+            windowFocusSyncTask = nil
+        }
+    }
+
+    @MainActor
+    private func updateLightweightScrollRenderMode(isScrolling: Bool) {
+        if isScrolling {
+            lightweightScrollRenderModeResetTask?.cancel()
+            lightweightScrollRenderModeResetTask = nil
+            if !isLightweightScrollRenderMode {
+                isLightweightScrollRenderMode = true
+            }
+            return
+        }
+
+        lightweightScrollRenderModeResetTask?.cancel()
+        lightweightScrollRenderModeResetTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: lightweightRenderModeResetDelayNs)
+            guard !Task.isCancelled else { return }
+            guard !isLiveScrolling else { return }
+            isLightweightScrollRenderMode = false
+            lightweightScrollRenderModeResetTask = nil
+        }
+    }
+
+    @MainActor
+    private func startWindowingDebugLogging() {
+#if DEBUG
+        stopWindowingDebugLogging()
+        let chatId = chat.id
+        windowingDebugTask = Task { @MainActor [chatId] in
+            await emitWindowingDebugLog(reason: "start", chatId: chatId)
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: windowingDebugIntervalNs)
+                guard !Task.isCancelled else { return }
+                await emitWindowingDebugLog(reason: "tick", chatId: chatId)
+            }
+        }
+#endif
+    }
+
+    @MainActor
+    private func stopWindowingDebugLogging(reason: String = "stop") {
+#if DEBUG
+        guard windowingDebugTask != nil else { return }
+        Task { @MainActor in
+            await emitWindowingDebugLog(reason: reason, chatId: chat.id)
+        }
+        windowingDebugTask?.cancel()
+        windowingDebugTask = nil
+#else
+        _ = reason
+#endif
+    }
+
+    @MainActor
+    private func emitWindowingDebugLog(reason: String, chatId: Int64) async {
+#if DEBUG
+        let uiRowsCount = rows.count
+        let uiMessagesCount = windowMessages.count
+        let visibleCount = visibleMessageIds.count
+        let snapshot = await store.messageStore.debugWindowSnapshot(chatId: chatId)
+        windowingLog.debug(
+            "chat window metrics chatId=\(chatId, privacy: .public) reason=\(reason, privacy: .public) isLiveScrolling=\(isLiveScrolling, privacy: .public) windowLimit=\(snapshot.windowLimit, privacy: .public) storeWindowCount=\(snapshot.orderedCount, privacy: .public) storeModelsCount=\(snapshot.modelsCount, privacy: .public) uiRowsCount=\(uiRowsCount, privacy: .public) uiMessagesCount=\(uiMessagesCount, privacy: .public) visibleCount=\(visibleCount, privacy: .public) storeVisibleCount=\(snapshot.visibleCount, privacy: .public)"
+        )
+#else
+        _ = reason
+        _ = chatId
+#endif
     }
 
     @MainActor
@@ -892,7 +1046,9 @@ struct MessagesPane: View {
                 } else {
                     DispatchQueue.main.async {
                         if !restorePrependPixelOffsetIfPossible(anchorMessageId: anchorId) {
-                            scrollToMessageTop(proxy, messageId: anchorId)
+                            if !hasPrependPixelMeasurement(anchorMessageId: anchorId) {
+                                scrollToMessageTop(proxy, messageId: anchorId)
+                            }
                         }
                         clearPrependPixelAnchor()
                     }
@@ -961,6 +1117,7 @@ struct MessagesPane: View {
                 chat: chat,
                 group: group,
                 optimizeForLargeTimeline: optimizeBubbleEffectsNow,
+                isScrolling: isLightweightScrollRenderMode,
                 revealTimeX: revealTimeX,
                 jellyScrollImpulse: 0,
                 onMessageAppear: { messageId in
@@ -1097,6 +1254,9 @@ struct MessagesPane: View {
             )
             .task(id: chat.id) {
                 resetStateForChat()
+                ChatPerfTrace.recordScrollState(chatId: chat.id, isScrolling: isLiveScrolling)
+                updateLightweightScrollRenderMode(isScrolling: isLiveScrolling)
+                startWindowingDebugLogging()
                 applyWindowMessages(viewModel.messages)
             }
             .onPreferenceChange(ContentMinYPreferenceKey.self) { minY in
@@ -1109,6 +1269,19 @@ struct MessagesPane: View {
             .onChange(of: viewModel.messages) { _, newMessages in
                 applyWindowMessages(newMessages)
             }
+            .onChange(of: isAtBottom) { _, _ in
+                scheduleWindowFocusSync()
+            }
+            .onChange(of: isLiveScrolling) { _, isScrolling in
+                ChatPerfTrace.recordScrollState(chatId: chat.id, isScrolling: isScrolling)
+                updateLightweightScrollRenderMode(isScrolling: isScrolling)
+                Task { @MainActor in
+                    await emitWindowingDebugLog(
+                        reason: isScrolling ? "scrollStart" : "scrollEnd",
+                        chatId: chat.id
+                    )
+                }
+            }
             .onChange(of: windowMessages) { oldMessages, newMessages in
                 pruneVisibleMessageIdsToWindow()
                 handleWindowMessagesChange(
@@ -1116,6 +1289,7 @@ struct MessagesPane: View {
                     newMessages: newMessages,
                     proxy: proxy
                 )
+                scheduleWindowFocusSync()
                 scheduleTextPrewarm(messages: newMessages)
                 maybeRequestOlderForUnderfilledViewport(source: "windowMessagesChanged")
             }
@@ -1141,6 +1315,13 @@ struct MessagesPane: View {
                 isPagingHistory = false
                 clearPrependPixelAnchor()
                 scrollViewRef.scrollView = nil
+                ChatPerfTrace.recordScrollState(chatId: chat.id, isScrolling: false)
+                stopWindowingDebugLogging(reason: "disappear")
+                cancelWindowFocusSyncTask()
+                store.updateMessageWindowFocus(chatId: chat.id, isFollowingLatest: true, anchorMessageId: nil)
+                lightweightScrollRenderModeResetTask?.cancel()
+                lightweightScrollRenderModeResetTask = nil
+                isLightweightScrollRenderMode = false
                 visibleReportTask?.cancel()
                 visibleReportTask = nil
                 visibleMessageIds = []
