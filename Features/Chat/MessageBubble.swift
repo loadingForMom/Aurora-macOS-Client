@@ -322,7 +322,9 @@ private struct MessageMediaAttachmentView: View {
     }
 
     private var taskId: String {
-        "\(chatId):\(messageId):\(descriptor.kind.rawValue):\(descriptor.width)x\(descriptor.height):\(descriptor.thumbnail?.fileId ?? 0):\(descriptor.media?.fileId ?? 0):\(perfMode ? 1 : 0)"
+        let size = placeholderSize
+        let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+        return "\(chatId):\(messageId):\(descriptor.kind.rawValue):\(descriptor.width)x\(descriptor.height):\(descriptor.thumbnail?.fileId ?? 0):\(descriptor.media?.fileId ?? 0):\(perfMode ? 1 : 0):\(Int(size.width.rounded()))x\(Int(size.height.rounded()))@\(Int((scale * 100).rounded()))"
     }
 
     private var placeholderSize: CGSize {
@@ -384,12 +386,25 @@ private struct MessageMediaAttachmentView: View {
         .frame(width: size.width, height: size.height)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .task(id: taskId) {
-            let state = await store.ensureMediaThumbnail(
-                chatId: chatId,
-                messageId: messageId,
-                descriptor: descriptor,
-                preferThumbnailOnly: perfMode
-            )
+            let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+            let state: TGMediaState
+            if perfMode {
+                state = await store.ensureMediaThumbnail(
+                    chatId: chatId,
+                    messageId: messageId,
+                    descriptor: descriptor,
+                    targetPointSize: size,
+                    screenScale: scale
+                )
+            } else {
+                state = await store.ensureMediaImage(
+                    chatId: chatId,
+                    messageId: messageId,
+                    descriptor: descriptor,
+                    targetPointSize: size,
+                    screenScale: scale
+                )
+            }
             scheduleImageLoad(path: state.thumbnailPath)
         }
         .onChange(of: mediaState?.thumbnailPath) { _, newPath in

@@ -624,9 +624,10 @@ struct MessagesPane: View {
         guard !requests.isEmpty else { return }
 
         let chatId = chat.id
-        let preferThumbnailOnly = isLiveScrolling || isLightweightScrollRenderMode
         let mediaService = store.mediaService
         let maxConcurrency = mediaPrefetchMaxConcurrency
+        let targetPointSize = CGSize(width: 240, height: 240)
+        let screenScale = NSScreen.main?.backingScaleFactor ?? 2.0
 
         mediaPrefetchTask = Task.detached(priority: .utility) {
             let workerCount = max(1, min(maxConcurrency, requests.count))
@@ -641,7 +642,8 @@ struct MessagesPane: View {
                                 chatId: chatId,
                                 messageId: request.messageId,
                                 descriptor: request.descriptor,
-                                preferThumbnailOnly: preferThumbnailOnly
+                                targetPointSize: targetPointSize,
+                                screenScale: screenScale
                             )
                             index += workerCount
                             if index.isMultiple(of: 8) {

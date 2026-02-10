@@ -680,10 +680,20 @@ extension TelegramStore {
         guard let photo = content["photo"] as? [String: Any] else { return nil }
         guard let sizeItems = photo["sizes"] as? [[String: Any]], !sizeItems.isEmpty else { return nil }
 
-        let sortedSizes = sizeItems.sorted {
-            let lhsArea = ((($0["width"] as? NSNumber)?.intValue ?? 0) * (($0["height"] as? NSNumber)?.intValue ?? 0))
-            let rhsArea = ((($1["width"] as? NSNumber)?.intValue ?? 0) * (($1["height"] as? NSNumber)?.intValue ?? 0))
-            return lhsArea < rhsArea
+        let parsedSizes: [TGMessagePhotoSize] = sizeItems.compactMap { item in
+            let width = (item["width"] as? NSNumber)?.intValue ?? 0
+            let height = (item["height"] as? NSNumber)?.intValue ?? 0
+            guard width > 0, height > 0 else { return nil }
+            guard let fileObj = item["photo"] as? [String: Any] else { return nil }
+            guard let file = parseMediaFile(fileObj) else { return nil }
+            return TGMessagePhotoSize(file: file, width: width, height: height)
+        }
+        guard !parsedSizes.isEmpty else { return nil }
+
+        let sortedSizes = parsedSizes.sorted {
+            if $0.width != $1.width { return $0.width < $1.width }
+            if $0.height != $1.height { return $0.height < $1.height }
+            return $0.file.fileId < $1.file.fileId
         }
 
         var thumbFile: TGMessageMediaFile? = nil
@@ -692,22 +702,18 @@ extension TelegramStore {
         var height = 0
 
         if let smallest = sortedSizes.first {
-            if let file = smallest["photo"] as? [String: Any] {
-                thumbFile = parseMediaFile(file)
-            }
+            thumbFile = smallest.file
         }
 
         if let largest = sortedSizes.last {
-            width = (largest["width"] as? NSNumber)?.intValue ?? 0
-            height = (largest["height"] as? NSNumber)?.intValue ?? 0
-            if let file = largest["photo"] as? [String: Any] {
-                mediaFile = parseMediaFile(file)
-            }
+            width = largest.width
+            height = largest.height
+            mediaFile = largest.file
         }
 
         if width <= 0 || height <= 0 {
-            width = (sortedSizes.first?["width"] as? NSNumber)?.intValue ?? 0
-            height = (sortedSizes.first?["height"] as? NSNumber)?.intValue ?? 0
+            width = sortedSizes.first?.width ?? 0
+            height = sortedSizes.first?.height ?? 0
         }
         if width <= 0 { width = 4 }
         if height <= 0 { height = 3 }
@@ -718,7 +724,8 @@ extension TelegramStore {
             width: width,
             height: height,
             thumbnail: thumbFile,
-            media: mediaFile
+            media: mediaFile,
+            photoSizes: sortedSizes
         )
     }
 
@@ -753,7 +760,8 @@ extension TelegramStore {
             width: width,
             height: height,
             thumbnail: thumbFile,
-            media: mediaFile
+            media: mediaFile,
+            photoSizes: []
         )
     }
 

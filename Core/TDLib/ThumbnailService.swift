@@ -38,6 +38,26 @@ actor MediaService {
     typealias DownloadScheduler = (Int32, Int, String) -> Void
     typealias StatePublisher = @MainActor (TGMessageMediaKey, TGMediaState?) -> Void
 
+    private enum RenderMode: Hashable, Sendable {
+        case thumbnailOnly
+        case bestForTarget
+    }
+
+    private struct RenderRequest: Hashable, Sendable {
+        let mode: RenderMode
+        let targetWidthPx: Int
+        let targetHeightPx: Int
+    }
+
+    private struct ResolvedImage: Hashable, Sendable {
+        let path: String
+        let sourceFileId: Int32
+        let selectedWidthPx: Int
+        let selectedHeightPx: Int
+        let maxPixel: Int
+        let mode: RenderMode
+    }
+
     private struct FileSnapshot {
         let fileId: Int32
         let localPath: String?
@@ -57,6 +77,7 @@ actor MediaService {
         let path: String
         let fileId: Int32
         let fromThumbnail: Bool
+        let sizePx: CGSize?
     }
 
     private let log = Logger(subsystem: "com.aurora.app", category: "media.service")
@@ -64,13 +85,12 @@ actor MediaService {
     private let imageMemCache = ImageMemCache(countLimit: 384)
     private let scheduleDownload: DownloadScheduler
     private let publishState: StatePublisher
-    private let thumbMaxPixelNormal = 520
     private let thumbMaxPixelLightweight = 280
 
     private var descriptorByKey: [TGMessageMediaKey: TGMessageMediaDescriptor] = [:]
     private var stateByKey: [TGMessageMediaKey: TGMediaState] = [:]
-    private var thumbPathByKey: [TGMessageMediaKey: String] = [:]
-    private var preferThumbOnlyByKey: [TGMessageMediaKey: Bool] = [:]
+    private var resolvedImageByKey: [TGMessageMediaKey: ResolvedImage] = [:]
+    private var requestByKey: [TGMessageMediaKey: RenderRequest] = [:]
     private var fileStateById: [Int32: TGFileUpdate] = [:]
     private var keysByFileId: [Int32: Set<TGMessageMediaKey>] = [:]
     private var requestedDownloadFileIds: Set<Int32> = []
@@ -86,8 +106,8 @@ actor MediaService {
     func reset() async {
         descriptorByKey.removeAll(keepingCapacity: false)
         stateByKey.removeAll(keepingCapacity: false)
-        thumbPathByKey.removeAll(keepingCapacity: false)
-        preferThumbOnlyByKey.removeAll(keepingCapacity: false)
+        resolvedImageByKey.removeAll(keepingCapacity: false)
+        requestByKey.removeAll(keepingCapacity: false)
         fileStateById.removeAll(keepingCapacity: false)
         keysByFileId.removeAll(keepingCapacity: false)
         requestedDownloadFileIds.removeAll(keepingCapacity: false)
@@ -100,8 +120,8 @@ actor MediaService {
         for key in keysToRemove {
             descriptorByKey.removeValue(forKey: key)
             stateByKey.removeValue(forKey: key)
-            thumbPathByKey.removeValue(forKey: key)
-            preferThumbOnlyByKey.removeValue(forKey: key)
+            resolvedImageByKey.removeValue(forKey: key)
+            requestByKey.removeValue(forKey: key)
         }
         for fileId in keysByFileId.keys {
             guard var keys = keysByFileId[fileId] else { continue }
@@ -123,13 +143,32 @@ actor MediaService {
         chatId: Int64,
         messageId: Int64,
         descriptor: TGMessageMediaDescriptor,
-        preferThumbnailOnly: Bool
+        targetPointSize: CGSize,
+        screenScale: CGFloat
     ) async -> TGMediaState {
         let key = TGMessageMediaKey(chatId: chatId, messageId: messageId)
-        return await ensureThumbnail(
+        let request = Self.buildRequest(mode: .thumbnailOnly, targetPointSize: targetPointSize, screenScale: screenScale)
+        return await ensureMedia(
             key: key,
             descriptor: descriptor,
-            preferThumbnailOnly: preferThumbnailOnly,
+            request: request,
+            countRequest: true
+        )
+    }
+
+    func ensureImage(
+        chatId: Int64,
+        messageId: Int64,
+        descriptor: TGMessageMediaDescriptor,
+        targetPointSize: CGSize,
+        screenScale: CGFloat
+    ) async -> TGMediaState {
+        let key = TGMessageMediaKey(chatId: chatId, messageId: messageId)
+        let request = Self.buildRequest(mode: .bestForTarget, targetPointSize: targetPointSize, screenScale: screenScale)
+        return await ensureMedia(
+            key: key,
+            descriptor: descriptor,
+            request: request,
             countRequest: true
         )
     }
@@ -144,47 +183,51 @@ actor MediaService {
         guard let keys = keysByFileId[fileUpdate.fileId], !keys.isEmpty else { return }
         for key in keys {
             guard let descriptor = descriptorByKey[key] else { continue }
-            let preferThumbOnly = preferThumbOnlyByKey[key] ?? false
-            _ = await ensureThumbnail(
+            let request = requestByKey[key] ?? RenderRequest(mode: .thumbnailOnly, targetWidthPx: 240, targetHeightPx: 240)
+            _ = await ensureMedia(
                 key: key,
                 descriptor: descriptor,
-                preferThumbnailOnly: preferThumbOnly,
+                request: request,
                 countRequest: false
             )
         }
     }
 
-    private func ensureThumbnail(
+    private func ensureMedia(
         key: TGMessageMediaKey,
         descriptor: TGMessageMediaDescriptor,
-        preferThumbnailOnly: Bool,
+        request: RenderRequest,
         countRequest: Bool
     ) async -> TGMediaState {
         descriptorByKey[key] = descriptor
-        preferThumbOnlyByKey[key] = preferThumbnailOnly
+        requestByKey[key] = request
         registerFiles(for: key, descriptor: descriptor)
         seedFileState(from: descriptor.thumbnail)
         seedFileState(from: descriptor.media)
+        for size in descriptor.photoSizes {
+            seedFileState(from: size.file)
+        }
 
         if countRequest {
             ChatPerfTrace.recordMediaThumbRequest(chatId: key.chatId)
         }
 
-        let resolvedPath: String?
-        if let cachedPath = resolveReadyPath(for: key) {
-            resolvedPath = cachedPath
-        } else {
-            resolvedPath = await prepareThumbnailIfPossible(
-                key: key,
-                descriptor: descriptor,
-                preferThumbnailOnly: preferThumbnailOnly
-            )
-        }
+        let desired = computeDesiredSource(descriptor: descriptor, request: request)
+        let selected = computeSelectedSource(descriptor: descriptor, request: request, desired: desired)
+        let resolvedPath = await resolvePathIfPossible(
+            key: key,
+            descriptor: descriptor,
+            request: request,
+            desired: desired,
+            selected: selected
+        )
 
         scheduleDownloadsIfNeeded(
             key: key,
             descriptor: descriptor,
-            preferThumbnailOnly: preferThumbnailOnly,
+            request: request,
+            desired: desired,
+            selected: selected,
             resolvedPath: resolvedPath
         )
 
@@ -192,7 +235,9 @@ actor MediaService {
             key: key,
             descriptor: descriptor,
             resolvedPath: resolvedPath,
-            preferThumbnailOnly: preferThumbnailOnly
+            request: request,
+            desired: desired,
+            selected: selected
         )
         await publishIfNeeded(state, for: key)
         return state
@@ -219,31 +264,271 @@ actor MediaService {
         )
     }
 
-    private func resolveReadyPath(for key: TGMessageMediaKey) -> String? {
-        guard let current = thumbPathByKey[key], fileExists(path: current) else { return nil }
-        return current
+    private struct PlannedSource: Hashable, Sendable {
+        let file: TGMessageMediaFile
+        let widthPx: Int
+        let heightPx: Int
+        let isThumbnail: Bool
     }
 
-    private func prepareThumbnailIfPossible(
-        key: TGMessageMediaKey,
-        descriptor: TGMessageMediaDescriptor,
-        preferThumbnailOnly: Bool
-    ) async -> String? {
-        guard let source = chooseSourceCandidate(
-            descriptor: descriptor,
-            preferThumbnailOnly: preferThumbnailOnly
-        ) else {
+    nonisolated private static func buildRequest(
+        mode: RenderMode,
+        targetPointSize: CGSize,
+        screenScale: CGFloat
+    ) -> RenderRequest {
+        let scale = max(1, screenScale)
+        let targetWidthPx = max(1, Int((targetPointSize.width * scale).rounded(.up)))
+        let targetHeightPx = max(1, Int((targetPointSize.height * scale).rounded(.up)))
+        return RenderRequest(mode: mode, targetWidthPx: targetWidthPx, targetHeightPx: targetHeightPx)
+    }
+
+    private func maxPixel(for request: RenderRequest) -> Int {
+        let raw: Int = {
+            switch request.mode {
+            case .thumbnailOnly:
+                return thumbMaxPixelLightweight
+            case .bestForTarget:
+                return max(request.targetWidthPx, request.targetHeightPx)
+            }
+        }()
+        return max(32, raw)
+    }
+
+    nonisolated private func bestPhotoSize(
+        forTargetWidthPx targetWidthPx: Int,
+        sizes: [TGMessagePhotoSize]
+    ) -> TGMessagePhotoSize? {
+        guard !sizes.isEmpty else { return nil }
+        for size in sizes where size.width >= targetWidthPx {
+            return size
+        }
+        return sizes.last
+    }
+
+    private func computeDesiredSource(descriptor: TGMessageMediaDescriptor, request: RenderRequest) -> PlannedSource? {
+        switch descriptor.kind {
+        case .photo:
+            let sizes = descriptor.photoSizes
+            guard !sizes.isEmpty else {
+                if let thumb = descriptor.thumbnail {
+                    return PlannedSource(file: thumb, widthPx: descriptor.width, heightPx: descriptor.height, isThumbnail: true)
+                }
+                if let media = descriptor.media {
+                    return PlannedSource(file: media, widthPx: descriptor.width, heightPx: descriptor.height, isThumbnail: false)
+                }
+                return nil
+            }
+
+            if request.mode == .thumbnailOnly {
+                if let thumbId = descriptor.thumbnail?.fileId,
+                   let thumbSize = sizes.first(where: { $0.file.fileId == thumbId }) {
+                    return PlannedSource(
+                        file: thumbSize.file,
+                        widthPx: thumbSize.width,
+                        heightPx: thumbSize.height,
+                        isThumbnail: true
+                    )
+                }
+                if let smallest = sizes.first {
+                    return PlannedSource(file: smallest.file, widthPx: smallest.width, heightPx: smallest.height, isThumbnail: true)
+                }
+                return nil
+            }
+
+            guard let desiredSize = bestPhotoSize(forTargetWidthPx: request.targetWidthPx, sizes: sizes) else { return nil }
+            let isThumb = desiredSize.file.fileId == descriptor.thumbnail?.fileId
+            return PlannedSource(
+                file: desiredSize.file,
+                widthPx: desiredSize.width,
+                heightPx: desiredSize.height,
+                isThumbnail: isThumb
+            )
+
+        case .video:
+            if let thumb = descriptor.thumbnail {
+                return PlannedSource(file: thumb, widthPx: descriptor.width, heightPx: descriptor.height, isThumbnail: true)
+            }
+            if let media = descriptor.media {
+                return PlannedSource(file: media, widthPx: descriptor.width, heightPx: descriptor.height, isThumbnail: false)
+            }
             return nil
         }
+    }
 
-        let maxPixel = preferThumbnailOnly ? thumbMaxPixelLightweight : thumbMaxPixelNormal
+    private func computeSelectedSource(
+        descriptor: TGMessageMediaDescriptor,
+        request: RenderRequest,
+        desired: PlannedSource?
+    ) -> SourceCandidate? {
+        _ = desired
+        switch descriptor.kind {
+        case .photo:
+            let sizes = descriptor.photoSizes
+            guard !sizes.isEmpty else {
+                if let thumb = fileSnapshot(from: descriptor.thumbnail),
+                   let thumbPath = normalizedPath(thumb.localPath) {
+                    return SourceCandidate(
+                        path: thumbPath,
+                        fileId: thumb.fileId,
+                        fromThumbnail: true,
+                        sizePx: CGSize(width: descriptor.width, height: descriptor.height)
+                    )
+                }
+                if let media = fileSnapshot(from: descriptor.media),
+                   let mediaPath = normalizedPath(media.localPath) {
+                    return SourceCandidate(
+                        path: mediaPath,
+                        fileId: media.fileId,
+                        fromThumbnail: false,
+                        sizePx: CGSize(width: descriptor.width, height: descriptor.height)
+                    )
+                }
+                return nil
+            }
+
+            var candidates: [SourceCandidate] = []
+            candidates.reserveCapacity(min(8, sizes.count))
+            let thumbId = descriptor.thumbnail?.fileId
+            for size in sizes {
+                guard let snapshot = fileSnapshot(from: size.file) else { continue }
+                guard let path = normalizedPath(snapshot.localPath) else { continue }
+                let isThumb = (snapshot.fileId == thumbId)
+                candidates.append(
+                    SourceCandidate(
+                        path: path,
+                        fileId: snapshot.fileId,
+                        fromThumbnail: isThumb,
+                        sizePx: CGSize(width: size.width, height: size.height)
+                    )
+                )
+            }
+            guard !candidates.isEmpty else { return nil }
+            candidates.sort { ($0.sizePx?.width ?? 0) < ($1.sizePx?.width ?? 0) }
+
+            if request.mode == .thumbnailOnly {
+                if let thumbId,
+                   let thumbCandidate = candidates.first(where: { $0.fileId == thumbId }) {
+                    return thumbCandidate
+                }
+                return candidates.first
+            }
+
+            for candidate in candidates {
+                let width = Int(candidate.sizePx?.width ?? 0)
+                if width >= request.targetWidthPx {
+                    return candidate
+                }
+            }
+            return candidates.last
+
+        case .video:
+            if let thumb = fileSnapshot(from: descriptor.thumbnail),
+               let thumbPath = normalizedPath(thumb.localPath) {
+                return SourceCandidate(
+                    path: thumbPath,
+                    fileId: thumb.fileId,
+                    fromThumbnail: true,
+                    sizePx: CGSize(width: descriptor.width, height: descriptor.height)
+                )
+            }
+
+            guard let media = fileSnapshot(from: descriptor.media),
+                  let mediaPath = normalizedPath(media.localPath)
+            else { return nil }
+            return SourceCandidate(
+                path: mediaPath,
+                fileId: media.fileId,
+                fromThumbnail: false,
+                sizePx: CGSize(width: descriptor.width, height: descriptor.height)
+            )
+        }
+    }
+
+    private func resolvePathIfPossible(
+        key: TGMessageMediaKey,
+        descriptor: TGMessageMediaDescriptor,
+        request: RenderRequest,
+        desired: PlannedSource?,
+        selected: SourceCandidate?
+    ) async -> String? {
+        _ = desired
+        let previousResolved: ResolvedImage? = {
+            guard let resolved = resolvedImageByKey[key] else { return nil }
+            guard fileExists(path: resolved.path) else {
+                resolvedImageByKey.removeValue(forKey: key)
+                return nil
+            }
+            return resolved
+        }()
+
+        if request.mode == .thumbnailOnly {
+            if let previousResolved {
+                return previousResolved.path
+            }
+            guard let selected else { return nil }
+
+            let selectedMaxPixel = Int(max(selected.sizePx?.width ?? 0, selected.sizePx?.height ?? 0))
+            let effectiveMaxPixel = max(32, min(thumbMaxPixelLightweight, max(1, selectedMaxPixel)))
+
+            let kind = descriptor.kind == .photo ? "message_photo" : "message_video"
+            let memKey = "\(selected.path)|\(kind)|\(effectiveMaxPixel)" as NSString
+
+            if imageMemCache.image(forKey: memKey) != nil {
+                ChatPerfTrace.recordMediaThumbCacheHit(chatId: key.chatId, cacheHit: true)
+            } else {
+                ChatPerfTrace.recordMediaThumbCacheHit(chatId: key.chatId, cacheHit: false)
+            }
+
+            var outputPath = thumbnailService.ensureThumbnail(
+                sourcePath: selected.path,
+                fileId: selected.fileId,
+                kind: kind,
+                maxPixel: effectiveMaxPixel,
+                jpegQuality: 0.86
+            )
+            if outputPath == nil {
+                outputPath = selected.path
+            }
+            guard let resolvedPath = outputPath, fileExists(path: resolvedPath) else { return nil }
+
+            let newResolved = ResolvedImage(
+                path: resolvedPath,
+                sourceFileId: selected.fileId,
+                selectedWidthPx: Int(selected.sizePx?.width ?? 0),
+                selectedHeightPx: Int(selected.sizePx?.height ?? 0),
+                maxPixel: effectiveMaxPixel,
+                mode: request.mode
+            )
+            resolvedImageByKey[key] = newResolved
+
+            if let image = NSImage(contentsOfFile: resolvedPath) {
+                imageMemCache.setImage(image, forKey: memKey)
+            }
+
+            return resolvedPath
+        }
+
+        guard let selected else { return previousResolved?.path }
+
+        let targetMaxPixel = maxPixel(for: request)
+        let selectedMaxPixel = Int(max(selected.sizePx?.width ?? 0, selected.sizePx?.height ?? 0))
+        let effectiveMaxPixel = max(32, min(targetMaxPixel, max(1, selectedMaxPixel)))
+
+        if let previousResolved,
+           previousResolved.mode == .bestForTarget,
+           previousResolved.sourceFileId == selected.fileId,
+           previousResolved.maxPixel >= effectiveMaxPixel,
+           fileExists(path: previousResolved.path) {
+            return previousResolved.path
+        }
+
         let kind = descriptor.kind == .photo ? "message_photo" : "message_video"
-        let memKey = "\(source.path)|\(kind)|\(maxPixel)" as NSString
+        let memKey = "\(selected.path)|\(kind)|\(effectiveMaxPixel)" as NSString
 
         if imageMemCache.image(forKey: memKey) != nil {
             ChatPerfTrace.recordMediaThumbCacheHit(chatId: key.chatId, cacheHit: true)
-            if let existing = thumbPathByKey[key], fileExists(path: existing) {
-                return existing
+            if let previousResolved, fileExists(path: previousResolved.path) {
+                return previousResolved.path
             }
         } else {
             ChatPerfTrace.recordMediaThumbCacheHit(chatId: key.chatId, cacheHit: false)
@@ -252,18 +537,15 @@ actor MediaService {
         let traceEnabled = ChatPerfTrace.isEnabled(for: key.chatId)
         let decodeStartNs = traceEnabled ? DispatchTime.now().uptimeNanoseconds : 0
 
-        var thumbPath = thumbnailService.ensureThumbnail(
-            sourcePath: source.path,
-            fileId: source.fileId,
+        var outputPath = thumbnailService.ensureThumbnail(
+            sourcePath: selected.path,
+            fileId: selected.fileId,
             kind: kind,
-            maxPixel: maxPixel,
-            jpegQuality: preferThumbnailOnly ? 0.86 : 0.9
+            maxPixel: effectiveMaxPixel,
+            jpegQuality: 0.92
         )
-        if thumbPath == nil && source.fromThumbnail {
-            thumbPath = source.path
-        }
-        if thumbPath == nil && !preferThumbnailOnly {
-            thumbPath = source.path
+        if outputPath == nil {
+            outputPath = selected.path
         }
 
         if traceEnabled {
@@ -271,40 +553,65 @@ actor MediaService {
             ChatPerfTrace.recordMediaDecode(chatId: key.chatId, durationMs: durationMs)
         }
 
-        guard let thumbPath, fileExists(path: thumbPath) else { return nil }
-        if let image = NSImage(contentsOfFile: thumbPath) {
+        guard let resolvedPath = outputPath, fileExists(path: resolvedPath) else {
+            return previousResolved?.path
+        }
+
+        let newResolved = ResolvedImage(
+            path: resolvedPath,
+            sourceFileId: selected.fileId,
+            selectedWidthPx: Int(selected.sizePx?.width ?? 0),
+            selectedHeightPx: Int(selected.sizePx?.height ?? 0),
+            maxPixel: effectiveMaxPixel,
+            mode: request.mode
+        )
+        resolvedImageByKey[key] = newResolved
+
+        if traceEnabled {
+            let isThumb = selected.fromThumbnail
+            let previousQuality: (Int, Int, Int) = {
+                guard let previousResolved else { return (0, 0, 0) }
+                let modeRank = previousResolved.mode == .bestForTarget ? 1 : 0
+                return (modeRank, previousResolved.selectedWidthPx, previousResolved.maxPixel)
+            }()
+            let newQuality: (Int, Int, Int) = {
+                let modeRank = newResolved.mode == .bestForTarget ? 1 : 0
+                return (modeRank, newResolved.selectedWidthPx, newResolved.maxPixel)
+            }()
+            let isUpgraded = previousResolved != nil && newQuality > previousQuality
+            ChatPerfTrace.recordMediaSelection(
+                chatId: key.chatId,
+                messageId: key.messageId,
+                targetWidthPx: request.targetWidthPx,
+                targetHeightPx: request.targetHeightPx,
+                selectedWidthPx: newResolved.selectedWidthPx,
+                selectedHeightPx: newResolved.selectedHeightPx,
+                isThumb: isThumb,
+                isUpgraded: isUpgraded
+            )
+        }
+
+        if let image = NSImage(contentsOfFile: resolvedPath) {
             imageMemCache.setImage(image, forKey: memKey)
         }
-        thumbPathByKey[key] = thumbPath
-        return thumbPath
-    }
 
-    private func chooseSourceCandidate(
-        descriptor: TGMessageMediaDescriptor,
-        preferThumbnailOnly: Bool
-    ) -> SourceCandidate? {
-        if let thumb = fileSnapshot(from: descriptor.thumbnail),
-           let thumbPath = normalizedPath(thumb.localPath) {
-            return SourceCandidate(path: thumbPath, fileId: thumb.fileId, fromThumbnail: true)
-        }
-
-        guard !preferThumbnailOnly else { return nil }
-        if let media = fileSnapshot(from: descriptor.media),
-           let mediaPath = normalizedPath(media.localPath) {
-            return SourceCandidate(path: mediaPath, fileId: media.fileId, fromThumbnail: false)
-        }
-        return nil
+        return resolvedPath
     }
 
     private func scheduleDownloadsIfNeeded(
         key: TGMessageMediaKey,
         descriptor: TGMessageMediaDescriptor,
-        preferThumbnailOnly: Bool,
+        request: RenderRequest,
+        desired: PlannedSource?,
+        selected: SourceCandidate?,
         resolvedPath: String?
     ) {
-        if resolvedPath != nil { return }
+        _ = selected
+        let thumbSnapshot = fileSnapshot(from: descriptor.thumbnail)
+        let desiredSnapshot: FileSnapshot? = desired.flatMap { fileSnapshot(from: $0.file) }
 
-        if let thumbSnapshot = fileSnapshot(from: descriptor.thumbnail),
+        if resolvedPath == nil,
+           let thumbSnapshot,
            thumbSnapshot.localPath == nil,
            !thumbSnapshot.isDownloadingCompleted {
             requestDownloadIfNeeded(
@@ -314,15 +621,14 @@ actor MediaService {
             )
         }
 
-        guard !preferThumbnailOnly else { return }
-        guard descriptor.thumbnail == nil else { return }
-        if let mediaSnapshot = fileSnapshot(from: descriptor.media),
-           mediaSnapshot.localPath == nil,
-           !mediaSnapshot.isDownloadingCompleted {
+        guard request.mode == .bestForTarget else { return }
+        guard let desiredSnapshot else { return }
+        if desiredSnapshot.localPath == nil,
+           !desiredSnapshot.isDownloadingCompleted {
             requestDownloadIfNeeded(
-                fileId: mediaSnapshot.fileId,
+                fileId: desiredSnapshot.fileId,
                 priority: 18,
-                reason: "media-file:\(key.chatId):\(key.messageId)"
+                reason: "media-best:\(key.chatId):\(key.messageId)"
             )
         }
     }
@@ -338,23 +644,25 @@ actor MediaService {
         key: TGMessageMediaKey,
         descriptor: TGMessageMediaDescriptor,
         resolvedPath: String?,
-        preferThumbnailOnly: Bool
+        request: RenderRequest,
+        desired: PlannedSource?,
+        selected: SourceCandidate?
     ) -> TGMediaState {
-        let thumbnailState = fileSnapshot(from: descriptor.thumbnail)
-        let mediaState = fileSnapshot(from: descriptor.media)
-        let progress = thumbnailState?.progress ?? mediaState?.progress
-        let anyActive = (thumbnailState?.isDownloadingActive ?? false) || (mediaState?.isDownloadingActive ?? false)
-        let hasPendingPrimary: Bool = {
-            if let thumbnailState {
-                return thumbnailState.localPath == nil && !thumbnailState.isDownloadingCompleted
-            }
-            guard !preferThumbnailOnly else { return false }
-            if let mediaState {
-                return mediaState.localPath == nil && !mediaState.isDownloadingCompleted
-            }
-            return false
-        }()
-        let isLoading = anyActive || (resolvedPath == nil && hasPendingPrimary)
+        _ = key
+        _ = request
+        _ = selected
+
+        let primarySnapshot: FileSnapshot? = desired.flatMap { fileSnapshot(from: $0.file) }
+        let thumbnailSnapshot = fileSnapshot(from: descriptor.thumbnail)
+        let mediaSnapshot = fileSnapshot(from: descriptor.media)
+
+        let progress = primarySnapshot?.progress ?? thumbnailSnapshot?.progress ?? mediaSnapshot?.progress
+        let anyActive = (primarySnapshot?.isDownloadingActive ?? false)
+            || (thumbnailSnapshot?.isDownloadingActive ?? false)
+            || (mediaSnapshot?.isDownloadingActive ?? false)
+        let hasPendingPrimary = (primarySnapshot?.localPath == nil) && !(primarySnapshot?.isDownloadingCompleted ?? true)
+
+        let isLoading = resolvedPath == nil && (anyActive || hasPendingPrimary)
         return TGMediaState(thumbnailPath: resolvedPath, progress: progress, isLoading: isLoading)
     }
 
@@ -363,7 +671,7 @@ actor MediaService {
         if let updated = fileStateById[descriptorFile.fileId] {
             return FileSnapshot(
                 fileId: updated.fileId,
-                localPath: updated.localPath,
+                localPath: normalizedPath(updated.localPath),
                 downloadedSize: updated.downloadedSize,
                 expectedSize: updated.expectedSize,
                 isDownloadingActive: updated.isDownloadingActive,

@@ -118,20 +118,31 @@ nonisolated struct TGMessageMediaFile: Hashable, Sendable {
     }
 }
 
+nonisolated struct TGMessagePhotoSize: Hashable, Sendable {
+    let file: TGMessageMediaFile
+    let width: Int
+    let height: Int
+}
+
 nonisolated struct TGMessageMediaDescriptor: Hashable, Sendable {
     let kind: TGMessageMediaKind
     let width: Int
     let height: Int
     let thumbnail: TGMessageMediaFile?
     let media: TGMessageMediaFile?
+    let photoSizes: [TGMessagePhotoSize]
 
     var fileIds: [Int32] {
         var ids: [Int32] = []
-        if let thumbnailId = thumbnail?.fileId {
-            ids.append(thumbnailId)
+        func appendUnique(_ fileId: Int32?) {
+            guard let fileId, fileId > 0 else { return }
+            if ids.contains(fileId) { return }
+            ids.append(fileId)
         }
-        if let mediaId = media?.fileId, mediaId != thumbnail?.fileId {
-            ids.append(mediaId)
+        appendUnique(thumbnail?.fileId)
+        appendUnique(media?.fileId)
+        for size in photoSizes {
+            appendUnique(size.file.fileId)
         }
         return ids
     }

@@ -748,13 +748,31 @@ final class TelegramStore: ObservableObject {
         chatId: Int64,
         messageId: Int64,
         descriptor: TGMessageMediaDescriptor,
-        preferThumbnailOnly: Bool
+        targetPointSize: CGSize,
+        screenScale: CGFloat
     ) async -> TGMediaState {
         await mediaService.ensureThumbnail(
             chatId: chatId,
             messageId: messageId,
             descriptor: descriptor,
-            preferThumbnailOnly: preferThumbnailOnly
+            targetPointSize: targetPointSize,
+            screenScale: screenScale
+        )
+    }
+
+    func ensureMediaImage(
+        chatId: Int64,
+        messageId: Int64,
+        descriptor: TGMessageMediaDescriptor,
+        targetPointSize: CGSize,
+        screenScale: CGFloat
+    ) async -> TGMediaState {
+        await mediaService.ensureImage(
+            chatId: chatId,
+            messageId: messageId,
+            descriptor: descriptor,
+            targetPointSize: targetPointSize,
+            screenScale: screenScale
         )
     }
 

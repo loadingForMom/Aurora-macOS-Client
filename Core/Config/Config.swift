@@ -619,6 +619,7 @@ nonisolated enum ChatPerfTrace {
         return value
     }()
     private static let signpostLog = OSLog(subsystem: "com.aurora.app", category: "points_of_interest")
+    private static let mediaTraceLog = Logger(subsystem: "com.aurora.app", category: "chat.media.trace")
     private static let collector: ChatPerfTraceCollector? = enabledFlag
         ? ChatPerfTraceCollector(chatIdFilter: chatIdFilter)
         : nil
@@ -775,6 +776,40 @@ nonisolated enum ChatPerfTrace {
 #else
         _ = chatId
         _ = durationMs
+#endif
+    }
+
+    static func recordMediaSelection(
+        chatId: Int64,
+        messageId: Int64,
+        targetWidthPx: Int,
+        targetHeightPx: Int,
+        selectedWidthPx: Int,
+        selectedHeightPx: Int,
+        isThumb: Bool,
+        isUpgraded: Bool
+    ) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        let line = [
+            "MEDIA_TRACE",
+            "chatId=\(chatId)",
+            "messageId=\(messageId)",
+            "targetPx=\(targetWidthPx)x\(targetHeightPx)",
+            "selectedSizePx=\(selectedWidthPx)x\(selectedHeightPx)",
+            "isThumb=\(isThumb ? "true" : "false")",
+            "isUpgraded=\(isUpgraded ? "true" : "false")"
+        ].joined(separator: " ")
+        mediaTraceLog.debug("\(line, privacy: .public)")
+#else
+        _ = chatId
+        _ = messageId
+        _ = targetWidthPx
+        _ = targetHeightPx
+        _ = selectedWidthPx
+        _ = selectedHeightPx
+        _ = isThumb
+        _ = isUpgraded
 #endif
     }
 
