@@ -9,17 +9,21 @@ import SwiftUI
 import AppKit
 
 struct MessageBubble: View {
+    @ObservedObject var store: TelegramStore
     let msg: TGMessage
     let currentChatId: Int64
 
     /// Trackpad “reveal exact time” (0…maxReveal), passed from parent.
     let revealTimeX: CGFloat
 
-    /// Simplified rendering mode for dense windows.
-    let optimizeForPerformance: Bool
+    /// Simplified visual effects mode for dense windows and live scroll.
+    let heavyEffectsDisabled: Bool
 
-    /// Transient lightweight mode while live scrolling.
-    let isScrolling: Bool
+    /// Native live scrolling state from NSScrollView.
+    let isLiveScrolling: Bool
+
+    /// Transient lightweight mode that may outlive live scroll for a short debounce.
+    let isScrollPerformanceMode: Bool
 
     var onRetry: () -> Void = {}
     var onDelete: () -> Void = {}
@@ -31,20 +35,24 @@ struct MessageBubble: View {
     private let bubbleMaxWidth: CGFloat = 560
 
     init(
+        store: TelegramStore,
         msg: TGMessage,
         currentChatId: Int64,
         revealTimeX: CGFloat = 0,
-        optimizeForPerformance: Bool = false,
-        isScrolling: Bool = false,
+        heavyEffectsDisabled: Bool = false,
+        isLiveScrolling: Bool = false,
+        isScrollPerformanceMode: Bool = false,
         onRetry: @escaping () -> Void = {},
         onDelete: @escaping () -> Void = {},
         jellyOffsetY: CGFloat = 0
     ) {
+        self.store = store
         self.msg = msg
         self.currentChatId = currentChatId
         self.revealTimeX = revealTimeX
-        self.optimizeForPerformance = optimizeForPerformance
-        self.isScrolling = isScrolling
+        self.heavyEffectsDisabled = heavyEffectsDisabled
+        self.isLiveScrolling = isLiveScrolling
+        self.isScrollPerformanceMode = isScrollPerformanceMode
         self.onRetry = onRetry
         self.onDelete = onDelete
         self.jellyOffsetY = jellyOffsetY
@@ -87,11 +95,18 @@ struct MessageBubble: View {
                 }
                 .frame(maxWidth: .infinity, alignment: msg.isOutgoing ? .trailing : .leading)
                 .offset(y: jellyOffsetY)
-                .modifier(MessageContextMenuModifier(enabled: !(optimizeForPerformance || isScrolling), msg: msg, onRetry: onRetry, onDelete: onDelete))
+                .modifier(
+                    MessageContextMenuModifier(
+                        enabled: !isLiveScrolling,
+                        msg: msg,
+                        onRetry: onRetry,
+                        onDelete: onDelete
+                    )
+                )
             }
         }
         .transaction { transaction in
-            if isScrolling {
+            if isLiveScrolling || isScrollPerformanceMode {
                 transaction.disablesAnimations = true
                 transaction.animation = nil
             }
@@ -137,21 +152,41 @@ struct MessageBubble: View {
     @ViewBuilder
     private func content(isRevealingTime: Bool) -> some View {
         let hideStatusLine = isRevealingTime && isSentState
+        let hasMedia = mediaDescriptor != nil
+        let shouldRenderText = shouldRenderTextContent
 
         VStack(alignment: msg.isOutgoing ? .trailing : .leading, spacing: 4) {
-            BubbleTextView(
-                chatId: msg.chatId,
-                messageId: msg.id,
-                rawText: msg.textForRendering,
-                entities: msg.entities,
-                isOutgoing: msg.isOutgoing,
-                textSelectionEnabled: !(optimizeForPerformance || isScrolling)
-            )
-            .padding(.vertical, 8)
-            .padding(.horizontal, 12)
+            VStack(alignment: msg.isOutgoing ? .trailing : .leading, spacing: hasMedia && shouldRenderText ? 8 : 0) {
+                if let descriptor = mediaDescriptor {
+                    MessageMediaAttachmentView(
+                        store: store,
+                        chatId: msg.chatId,
+                        messageId: msg.id,
+                        descriptor: descriptor,
+                        isLiveScrolling: isLiveScrolling,
+                        isScrollPerformanceMode: isScrollPerformanceMode
+                    )
+                    .padding(.horizontal, 8)
+                    .padding(.top, 8)
+                    .padding(.bottom, shouldRenderText ? 0 : 8)
+                }
+
+                if shouldRenderText {
+                    BubbleTextView(
+                        chatId: msg.chatId,
+                        messageId: msg.id,
+                        rawText: msg.textForRendering,
+                        entities: msg.entities,
+                        isOutgoing: msg.isOutgoing,
+                        textSelectionEnabled: !isLiveScrolling
+                    )
+                    .padding(.vertical, 8)
+                    .padding(.horizontal, 12)
+                }
+            }
             .background(bubbleBackground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay {
-                if !optimizeForPerformance && !isScrolling {
+                if !heavyEffectsDisabled {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
                 }
@@ -173,6 +208,21 @@ struct MessageBubble: View {
             .allowsHitTesting(!hideStatusLine)
         }
         .frame(maxWidth: bubbleMaxWidth, alignment: msg.isOutgoing ? .trailing : .leading)
+    }
+
+    private var mediaDescriptor: TGMessageMediaDescriptor? {
+        guard msg.contentType == "messagePhoto" || msg.contentType == "messageVideo" else { return nil }
+        return msg.media
+    }
+
+    private var shouldRenderTextContent: Bool {
+        if mediaDescriptor != nil {
+            guard let text = msg.textForRendering?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                return false
+            }
+            return !text.isEmpty
+        }
+        return true
     }
 
     private var isSentState: Bool {
@@ -220,7 +270,7 @@ struct MessageBubble: View {
             // Make outgoing bubbles always “Messages blue” on macOS.
             return AnyShapeStyle(Color(nsColor: .systemBlue))
         } else {
-            if optimizeForPerformance || isScrolling {
+            if heavyEffectsDisabled {
                 return AnyShapeStyle(Color(nsColor: .controlBackgroundColor))
             }
             return AnyShapeStyle(.thinMaterial)
@@ -251,6 +301,133 @@ struct MessageBubble: View {
     }()
 }
 
+private struct MessageMediaAttachmentView: View {
+    @ObservedObject var store: TelegramStore
+    let chatId: Int64
+    let messageId: Int64
+    let descriptor: TGMessageMediaDescriptor
+    let isLiveScrolling: Bool
+    let isScrollPerformanceMode: Bool
+
+    @State private var thumbImage: NSImage?
+    @State private var thumbPath: String?
+    @State private var imageLoadTask: Task<Void, Never>? = nil
+
+    private var mediaState: TGMediaState? {
+        store.mediaStateByMessageKey[TGMessageMediaKey(chatId: chatId, messageId: messageId)]
+    }
+
+    private var perfMode: Bool {
+        isLiveScrolling || isScrollPerformanceMode
+    }
+
+    private var taskId: String {
+        "\(chatId):\(messageId):\(descriptor.kind.rawValue):\(descriptor.width)x\(descriptor.height):\(descriptor.thumbnail?.fileId ?? 0):\(descriptor.media?.fileId ?? 0):\(perfMode ? 1 : 0)"
+    }
+
+    private var placeholderSize: CGSize {
+        let rawAspect = CGFloat(max(1, descriptor.width)) / CGFloat(max(1, descriptor.height))
+        let aspect = min(max(rawAspect, 0.42), 2.2)
+        let width: CGFloat = perfMode ? 220 : 240
+        let height = min(300, max(120, width / aspect))
+        return CGSize(width: width, height: height)
+    }
+
+    var body: some View {
+        let size = placeholderSize
+
+        ZStack {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.gray.opacity(0.22))
+
+            if let thumbImage {
+                Image(nsImage: thumbImage)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: size.width, height: size.height)
+                    .clipped()
+            }
+
+            if descriptor.kind == .video {
+                Image(systemName: "play.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(10)
+                    .background(
+                        Circle()
+                            .fill(Color.black.opacity(0.45))
+                    )
+            }
+
+            if let state = mediaState, state.isLoading {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.black.opacity(0.26))
+                    if let progress = state.progress, progress > 0 {
+                        VStack(spacing: 6) {
+                            ProgressView(value: progress)
+                                .progressViewStyle(.linear)
+                                .tint(.white)
+                                .frame(width: max(72, size.width * 0.48))
+                            Text("\(Int(progress * 100))%")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.white.opacity(0.92))
+                        }
+                    } else {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(.white)
+                    }
+                }
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .task(id: taskId) {
+            let state = await store.ensureMediaThumbnail(
+                chatId: chatId,
+                messageId: messageId,
+                descriptor: descriptor,
+                preferThumbnailOnly: perfMode
+            )
+            scheduleImageLoad(path: state.thumbnailPath)
+        }
+        .onChange(of: mediaState?.thumbnailPath) { _, newPath in
+            scheduleImageLoad(path: newPath)
+        }
+        .onDisappear {
+            imageLoadTask?.cancel()
+            imageLoadTask = nil
+        }
+        .animation(perfMode ? nil : .easeOut(duration: 0.14), value: thumbPath)
+    }
+
+    @MainActor
+    private func scheduleImageLoad(path: String?) {
+        imageLoadTask?.cancel()
+        imageLoadTask = Task { @MainActor [path] in
+            await loadThumbnail(path: path)
+        }
+    }
+
+    @MainActor
+    private func loadThumbnail(path: String?) async {
+        guard let path, !path.isEmpty else {
+            thumbPath = nil
+            thumbImage = nil
+            return
+        }
+        if thumbPath == path, thumbImage != nil {
+            return
+        }
+        thumbPath = path
+        let loaded = await DiskImageCache.shared.imageAsync(path: path)
+        guard !Task.isCancelled else { return }
+        guard thumbPath == path else { return }
+        thumbImage = loaded
+    }
+}
+
 private struct BubbleTextView: View {
     let chatId: Int64
     let messageId: Int64
@@ -264,11 +441,13 @@ private struct BubbleTextView: View {
 
     @State private var attributed: AttributedString
     @State private var renderTask: Task<Void, Never>? = nil
-    @State private var lastRenderedSignature: RenderSignature? = nil
-    @State private var inFlightSignature: RenderSignature? = nil
+    @State private var lastRenderedTextSignature: TextRenderSignature? = nil
+    @State private var inFlightTextSignature: TextRenderSignature? = nil
 
-    private struct RenderSignature: Hashable {
-        let input: MessageTextRenderInput
+    private struct TextRenderSignature: Hashable {
+        let rawText: String?
+        let entities: [TGTextEntity]
+        let style: MessageTextStyle
         let colorScheme: ColorScheme
         let dynamicTypeSize: DynamicTypeSize
     }
@@ -301,22 +480,14 @@ private struct BubbleTextView: View {
     }
 
     var body: some View {
-        Group {
-            if textSelectionEnabled {
-                Text(attributed)
-                    .textSelection(.enabled)
-            } else {
-                Text(attributed)
-                    .textSelection(.disabled)
-            }
-        }
-        .foregroundStyle(isOutgoing ? .white : .primary)
+        selectableText
+            .foregroundStyle(isOutgoing ? .white : .primary)
         .fixedSize(horizontal: false, vertical: true)
         .onAppear {
-            let signature = renderSignature
-            if lastRenderedSignature == nil,
-               MessageTextPipeline.cachedValue(signature.input) != nil {
-                lastRenderedSignature = signature
+            let textSignature = textRenderSignature
+            if lastRenderedTextSignature == nil,
+               MessageTextPipeline.cachedValue(renderInput) != nil {
+                lastRenderedTextSignature = textSignature
             }
             scheduleRerenderIfNeeded()
         }
@@ -338,7 +509,18 @@ private struct BubbleTextView: View {
         .onDisappear {
             renderTask?.cancel()
             renderTask = nil
-            inFlightSignature = nil
+            inFlightTextSignature = nil
+        }
+    }
+
+    @ViewBuilder
+    private var selectableText: some View {
+        if textSelectionEnabled {
+            Text(attributed)
+                .textSelection(.enabled)
+        } else {
+            Text(attributed)
+                .textSelection(.disabled)
         }
     }
 
@@ -352,9 +534,11 @@ private struct BubbleTextView: View {
         )
     }
 
-    private var renderSignature: RenderSignature {
-        RenderSignature(
-            input: renderInput,
+    private var textRenderSignature: TextRenderSignature {
+        TextRenderSignature(
+            rawText: rawText,
+            entities: entities,
+            style: .bubbleBody,
             colorScheme: colorScheme,
             dynamicTypeSize: dynamicTypeSize
         )
@@ -362,21 +546,21 @@ private struct BubbleTextView: View {
 
     @MainActor
     private func scheduleRerenderIfNeeded() {
-        let signature = renderSignature
-        guard lastRenderedSignature != signature else { return }
-        guard inFlightSignature != signature else { return }
+        let signature = textRenderSignature
+        guard lastRenderedTextSignature != signature else { return }
+        guard inFlightTextSignature != signature else { return }
 
         renderTask?.cancel()
-        inFlightSignature = signature
-        let input = signature.input
+        inFlightTextSignature = signature
+        let input = renderInput
 
         renderTask = Task { [signature, input] in
             let rendered = await MessageTextPipeline.renderAsync(input, priority: .userInitiated)
             guard !Task.isCancelled else { return }
-            guard inFlightSignature == signature else { return }
+            guard inFlightTextSignature == signature else { return }
             attributed = rendered
-            lastRenderedSignature = signature
-            inFlightSignature = nil
+            lastRenderedTextSignature = signature
+            inFlightTextSignature = nil
             renderTask = nil
         }
     }

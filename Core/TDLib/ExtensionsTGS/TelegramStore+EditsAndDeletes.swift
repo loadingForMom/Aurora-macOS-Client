@@ -43,7 +43,16 @@ extension TelegramStore {
 
     func applyMessageContentChanged(chatId: Int64, messageId: Int64, newContent: [String: Any]) async {
         let newText = renderPreviewTextFromContent(newContent)
-        _ = await messageStore.applyContent(chatId: chatId, messageId: messageId, text: newText)
+        let payload = parseMessageContentPayload(newContent)
+        _ = await messageStore.applyContentPayload(
+            chatId: chatId,
+            messageId: messageId,
+            text: newText,
+            contentType: payload.contentType,
+            rawText: payload.rawText,
+            entities: payload.entities,
+            media: payload.media
+        )
         await databaseBatchWriter.enqueue(.updateMessageText(chatId: chatId, messageId: messageId, text: newText))
 
         if let latest = databaseRepository.fetchLatestMessage(chatId: chatId), latest.id == messageId {

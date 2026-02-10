@@ -75,8 +75,15 @@ struct ChatHeader: View {
                         size: avatarSize,
                         font: .system(size: 11, weight: .semibold, design: .rounded),
                         imageProvider: {
-                            store.chatAvatarNSImage(chatId: chatId, pointSize: avatarSize, preferHiRes: false)
-                            ?? avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
+                            if let image = await store.chatAvatarNSImageAsync(
+                                chatId: chatId,
+                                pointSize: avatarSize,
+                                preferHiRes: false
+                            ) {
+                                return image
+                            }
+                            guard let avatarPath else { return nil }
+                            return await DiskImageCache.shared.imageAsync(path: avatarPath)
                         }
                     )
                     .overlay(Circle().strokeBorder(.white.opacity(0.14), lineWidth: 1))

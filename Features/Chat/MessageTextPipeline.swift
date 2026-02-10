@@ -111,6 +111,7 @@ nonisolated final class MessageTextCache {
 nonisolated enum MessageTextPipeline {
     private static let log = Logger(subsystem: "com.aurora.app", category: "message.text")
     private static let prewarmer = MessageTextPrewarmActor()
+    private static let prewarmMaxConcurrency = 3
     // Supported now vs later:
     // | Supported now | Later |
     // | --- | --- |
@@ -149,7 +150,6 @@ nonisolated enum MessageTextPipeline {
         messages: [TGMessage],
         style: MessageTextStyle = .bubbleBody
     ) {
-        guard !messages.isEmpty else { return }
         let inputs = messages.compactMap { message -> MessageTextRenderInput? in
             guard message.chatId == chatId else { return nil }
             return MessageTextRenderInput(
@@ -160,9 +160,14 @@ nonisolated enum MessageTextPipeline {
                 style: style
             )
         }
-        guard !inputs.isEmpty else { return }
         Task(priority: .utility) {
-            await prewarmer.submit(inputs: inputs)
+            await prewarmer.submit(inputs: inputs, maxConcurrency: prewarmMaxConcurrency)
+        }
+    }
+
+    static func cancelPrewarm() {
+        Task(priority: .utility) {
+            await prewarmer.cancel()
         }
     }
 
@@ -173,13 +178,18 @@ nonisolated enum MessageTextPipeline {
         entities: [TGTextEntity]?,
         style: MessageTextStyle
     ) -> AttributedString {
+        var cacheHit = false
         let traceEnabled = ChatPerfTrace.isEnabled(for: chatId)
         let textRenderStartNs = traceEnabled ? DispatchTime.now().uptimeNanoseconds : 0
         let signpostId = ChatPerfTrace.beginSignpost("MessageTextPipeline.render", chatId: chatId)
         defer {
             if traceEnabled {
                 let textRenderDurationMs = ChatPerfTrace.elapsedMs(since: textRenderStartNs)
-                ChatPerfTrace.recordTextRender(chatId: chatId, durationMs: textRenderDurationMs)
+                ChatPerfTrace.recordTextRender(
+                    chatId: chatId,
+                    durationMs: textRenderDurationMs,
+                    cacheHit: cacheHit
+                )
             }
             ChatPerfTrace.endSignpost("MessageTextPipeline.render", signpostId: signpostId, chatId: chatId)
         }
@@ -190,6 +200,7 @@ nonisolated enum MessageTextPipeline {
             style: style
         )
         if let cached = MessageTextCache.shared.value(for: cacheKey, rawText: rawText, entities: entities) {
+            cacheHit = true
             return cached
         }
 
@@ -286,48 +297,60 @@ nonisolated enum MessageTextPipeline {
 }
 
 private actor MessageTextPrewarmActor {
-    private var pendingInputs: [MessageTextRenderInput] = []
-    private var isDraining = false
+    private var lastSubmittedInputs: [MessageTextRenderInput] = []
+    private var runningTask: Task<Void, Never>? = nil
 
-    func submit(inputs: [MessageTextRenderInput]) {
-        guard !inputs.isEmpty else { return }
-        pendingInputs = inputs
-        guard !isDraining else { return }
-        isDraining = true
-        Task(priority: .utility) {
-            await self.drain()
+    func submit(inputs: [MessageTextRenderInput], maxConcurrency: Int) {
+        guard inputs != lastSubmittedInputs else { return }
+        lastSubmittedInputs = inputs
+
+        runningTask?.cancel()
+        guard !inputs.isEmpty else {
+            runningTask = nil
+            return
+        }
+
+        let batch = inputs
+        let workerCount = max(1, min(4, maxConcurrency))
+        runningTask = Task(priority: .utility) {
+            await Self.prewarm(batch, maxConcurrency: workerCount)
         }
     }
 
-    private func drain() async {
-        while !Task.isCancelled {
-            let batch = pendingInputs
-            guard !batch.isEmpty else {
-                isDraining = false
-                return
-            }
-            pendingInputs = []
-            for (index, input) in batch.enumerated() {
-                if Task.isCancelled {
-                    isDraining = false
-                    return
-                }
-                _ = MessageTextPipeline.render(
-                    chatId: input.chatId,
-                    messageId: input.messageId,
-                    rawText: input.rawText,
-                    entities: input.entities,
-                    style: input.style
-                )
-                if index.isMultiple(of: 12) {
-                    await Task.yield()
-                    if !pendingInputs.isEmpty {
-                        break
+    func cancel() {
+        lastSubmittedInputs = []
+        runningTask?.cancel()
+        runningTask = nil
+    }
+
+    nonisolated private static func prewarm(
+        _ inputs: [MessageTextRenderInput],
+        maxConcurrency: Int
+    ) async {
+        guard !inputs.isEmpty else { return }
+        let workerCount = max(1, min(maxConcurrency, inputs.count))
+        await withTaskGroup(of: Void.self) { group in
+            for worker in 0..<workerCount {
+                group.addTask {
+                    var index = worker
+                    while index < inputs.count {
+                        if Task.isCancelled { return }
+                        let input = inputs[index]
+                        _ = MessageTextPipeline.render(
+                            chatId: input.chatId,
+                            messageId: input.messageId,
+                            rawText: input.rawText,
+                            entities: input.entities,
+                            style: input.style
+                        )
+                        index += workerCount
+                        if index.isMultiple(of: 8) {
+                            await Task.yield()
+                        }
                     }
                 }
             }
-            await Task.yield()
+            await group.waitForAll()
         }
-        isDraining = false
     }
 }

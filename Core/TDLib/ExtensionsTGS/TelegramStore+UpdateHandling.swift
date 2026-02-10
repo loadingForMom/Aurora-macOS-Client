@@ -110,6 +110,13 @@ extension TelegramStore {
             }
         }
 
+        if let fileUpdate = parseUpdateFileState(upd) {
+            if fileUpdate.isDownloadingCompleted {
+                markDownloadCompleted(fileId: fileUpdate.fileId)
+            }
+            await handleMediaFileUpdate(fileUpdate)
+        }
+
         if let (fileId, path) = parseUpdateFilePathIfMyPhoto(upd) {
             markDownloadCompleted(fileId: fileId)
             await MainActor.run {
@@ -636,11 +643,13 @@ extension TelegramStore {
                 }
             }
 
-            applyHistoryPaginationResponse(
-                job: job,
-                responseMessages: res.messages,
-                mergedMessages: messagesToMerge
-            )
+            if job.kind != .around {
+                applyHistoryPaginationResponse(
+                    job: job,
+                    responseMessages: res.messages,
+                    mergedMessages: messagesToMerge
+                )
+            }
 
             historyJobs.removeValue(forKey: res.extra)
 

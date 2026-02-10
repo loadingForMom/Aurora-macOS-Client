@@ -44,8 +44,15 @@ struct ChatTitleButton: View {
                     size: avatarSize,
                     font: .caption.weight(.semibold),
                     imageProvider: {
-                        store.chatAvatarNSImage(chatId: chatId, pointSize: avatarSize, preferHiRes: false)
-                        ?? avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
+                        if let image = await store.chatAvatarNSImageAsync(
+                            chatId: chatId,
+                            pointSize: avatarSize,
+                            preferHiRes: false
+                        ) {
+                            return image
+                        }
+                        guard let avatarPath else { return nil }
+                        return await DiskImageCache.shared.imageAsync(path: avatarPath)
                     }
                 )
                 .offset(y: -avatarLift)

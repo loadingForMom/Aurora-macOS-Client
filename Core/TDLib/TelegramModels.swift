@@ -93,6 +93,71 @@ nonisolated enum TGMessageSendState: Hashable, Sendable {
     case failed(errorText: String)
 }
 
+nonisolated struct TGMessageMediaKey: Hashable, Sendable {
+    let chatId: Int64
+    let messageId: Int64
+}
+
+nonisolated enum TGMessageMediaKind: String, Hashable, Sendable {
+    case photo
+    case video
+}
+
+nonisolated struct TGMessageMediaFile: Hashable, Sendable {
+    let fileId: Int32
+    let localPath: String?
+    let downloadedSize: Int64
+    let expectedSize: Int64
+    let isDownloadingActive: Bool
+    let isDownloadingCompleted: Bool
+
+    var progress: Double? {
+        guard expectedSize > 0 else { return nil }
+        let normalized = Double(downloadedSize) / Double(expectedSize)
+        return min(max(normalized, 0), 1)
+    }
+}
+
+nonisolated struct TGMessageMediaDescriptor: Hashable, Sendable {
+    let kind: TGMessageMediaKind
+    let width: Int
+    let height: Int
+    let thumbnail: TGMessageMediaFile?
+    let media: TGMessageMediaFile?
+
+    var fileIds: [Int32] {
+        var ids: [Int32] = []
+        if let thumbnailId = thumbnail?.fileId {
+            ids.append(thumbnailId)
+        }
+        if let mediaId = media?.fileId, mediaId != thumbnail?.fileId {
+            ids.append(mediaId)
+        }
+        return ids
+    }
+}
+
+nonisolated struct TGMediaState: Hashable, Sendable {
+    let thumbnailPath: String?
+    let progress: Double?
+    let isLoading: Bool
+}
+
+nonisolated struct TGFileUpdate: Hashable, Sendable {
+    let fileId: Int32
+    let localPath: String?
+    let downloadedSize: Int64
+    let expectedSize: Int64
+    let isDownloadingActive: Bool
+    let isDownloadingCompleted: Bool
+
+    var progress: Double? {
+        guard expectedSize > 0 else { return nil }
+        let normalized = Double(downloadedSize) / Double(expectedSize)
+        return min(max(normalized, 0), 1)
+    }
+}
+
 nonisolated struct TGMessage: Identifiable, Hashable, Sendable {
     let id: Int64
     let chatId: Int64
@@ -110,6 +175,7 @@ nonisolated struct TGMessage: Identifiable, Hashable, Sendable {
     let contentType: String
     var rawText: String?
     var entities: [TGTextEntity]
+    var media: TGMessageMediaDescriptor?
 
     // Optimistic / sending state
     var sendState: TGMessageSendState
@@ -143,6 +209,7 @@ nonisolated struct TGMessage: Identifiable, Hashable, Sendable {
         contentType: String = "messageText",
         rawText: String? = nil,
         entities: [TGTextEntity] = [],
+        media: TGMessageMediaDescriptor? = nil,
         sendState: TGMessageSendState = .sent,
         replyToMessageId: Int64? = nil,
         localId: UUID? = nil,
@@ -161,6 +228,7 @@ nonisolated struct TGMessage: Identifiable, Hashable, Sendable {
         self.contentType = contentType
         self.rawText = rawText
         self.entities = entities
+        self.media = media
         self.sendState = sendState
         self.replyToMessageId = replyToMessageId
         self.localId = localId
@@ -186,6 +254,10 @@ nonisolated struct TGMessage: Identifiable, Hashable, Sendable {
     var textForRendering: String? {
         if contentType == "messageText" {
             return rawText ?? text
+        }
+        if contentType == "messagePhoto" || contentType == "messageVideo" {
+            guard let rawText, !rawText.isEmpty else { return nil }
+            return rawText
         }
         if text.isEmpty {
             return nil

@@ -697,6 +697,17 @@ nonisolated enum ChatPerfTrace {
 #endif
     }
 
+    static func recordHeavyEffectsDisabled(chatId: Int64, count: Int = 1) {
+#if DEBUG
+        guard count > 0 else { return }
+        guard isEnabled(for: chatId) else { return }
+        collector?.recordHeavyEffectsDisabled(count)
+#else
+        _ = chatId
+        _ = count
+#endif
+    }
+
     static func shouldCoalesceLatest(chatId: Int64?) -> Bool {
 #if DEBUG
         guard isEnabled(for: chatId) else { return false }
@@ -717,13 +728,14 @@ nonisolated enum ChatPerfTrace {
 #endif
     }
 
-    static func recordTextRender(chatId: Int64, durationMs: Double) {
+    static func recordTextRender(chatId: Int64, durationMs: Double, cacheHit: Bool) {
 #if DEBUG
         guard isEnabled(for: chatId) else { return }
-        collector?.recordTextRender(durationMs)
+        collector?.recordTextRender(durationMs, cacheHit: cacheHit)
 #else
         _ = chatId
         _ = durationMs
+        _ = cacheHit
 #endif
     }
 
@@ -731,6 +743,35 @@ nonisolated enum ChatPerfTrace {
 #if DEBUG
         guard isEnabled(for: chatId) else { return }
         collector?.recordAvatarThumb(durationMs)
+#else
+        _ = chatId
+        _ = durationMs
+#endif
+    }
+
+    static func recordMediaThumbRequest(chatId: Int64) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        collector?.recordMediaThumbRequest()
+#else
+        _ = chatId
+#endif
+    }
+
+    static func recordMediaThumbCacheHit(chatId: Int64, cacheHit: Bool) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        collector?.recordMediaThumbCacheLookup(cacheHit: cacheHit)
+#else
+        _ = chatId
+        _ = cacheHit
+#endif
+    }
+
+    static func recordMediaDecode(chatId: Int64, durationMs: Double) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        collector?.recordMediaDecode(durationMs)
 #else
         _ = chatId
         _ = durationMs
@@ -805,10 +846,17 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
     private var fullRowsRebuildIdleCount: Int = 0
     private var contentOnlyFastPathCount: Int = 0
     private var incrementalRowsBuildCount: Int = 0
+    private var heavyEffectsDisabledCount: Int = 0
     private var buildRowsDurationMs = DurationAggregate()
     private var applyWindowMessagesDurationMs = DurationAggregate()
+    private var textRenderCallCount: Int = 0
+    private var textRenderCacheHitCount: Int = 0
     private var textRenderDurationMs = DurationAggregate()
     private var avatarThumbDurationMs = DurationAggregate()
+    private var mediaThumbRequestCount: Int = 0
+    private var mediaThumbCacheLookupCount: Int = 0
+    private var mediaThumbCacheHitCount: Int = 0
+    private var mediaDecodeDurationMs = DurationAggregate()
     private var snapshotInRateSamples: [Double] = []
     private var snapshotOutRateSamples: [Double] = []
     private let rateSamplesLimit = 64
@@ -876,6 +924,14 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
         }
     }
 
+    func recordHeavyEffectsDisabled(_ count: Int) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard count > 0 else { return }
+            self.heavyEffectsDisabledCount += count
+        }
+    }
+
     func shouldCoalesceLatest() -> Bool {
         queue.sync { snapshotCoalesceLatestEnabled }
     }
@@ -889,9 +945,13 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
         }
     }
 
-    func recordTextRender(_ durationMs: Double) {
+    func recordTextRender(_ durationMs: Double, cacheHit: Bool) {
         queue.async { [weak self] in
             guard let self else { return }
+            self.textRenderCallCount += 1
+            if cacheHit {
+                self.textRenderCacheHitCount += 1
+            }
             self.textRenderDurationMs.record(durationMs)
         }
     }
@@ -900,6 +960,30 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             self.avatarThumbDurationMs.record(durationMs)
+        }
+    }
+
+    func recordMediaThumbRequest() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.mediaThumbRequestCount += 1
+        }
+    }
+
+    func recordMediaThumbCacheLookup(cacheHit: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.mediaThumbCacheLookupCount += 1
+            if cacheHit {
+                self.mediaThumbCacheHitCount += 1
+            }
+        }
+    }
+
+    func recordMediaDecode(_ durationMs: Double) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.mediaDecodeDurationMs.record(durationMs)
         }
     }
 
@@ -916,10 +1000,14 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
             fullRowsRebuildCount > 0 ||
             contentOnlyFastPathCount > 0 ||
             incrementalRowsBuildCount > 0 ||
+            heavyEffectsDisabledCount > 0 ||
             buildRowsDurationMs.count > 0 ||
             applyWindowMessagesDurationMs.count > 0 ||
             textRenderDurationMs.count > 0 ||
-            avatarThumbDurationMs.count > 0
+            avatarThumbDurationMs.count > 0 ||
+            mediaThumbRequestCount > 0 ||
+            mediaThumbCacheLookupCount > 0 ||
+            mediaDecodeDurationMs.count > 0
 
         guard hasActivity else {
             resetWindow(nowNs: nowNs)
@@ -940,6 +1028,15 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
         let fullRebuildsPerSecScrolling = Double(fullRowsRebuildScrollingCount) / max(0.001, scrollingSec)
         let fullRebuildsPerSecIdle = Double(fullRowsRebuildIdleCount) / max(0.001, idleSec)
         let incrementalBuildsPerSec = Double(incrementalRowsBuildCount) / elapsedSec
+        let heavyEffectsDisabledPerSec = Double(heavyEffectsDisabledCount) / elapsedSec
+        let textRenderCallsPerSec = Double(textRenderCallCount) / elapsedSec
+        let textRenderCacheHitRate = textRenderCallCount > 0
+            ? Double(textRenderCacheHitCount) / Double(textRenderCallCount)
+            : 0
+        let mediaThumbRequestsPerSec = Double(mediaThumbRequestCount) / elapsedSec
+        let mediaCacheHitRate = mediaThumbCacheLookupCount > 0
+            ? Double(mediaThumbCacheHitCount) / Double(mediaThumbCacheLookupCount)
+            : 0
 
         if scrollingSec > 0 {
             let scrollLine = [
@@ -978,10 +1075,17 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
             "fullRebuilds/s=\(format(fullRebuildsPerSec))",
             "contentOnlyFastPath/s=\(format(contentOnlyFastPathPerSec))",
             "incrementalBuilds/s=\(format(incrementalBuildsPerSec))",
+            "heavyEffectsDisabled(count/s)=\(heavyEffectsDisabledCount)/\(format(heavyEffectsDisabledPerSec))",
             "buildRowsMs(avg/max)=\(format(buildRowsDurationMs.avgMs))/\(format(buildRowsDurationMs.maxMs))",
             "applyWindowMessagesMs(avg/max)=\(format(applyWindowMessagesDurationMs.avgMs))/\(format(applyWindowMessagesDurationMs.maxMs))",
+            "textRenderCalls/s=\(format(textRenderCallsPerSec))",
+            "textRenderCacheHitRate=\(format(textRenderCacheHitRate * 100))%",
+            "textRenderMaxMs=\(format(textRenderDurationMs.maxMs))",
             "textRenderMs(avg/max)=\(format(textRenderDurationMs.avgMs))/\(format(textRenderDurationMs.maxMs))",
-            "avatarThumbMs(avg/max)=\(format(avatarThumbDurationMs.avgMs))/\(format(avatarThumbDurationMs.maxMs))"
+            "avatarThumbMs(avg/max)=\(format(avatarThumbDurationMs.avgMs))/\(format(avatarThumbDurationMs.maxMs))",
+            "mediaThumbRequests/s=\(format(mediaThumbRequestsPerSec))",
+            "mediaCacheHitRate=\(format(mediaCacheHitRate * 100))%",
+            "mediaDecodeMaxMs=\(format(mediaDecodeDurationMs.maxMs))"
         ].joined(separator: " ")
         log.debug("\(line, privacy: .public)")
 
@@ -1001,10 +1105,17 @@ nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
         fullRowsRebuildIdleCount = 0
         contentOnlyFastPathCount = 0
         incrementalRowsBuildCount = 0
+        heavyEffectsDisabledCount = 0
         buildRowsDurationMs = DurationAggregate()
         applyWindowMessagesDurationMs = DurationAggregate()
+        textRenderCallCount = 0
+        textRenderCacheHitCount = 0
         textRenderDurationMs = DurationAggregate()
         avatarThumbDurationMs = DurationAggregate()
+        mediaThumbRequestCount = 0
+        mediaThumbCacheLookupCount = 0
+        mediaThumbCacheHitCount = 0
+        mediaDecodeDurationMs = DurationAggregate()
     }
 
     private func accumulateScrollingDuration(until nowNs: UInt64) {

@@ -31,6 +31,7 @@ final class TelegramStore: ObservableObject {
 
     @Published var selectedChatId: Int64?
     @Published var isLoadingHistory: Bool = false
+    @Published private(set) var pendingMessageJumpRequest: MessageJumpRequest?
 
     // MARK: - App DB
 
@@ -73,6 +74,23 @@ final class TelegramStore: ObservableObject {
     var requestedAvatarFileIds: Set<Int32> = []
 
     var myPhotoFileId: Int32?
+
+    // MARK: - Message media thumbs (photo/video)
+
+    @Published var mediaStateByMessageKey: [TGMessageMediaKey: TGMediaState] = [:]
+    private var pendingMediaStateUpdates: [TGMessageMediaKey: TGMediaState?] = [:]
+    private var mediaStatePublishTask: Task<Void, Never>?
+    private let mediaStatePublishDelayNs: UInt64 = 40_000_000
+
+    lazy var mediaService: MediaService = MediaService(
+        scheduleDownload: { [weak self] fileId, priority, reason in
+            self?.scheduleDownloadFile(fileId: fileId, priority: priority, reason: reason)
+        },
+        publishState: { [weak self] key, state in
+            guard let self else { return }
+            self.queueMediaStateUpdate(key: key, state: state)
+        }
+    )
 
     // MARK: - JSON parsing cache
 
@@ -189,8 +207,24 @@ final class TelegramStore: ObservableObject {
 
     // MARK: - History jobs
 
-    enum HistoryJobKind { case initialLocal, initialRemote, older }
+    enum HistoryJobKind { case initialLocal, initialRemote, older, around }
     enum PaginationAnchorSource: String { case storeMin, uiTop, other }
+
+    enum MessageJumpSource: String, Sendable {
+        case reply
+        case jump
+        case search
+        case selection
+        case restore
+        case other
+    }
+
+    struct MessageJumpRequest: Identifiable, Equatable, Sendable {
+        let id: UUID
+        let chatId: Int64
+        let messageId: Int64
+        let source: MessageJumpSource
+    }
 
     struct HistoryJob {
         let chatId: Int64
@@ -302,6 +336,28 @@ final class TelegramStore: ObservableObject {
                 self.loadInitialHistory(chatId: chatId)
             }
         }
+    }
+
+    @MainActor
+    func requestMessageJump(
+        chatId: Int64,
+        messageId: Int64,
+        source: MessageJumpSource = .jump
+    ) {
+        guard messageId > 0 else { return }
+        pendingMessageJumpRequest = MessageJumpRequest(
+            id: UUID(),
+            chatId: chatId,
+            messageId: messageId,
+            source: source
+        )
+    }
+
+    @MainActor
+    func consumeMessageJumpRequest(requestId: UUID) {
+        guard let request = pendingMessageJumpRequest else { return }
+        guard request.id == requestId else { return }
+        pendingMessageJumpRequest = nil
     }
 
     @MainActor
@@ -668,6 +724,17 @@ final class TelegramStore: ObservableObject {
         }
     }
 
+    func updateMessageStoreLiveScrolling(chatId: Int64, isLiveScrolling: Bool, anchorMessageId: Int64?) {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            await self.messageStore.setLiveScrolling(
+                chatId: chatId,
+                isLiveScrolling: isLiveScrolling,
+                anchorMessageId: anchorMessageId
+            )
+        }
+    }
+
     func primeMessageStore(chatId: Int64, limit: Int) async {
         let fetched = databaseRepository.fetchLatestMessages(chatId: chatId, limit: limit)
         guard !fetched.isEmpty else {
@@ -675,6 +742,36 @@ final class TelegramStore: ObservableObject {
             return
         }
         _ = await messageStore.mergeMessages(chatId: chatId, messages: fetched, windowLimit: limit)
+    }
+
+    func ensureMediaThumbnail(
+        chatId: Int64,
+        messageId: Int64,
+        descriptor: TGMessageMediaDescriptor,
+        preferThumbnailOnly: Bool
+    ) async -> TGMediaState {
+        await mediaService.ensureThumbnail(
+            chatId: chatId,
+            messageId: messageId,
+            descriptor: descriptor,
+            preferThumbnailOnly: preferThumbnailOnly
+        )
+    }
+
+    @MainActor
+    func mediaState(chatId: Int64, messageId: Int64) -> TGMediaState? {
+        mediaStateByMessageKey[TGMessageMediaKey(chatId: chatId, messageId: messageId)]
+    }
+
+    func handleMediaFileUpdate(_ update: TGFileUpdate) async {
+        await mediaService.handleFileUpdate(update)
+    }
+
+    @MainActor
+    func clearMediaState(chatId: Int64) {
+        Task {
+            await mediaService.clear(chatId: chatId)
+        }
     }
 
     func persistChatLastMessage(chatId: Int64, messageId: Int64, preview: String, date: Int) {
@@ -762,15 +859,91 @@ final class TelegramStore: ObservableObject {
         )
     }
 
+    @MainActor
+    func ensureMessageAvailableForScroll(
+        chatId: Int64,
+        messageId: Int64,
+        timeoutNs: UInt64 = 4_000_000_000
+    ) async -> Bool {
+        guard messageId > 0 else { return false }
+
+        if await messageStore.containsOrderedMessageId(chatId: chatId, messageId: messageId) {
+            return true
+        }
+
+#if DEBUG
+        log.debug("ensure message for scroll started chatId=\(chatId, privacy: .public) messageId=\(messageId, privacy: .public)")
+#endif
+
+        _ = await messageStore.setWindowFocus(
+            chatId: chatId,
+            isFollowingLatest: false,
+            anchorMessageId: messageId
+        )
+
+        if let persisted = databaseRepository.fetchMessage(chatId: chatId, messageId: messageId) {
+            _ = await messageStore.mergeMessages(
+                chatId: chatId,
+                messages: [persisted],
+                windowLimit: historyWindowLimitByChatId[chatId] ?? 160
+            )
+            if await messageStore.containsOrderedMessageId(chatId: chatId, messageId: messageId) {
+                return true
+            }
+        }
+
+        let pageSize = max(50, min(100, (historyWindowLimitByChatId[chatId] ?? 160) / 2))
+        var requestedAround = loadHistoryAroundMessage(
+            chatId: chatId,
+            messageId: messageId,
+            pageSize: pageSize
+        )
+        let pollNs: UInt64 = 120_000_000
+        let startedAtNs = DispatchTime.now().uptimeNanoseconds
+
+        while DispatchTime.now().uptimeNanoseconds &- startedAtNs < timeoutNs {
+            if await messageStore.containsOrderedMessageId(chatId: chatId, messageId: messageId) {
+#if DEBUG
+                log.debug("ensure message for scroll resolved chatId=\(chatId, privacy: .public) messageId=\(messageId, privacy: .public)")
+#endif
+                return true
+            }
+            if !requestedAround,
+               !historyJobs.values.contains(where: { $0.chatId == chatId && $0.kind == .around }) {
+                requestedAround = loadHistoryAroundMessage(
+                    chatId: chatId,
+                    messageId: messageId,
+                    pageSize: pageSize
+                )
+            }
+            try? await Task.sleep(nanoseconds: pollNs)
+            if Task.isCancelled {
+                return false
+            }
+        }
+
+        let available = await messageStore.containsOrderedMessageId(chatId: chatId, messageId: messageId)
+#if DEBUG
+        if !available {
+            log.error("ensure message for scroll timeout chatId=\(chatId, privacy: .public) messageId=\(messageId, privacy: .public)")
+        }
+#endif
+        return available
+    }
+
     // Storage (implemented in +Storage)
     @MainActor func refreshStorageStatistics() { _refreshStorageStatistics_impl() }
     @MainActor func applyCacheLimitBytes(_ bytes: Int64) { _applyCacheLimitBytes_impl(bytes) }
     @MainActor func clearAllCache() { _clearAllCache_impl() }
 
     // Avatars/images (implemented in +Avatars)
+    @MainActor
     var myProfileNSImage: NSImage? { myProfileNSImage(pointSize: 36) }
+
+    @MainActor
     func myProfileNSImage(pointSize: CGFloat) -> NSImage? { _myProfileNSImage_impl(pointSize: pointSize) }
 
+    @MainActor
     func chatAvatarNSImage(
         chatId: Int64,
         pointSize: CGFloat,
@@ -781,11 +954,37 @@ final class TelegramStore: ObservableObject {
         _chatAvatarNSImage_impl(chatId: chatId, pointSize: pointSize, preferHiRes: preferHiRes, maxClamp: maxClamp, kindOverride: kindOverride)
     }
 
+    @MainActor
     func chatAvatarNSImage(chatId: Int64) -> NSImage? {
         chatAvatarNSImage(chatId: chatId, pointSize: 40, preferHiRes: false)
     }
 
-    func prefetchChatAvatarHiResIfNeeded(chatId: Int64) { _prefetchChatAvatarHiResIfNeeded_impl(chatId: chatId) }
+    @MainActor
+    func prefetchChatAvatarHiResIfNeeded(chatId: Int64) {
+        _prefetchChatAvatarHiResIfNeeded_impl(chatId: chatId)
+    }
+
+    @MainActor
+    func chatAvatarNSImageAsync(
+        chatId: Int64,
+        pointSize: CGFloat,
+        preferHiRes: Bool = false,
+        maxClamp: Int? = nil,
+        kindOverride: String? = nil
+    ) async -> NSImage? {
+        chatAvatarNSImage(
+            chatId: chatId,
+            pointSize: pointSize,
+            preferHiRes: preferHiRes,
+            maxClamp: maxClamp,
+            kindOverride: kindOverride
+        )
+    }
+
+    @MainActor
+    func chatAvatarNSImageAsync(chatId: Int64) async -> NSImage? {
+        chatAvatarNSImage(chatId: chatId)
+    }
 
     // MARK: - Authorization
 
@@ -892,6 +1091,12 @@ final class TelegramStore: ObservableObject {
         chatIdByAvatarFileId = [:]
         requestedAvatarFileIds = []
         myPhotoFileId = nil
+
+        mediaStatePublishTask?.cancel()
+        mediaStatePublishTask = nil
+        pendingMediaStateUpdates = [:]
+        mediaStateByMessageKey = [:]
+        Task { await mediaService.reset() }
 
         lastParsedUpdate = nil
         lastParsedObject = nil
@@ -1002,7 +1207,31 @@ final class TelegramStore: ObservableObject {
     }
 
     @MainActor
+    func debugAssertAvatarStateAccess(_ context: StaticString = #function) {
+#if DEBUG
+        let contextString = String(describing: context)
+        if !Thread.isMainThread {
+            log.fault("avatar storage access off-main context=\(contextString, privacy: .public)")
+            assertionFailure("Avatar storage access off-main context=\(contextString)")
+        }
+        let metaStorage: Any = chatAvatarMetaByChatId
+        guard metaStorage is [Int64: ChatAvatarMeta] else {
+            log.fault("avatar meta storage unexpected type context=\(contextString, privacy: .public)")
+            assertionFailure("Unexpected avatar meta storage type: \(type(of: metaStorage))")
+            return
+        }
+        let pathStorage: Any = chatAvatarPathByChatId
+        guard pathStorage is [Int64: String] else {
+            log.fault("avatar path storage unexpected type context=\(contextString, privacy: .public)")
+            assertionFailure("Unexpected avatar path storage type: \(type(of: pathStorage))")
+            return
+        }
+#endif
+    }
+
+    @MainActor
     func queueChatAvatarPathUpdate(chatId: Int64, path: String?) {
+        debugAssertAvatarStateAccess()
         let normalized: String? = {
             guard let path, !path.isEmpty else { return nil }
             return path
@@ -1023,6 +1252,7 @@ final class TelegramStore: ObservableObject {
 
     @MainActor
     private func scheduleAvatarPathPublishIfNeeded() {
+        debugAssertAvatarStateAccess()
         guard avatarPathPublishTask == nil else { return }
         avatarPathPublishTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1033,6 +1263,7 @@ final class TelegramStore: ObservableObject {
 
     @MainActor
     private func flushQueuedAvatarPathUpdates(attempt: Int) async {
+        debugAssertAvatarStateAccess()
         guard !pendingAvatarPathUpdates.isEmpty else {
             avatarPathPublishTask = nil
             return
@@ -1057,6 +1288,55 @@ final class TelegramStore: ObservableObject {
 
         if nextPaths != chatAvatarPathByChatId {
             chatAvatarPathByChatId = nextPaths
+        }
+    }
+
+    @MainActor
+    private func queueMediaStateUpdate(key: TGMessageMediaKey, state: TGMediaState?) {
+        if pendingMediaStateUpdates[key] == state,
+           mediaStateByMessageKey[key] == state {
+            return
+        }
+        pendingMediaStateUpdates[key] = state
+        scheduleMediaStatePublishIfNeeded()
+    }
+
+    @MainActor
+    private func scheduleMediaStatePublishIfNeeded() {
+        guard mediaStatePublishTask == nil else { return }
+        mediaStatePublishTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: self.mediaStatePublishDelayNs)
+            await self.flushQueuedMediaStateUpdates(attempt: 0)
+        }
+    }
+
+    @MainActor
+    private func flushQueuedMediaStateUpdates(attempt: Int) async {
+        guard !pendingMediaStateUpdates.isEmpty else {
+            mediaStatePublishTask = nil
+            return
+        }
+
+        if ViewUpdatePhaseTracker.shared.isViewUpdating, attempt < 8 {
+            try? await Task.sleep(nanoseconds: 16_000_000)
+            await flushQueuedMediaStateUpdates(attempt: attempt + 1)
+            return
+        }
+
+        var nextStateByKey = mediaStateByMessageKey
+        for (key, state) in pendingMediaStateUpdates {
+            if let state {
+                nextStateByKey[key] = state
+            } else {
+                nextStateByKey.removeValue(forKey: key)
+            }
+        }
+        pendingMediaStateUpdates.removeAll(keepingCapacity: true)
+        mediaStatePublishTask = nil
+
+        if nextStateByKey != mediaStateByMessageKey {
+            mediaStateByMessageKey = nextStateByKey
         }
     }
 }
@@ -1496,6 +1776,9 @@ actor MessageStore {
         let orderedCount: Int
         let modelsCount: Int
         let visibleCount: Int
+        let trimsDeferredCount: Int
+        let trimsAppliedAfterScrollCount: Int
+        let trimsDuringLiveScrollCount: Int
     }
 
     struct WindowFocusState: Sendable, Equatable {
@@ -1507,6 +1790,12 @@ actor MessageStore {
         var prepended: Int = 0
         var appended: Int = 0
         var interior: Int = 0
+    }
+
+    private struct LiveScrollTrimMetrics: Sendable {
+        var trimsDeferredCount: Int = 0
+        var trimsAppliedAfterScrollCount: Int = 0
+        var trimsDuringLiveScrollCount: Int = 0
     }
 
     private struct ChatState {
@@ -1523,21 +1812,37 @@ actor MessageStore {
     private let maxMessagesPerChat: Int
     private let slidingWindowHardCap: Int
     private let followingLatestLowWatermarkGap: Int
+    private let liveScrollOverflowCap: Int
+    private let liveScrollSoftTrimTarget: Int
     private let sortBias: Int64 = 9_000_000_000_000_000_000
     private var chatStateById: [Int64: ChatState] = [:]
     private var windowFocusByChatId: [Int64: WindowFocusState] = [:]
+    private var liveScrollingChatIds: Set<Int64> = []
+    private var deferredTrimChatIds: Set<Int64> = []
+    private var liveScrollTrimMetricsByChatId: [Int64: LiveScrollTrimMetrics] = [:]
     private var mutationCount = 0
+#if DEBUG
+    private let debugStoreWindowInvariantCap = 600
+#endif
 
     init(
         publishDebounceMs: UInt64 = 33,
         maxMessagesPerChat: Int = 6_000,
         slidingWindowHardCap: Int = 600,
-        followingLatestLowWatermarkGap: Int = 40
+        followingLatestLowWatermarkGap: Int = 40,
+        liveScrollOverflowCap: Int = 680,
+        liveScrollSoftTrimTarget: Int = 650
     ) {
         self.publishDebounceNs = publishDebounceMs * 1_000_000
         self.maxMessagesPerChat = maxMessagesPerChat
         self.slidingWindowHardCap = max(40, slidingWindowHardCap)
         self.followingLatestLowWatermarkGap = max(0, followingLatestLowWatermarkGap)
+        let overflowCap = max(self.slidingWindowHardCap, liveScrollOverflowCap)
+        self.liveScrollOverflowCap = min(700, overflowCap)
+        self.liveScrollSoftTrimTarget = min(
+            self.liveScrollOverflowCap,
+            max(self.slidingWindowHardCap, liveScrollSoftTrimTarget)
+        )
     }
 
     func historyTraceSnapshot(chatId: Int64) -> HistoryTraceSnapshot {
@@ -1574,12 +1879,16 @@ actor MessageStore {
     }
 
     func debugWindowSnapshot(chatId: Int64) -> DebugWindowSnapshot {
+        let metrics = liveScrollTrimMetricsByChatId[chatId] ?? LiveScrollTrimMetrics()
         guard var chat = chatStateById[chatId] else {
             return DebugWindowSnapshot(
                 windowLimit: 160,
                 orderedCount: 0,
                 modelsCount: 0,
-                visibleCount: 0
+                visibleCount: 0,
+                trimsDeferredCount: metrics.trimsDeferredCount,
+                trimsAppliedAfterScrollCount: metrics.trimsAppliedAfterScrollCount,
+                trimsDuringLiveScrollCount: metrics.trimsDuringLiveScrollCount
             )
         }
         normalizeOrderedIdsIfNeeded(chat: &chat)
@@ -1589,8 +1898,58 @@ actor MessageStore {
             windowLimit: chat.windowLimit,
             orderedCount: chat.orderedMessageIds.count,
             modelsCount: chat.messagesById.count,
-            visibleCount: visibleCount
+            visibleCount: visibleCount,
+            trimsDeferredCount: metrics.trimsDeferredCount,
+            trimsAppliedAfterScrollCount: metrics.trimsAppliedAfterScrollCount,
+            trimsDuringLiveScrollCount: metrics.trimsDuringLiveScrollCount
         )
+    }
+
+    func setLiveScrolling(chatId: Int64, isLiveScrolling: Bool, anchorMessageId: Int64?) {
+        var chat = chatStateById[chatId] ?? ChatState()
+        normalizeOrderedIdsIfNeeded(chat: &chat)
+
+        if isLiveScrolling {
+            liveScrollingChatIds.insert(chatId)
+            chatStateById[chatId] = chat
+            debugAssertStoreWindowCountInvariant(chatId: chatId, chat: chat, stage: "scrollStart")
+            return
+        }
+
+        liveScrollingChatIds.remove(chatId)
+        let hadDeferredTrim = deferredTrimChatIds.remove(chatId) != nil
+        guard hadDeferredTrim else {
+            chatStateById[chatId] = chat
+            debugAssertStoreWindowCountInvariant(chatId: chatId, chat: chat, stage: "scrollEndIdle")
+            return
+        }
+
+        let normalizedAnchor = anchorMessageId.flatMap { $0 > 0 ? $0 : nil }
+        let focusOverride = normalizedAnchor.map {
+            WindowFocusState(isFollowingLatest: false, anchorMessageId: $0)
+        }
+
+        let trimmed = trimToSlidingWindowIfNeeded(
+            chatId: chatId,
+            chat: &chat,
+            delta: nil,
+            focusOverride: focusOverride,
+            forceApply: true
+        )
+        chatStateById[chatId] = chat
+        debugAssertStoreWindowCountInvariant(chatId: chatId, chat: chat, stage: "scrollEndFlush")
+        if trimmed {
+            incrementTrimsAppliedAfterScroll(chatId: chatId)
+            schedulePublish(chatId: chatId)
+        }
+    }
+
+    func containsOrderedMessageId(chatId: Int64, messageId: Int64) -> Bool {
+        guard messageId > 0 else { return false }
+        guard var chat = chatStateById[chatId] else { return false }
+        normalizeOrderedIdsIfNeeded(chat: &chat)
+        chatStateById[chatId] = chat
+        return indexOfMessageId(messageId, in: chat.orderedMessageIds) != nil
     }
 
     func setWindowFocus(chatId: Int64, isFollowingLatest: Bool, anchorMessageId: Int64?) -> Bool {
@@ -1683,6 +2042,7 @@ actor MessageStore {
             _ = trimToSlidingWindowIfNeeded(chatId: chatId, chat: &chat, delta: insertionDelta)
         }
         chatStateById[chatId] = chat
+        debugAssertStoreWindowCountInvariant(chatId: chatId, chat: chat, stage: "merge")
         if changed > 0 {
             debugLogMutation(label: "merge", chatId: chatId, changed: changed)
             schedulePublish(chatId: chatId)
@@ -1724,6 +2084,70 @@ actor MessageStore {
     }
 
     @discardableResult
+    func applyContentPayload(
+        chatId: Int64,
+        messageId: Int64,
+        text: String,
+        contentType: String,
+        rawText: String?,
+        entities: [TGTextEntity],
+        media: TGMessageMediaDescriptor?
+    ) -> Bool {
+        guard var chat = chatStateById[chatId],
+              var message = chat.messagesById[messageId]
+        else { return false }
+        normalizeOrderedIdsIfNeeded(chat: &chat)
+
+        var hasChanges = false
+        if message.text != text {
+            message.text = text
+            hasChanges = true
+        }
+        if message.rawText != rawText {
+            message.rawText = rawText
+            hasChanges = true
+        }
+        if message.entities != entities {
+            message.entities = entities
+            hasChanges = true
+        }
+        if message.contentType != contentType {
+            message = TGMessage(
+                id: message.id,
+                chatId: message.chatId,
+                date: message.date,
+                isOutgoing: message.isOutgoing,
+                senderUserId: message.senderUserId,
+                text: message.text,
+                contentType: contentType,
+                rawText: message.rawText,
+                entities: message.entities,
+                media: message.media,
+                sendState: message.sendState,
+                replyToMessageId: message.replyToMessageId,
+                localId: message.localId,
+                sendingId: message.sendingId,
+                editedAt: message.editedAt,
+                canRetry: message.canRetry,
+                retryCount: message.retryCount,
+                nextRetryAt: message.nextRetryAt
+            )
+            hasChanges = true
+        }
+        if message.media != media {
+            message.media = media
+            hasChanges = true
+        }
+
+        guard hasChanges else { return false }
+        chat.messagesById[messageId] = message
+        chatStateById[chatId] = chat
+        debugLogMutation(label: "contentPayload", chatId: chatId, changed: 1)
+        schedulePublish(chatId: chatId)
+        return true
+    }
+
+    @discardableResult
     func applyDelete(chatId: Int64, messageIds: [Int64]) -> Int {
         guard var chat = chatStateById[chatId], !messageIds.isEmpty else { return 0 }
         normalizeOrderedIdsIfNeeded(chat: &chat)
@@ -1747,6 +2171,9 @@ actor MessageStore {
         }
         chatStateById.removeAll(keepingCapacity: false)
         windowFocusByChatId.removeAll(keepingCapacity: false)
+        liveScrollingChatIds.removeAll(keepingCapacity: false)
+        deferredTrimChatIds.removeAll(keepingCapacity: false)
+        liveScrollTrimMetricsByChatId.removeAll(keepingCapacity: false)
     }
 
     private func attach(
@@ -1761,6 +2188,7 @@ actor MessageStore {
         _ = trimToSlidingWindowIfNeeded(chatId: chatId, chat: &chat, delta: nil)
         chat.continuations[subscriberId] = continuation
         chatStateById[chatId] = chat
+        debugAssertStoreWindowCountInvariant(chatId: chatId, chat: chat, stage: "attach")
         continuation.yield(snapshot(for: chat))
     }
 
@@ -1799,6 +2227,7 @@ actor MessageStore {
     private func publish(chatId: Int64) {
         guard var chat = chatStateById[chatId] else { return }
         normalizeOrderedIdsIfNeeded(chat: &chat)
+        debugAssertStoreWindowCountInvariant(chatId: chatId, chat: chat, stage: "publish")
         chat.publishTask = nil
         let newSnapshot = snapshot(for: chat)
         let subscribersCount = chat.continuations.count
@@ -1870,20 +2299,78 @@ actor MessageStore {
     private func trimToSlidingWindowIfNeeded(
         chatId: Int64,
         chat: inout ChatState,
-        delta: MergeInsertionDelta?
+        delta: MergeInsertionDelta?,
+        focusOverride: WindowFocusState? = nil,
+        forceApply: Bool = false
     ) -> Bool {
         let target = max(40, min(chat.windowLimit, slidingWindowHardCap))
         let count = chat.orderedMessageIds.count
         guard count > target else { return false }
+        let isLiveScrolling = liveScrollingChatIds.contains(chatId)
+        if isLiveScrolling && !forceApply {
+            deferredTrimChatIds.insert(chatId)
+            incrementTrimsDeferred(chatId: chatId)
+            if count <= liveScrollOverflowCap {
+                return false
+            }
+            let liveSoftTarget = max(target, liveScrollSoftTrimTarget)
+            let didTrim = applyTrim(
+                chatId: chatId,
+                chat: &chat,
+                delta: delta,
+                target: liveSoftTarget,
+                focusOverride: focusOverride,
+                applyFollowingLowWatermark: false
+            )
+            if didTrim {
+                incrementTrimsDuringLiveScroll(chatId: chatId)
+            }
+            return didTrim
+        }
 
-        let focus = windowFocusByChatId[chatId]
+        return applyTrim(
+            chatId: chatId,
+            chat: &chat,
+            delta: delta,
+            target: target,
+            focusOverride: focusOverride
+        )
+    }
+
+    @discardableResult
+    private func applyTrim(
+        chatId: Int64,
+        chat: inout ChatState,
+        delta: MergeInsertionDelta?,
+        target: Int,
+        focusOverride: WindowFocusState?,
+        applyFollowingLowWatermark: Bool = true
+    ) -> Bool {
+        let count = chat.orderedMessageIds.count
+        guard count > target else { return false }
+        let overflow = count - target
+        let direction = insertionDirection(delta: delta)
+        let focus = focusOverride
+            ?? windowFocusByChatId[chatId]
             ?? WindowFocusState(isFollowingLatest: true, anchorMessageId: nil)
 
-        let overflow = count - target
         if focus.isFollowingLatest {
-            let preferred = max(40, target - followingLatestLowWatermarkGap)
+            let preferred =
+                applyFollowingLowWatermark
+                ? max(40, target - followingLatestLowWatermarkGap)
+                : target
             let removal = max(overflow, count - preferred)
+            let evictedTop = min(removal, count)
             removePrefix(chat: &chat, count: removal)
+            debugLogSlidingWindowEviction(
+                chatId: chatId,
+                mode: "following",
+                direction: direction,
+                beforeCount: count,
+                target: target,
+                evictedTop: evictedTop,
+                evictedBottom: 0
+            )
             return true
         }
 
@@ -1901,9 +2388,29 @@ actor MessageStore {
 
         guard let anchorIndex else {
             if let delta, delta.prepended > delta.appended {
+                let evictedBottom = min(overflow, count)
                 removeSuffix(chat: &chat, count: overflow)
+                debugLogSlidingWindowEviction(
+                    chatId: chatId,
+                    mode: "anchored",
+                    direction: "prepend",
+                    beforeCount: count,
+                    target: target,
+                    evictedTop: 0,
+                    evictedBottom: evictedBottom
+                )
             } else {
+                let evictedTop = min(overflow, count)
                 removePrefix(chat: &chat, count: overflow)
+                debugLogSlidingWindowEviction(
+                    chatId: chatId,
+                    mode: "anchored",
+                    direction: "append",
+                    beforeCount: count,
+                    target: target,
+                    evictedTop: evictedTop,
+                    evictedBottom: 0
+                )
             }
             return true
         }
@@ -1931,6 +2438,15 @@ actor MessageStore {
         if removeTailCount > 0 {
             removeSuffix(chat: &chat, count: removeTailCount)
         }
+        debugLogSlidingWindowEviction(
+            chatId: chatId,
+            mode: "anchored",
+            direction: direction,
+            beforeCount: count,
+            target: target,
+            evictedTop: removeHeadCount,
+            evictedBottom: removeTailCount
+        )
         return true
     }
 
@@ -2007,6 +2523,78 @@ actor MessageStore {
         }
         guard low < orderedIds.count, orderedIds[low] == messageId else { return nil }
         return low
+    }
+
+    private func insertionDirection(delta: MergeInsertionDelta?) -> String {
+        guard let delta else { return "append" }
+        return delta.prepended > delta.appended ? "prepend" : "append"
+    }
+
+    private func debugAssertStoreWindowCountInvariant(chatId: Int64, chat: ChatState, stage: String) {
+#if DEBUG
+        let cap =
+            liveScrollingChatIds.contains(chatId)
+            ? max(self.debugStoreWindowInvariantCap, self.liveScrollOverflowCap)
+            : self.debugStoreWindowInvariantCap
+        let storeWindowCount = chat.orderedMessageIds.count
+        if storeWindowCount > cap {
+            log.fault(
+                "store window invariant violated chatId=\(chatId, privacy: .public) stage=\(stage, privacy: .public) storeWindowCount=\(storeWindowCount, privacy: .public) cap=\(cap, privacy: .public)"
+            )
+        }
+        assert(
+            storeWindowCount <= cap,
+            "MessageStore invariant failed stage=\(stage) chatId=\(chatId) storeWindowCount=\(storeWindowCount) cap=\(cap)"
+        )
+#else
+        _ = chatId
+        _ = chat
+        _ = stage
+#endif
+    }
+
+    private func incrementTrimsDeferred(chatId: Int64) {
+        var metrics = liveScrollTrimMetricsByChatId[chatId] ?? LiveScrollTrimMetrics()
+        metrics.trimsDeferredCount += 1
+        liveScrollTrimMetricsByChatId[chatId] = metrics
+    }
+
+    private func incrementTrimsAppliedAfterScroll(chatId: Int64) {
+        var metrics = liveScrollTrimMetricsByChatId[chatId] ?? LiveScrollTrimMetrics()
+        metrics.trimsAppliedAfterScrollCount += 1
+        liveScrollTrimMetricsByChatId[chatId] = metrics
+    }
+
+    private func incrementTrimsDuringLiveScroll(chatId: Int64) {
+        var metrics = liveScrollTrimMetricsByChatId[chatId] ?? LiveScrollTrimMetrics()
+        metrics.trimsDuringLiveScrollCount += 1
+        liveScrollTrimMetricsByChatId[chatId] = metrics
+    }
+
+    private func debugLogSlidingWindowEviction(
+        chatId: Int64,
+        mode: String,
+        direction: String,
+        beforeCount: Int,
+        target: Int,
+        evictedTop: Int,
+        evictedBottom: Int
+    ) {
+#if DEBUG
+        guard evictedTop > 0 || evictedBottom > 0 else { return }
+        let afterCount = max(0, beforeCount - evictedTop - evictedBottom)
+        log.debug(
+            "sliding-window eviction chatId=\(chatId, privacy: .public) mode=\(mode, privacy: .public) direction=\(direction, privacy: .public) evictedTop=\(evictedTop, privacy: .public) evictedBottom=\(evictedBottom, privacy: .public) before=\(beforeCount, privacy: .public) after=\(afterCount, privacy: .public) target=\(target, privacy: .public)"
+        )
+#else
+        _ = chatId
+        _ = mode
+        _ = direction
+        _ = beforeCount
+        _ = target
+        _ = evictedTop
+        _ = evictedBottom
+#endif
     }
 
     private func debugLogMutation(label: String, chatId: Int64, changed: Int) {

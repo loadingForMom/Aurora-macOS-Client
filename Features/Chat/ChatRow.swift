@@ -13,6 +13,11 @@ final class DiskImageCache {
     static let shared = DiskImageCache()
 
     private let cache = NSCache<NSString, NSImage>()
+    private let decodeQueue = DispatchQueue(
+        label: "com.aurora.app.avatar.disk.decode",
+        qos: .utility,
+        attributes: .concurrent
+    )
 
     private init() {
         cache.countLimit = 512
@@ -26,6 +31,33 @@ final class DiskImageCache {
         else { return nil }
         cache.setObject(img, forKey: key)
         return img
+    }
+
+    func imageAsync(path: String) async -> NSImage? {
+        let cacheKey = path
+        if let hit = cache.object(forKey: cacheKey as NSString) { return hit }
+
+        return await withCheckedContinuation { continuation in
+            decodeQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let key = cacheKey as NSString
+                if let hit = self.cache.object(forKey: key) {
+                    continuation.resume(returning: hit)
+                    return
+                }
+                guard FileManager.default.fileExists(atPath: cacheKey),
+                      let img = NSImage(contentsOfFile: cacheKey)
+                else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                self.cache.setObject(img, forKey: key)
+                continuation.resume(returning: img)
+            }
+        }
     }
 }
 
@@ -79,7 +111,7 @@ struct AvatarCircle: View {
     let image: NSImage?
     let identityKey: AvatarCacheKey?
     let reloadToken: String?
-    let imageProvider: (() -> NSImage?)?
+    let imageProvider: (() async -> NSImage?)?
     let size: CGFloat
     let font: Font
     @State private var loadedImage: NSImage? = nil
@@ -110,7 +142,7 @@ struct AvatarCircle: View {
         reloadToken: String? = nil,
         size: CGFloat,
         font: Font,
-        imageProvider: @escaping () -> NSImage?
+        imageProvider: @escaping () async -> NSImage?
     ) {
         self.title = title
         self.image = nil
@@ -182,9 +214,7 @@ struct AvatarCircle: View {
         }
 
         let requestKey = identityKey
-        let image = await Task.detached(priority: .userInitiated) {
-            imageProvider()
-        }.value
+        let image = await imageProvider()
 
         guard !Task.isCancelled else { return }
         guard self.identityKey == requestKey else {
@@ -234,8 +264,15 @@ struct ChatRow: View {
                 size: 34,
                 font: .caption.weight(.semibold),
                 imageProvider: {
-                    store.chatAvatarNSImage(chatId: chat.id, pointSize: 34, preferHiRes: false)
-                    ?? avatarPath.flatMap { DiskImageCache.shared.image(path: $0) }
+                    if let image = await store.chatAvatarNSImageAsync(
+                        chatId: chat.id,
+                        pointSize: 34,
+                        preferHiRes: false
+                    ) {
+                        return image
+                    }
+                    guard let avatarPath else { return nil }
+                    return await DiskImageCache.shared.imageAsync(path: avatarPath)
                 }
             )
             .overlay(

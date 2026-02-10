@@ -8,14 +8,19 @@ import Combine
 
 extension TelegramStore {
 
+    @MainActor
     func screenScale() -> CGFloat {
-        avatarService.screenScale()
+        debugAssertAvatarStateAccess()
+        return avatarService.screenScale()
     }
 
+    @MainActor
     func maxPixel(forPointSize pt: CGFloat, clampTo maxClamp: Int) -> Int {
-        avatarService.maxPixel(forPointSize: pt, clampTo: maxClamp)
+        debugAssertAvatarStateAccess()
+        return avatarService.maxPixel(forPointSize: pt, clampTo: maxClamp)
     }
 
+    @MainActor
     func _myProfileNSImage_impl(pointSize: CGFloat) -> NSImage? {
         avatarService.myProfileNSImage(
             pointSize: pointSize,
@@ -24,6 +29,7 @@ extension TelegramStore {
         )
     }
 
+    @MainActor
     func _chatAvatarNSImage_impl(
         chatId: Int64,
         pointSize: CGFloat,
@@ -31,6 +37,7 @@ extension TelegramStore {
         maxClamp: Int?,
         kindOverride: String?
     ) -> NSImage? {
+        debugAssertAvatarStateAccess()
         let image = avatarService.chatAvatarNSImage(
             chatId: chatId,
             pointSize: pointSize,
@@ -50,7 +57,9 @@ extension TelegramStore {
         return image
     }
 
+    @MainActor
     func _prefetchChatAvatarHiResIfNeeded_impl(chatId: Int64) {
+        debugAssertAvatarStateAccess()
         avatarService.prefetchChatAvatarHiResIfNeeded(
             chatId: chatId,
             chatAvatarMetaByChatId: chatAvatarMetaByChatId,
@@ -62,6 +71,7 @@ extension TelegramStore {
 
     @MainActor
     func registerChatAvatar(chatId: Int64, smallFileId: Int32?, bigFileId: Int32?, initialBestPath: String?) {
+        debugAssertAvatarStateAccess()
         avatarService.registerChatAvatar(
             chatId: chatId,
             smallFileId: smallFileId,
@@ -76,6 +86,7 @@ extension TelegramStore {
 
     @MainActor
     func applyChatAvatarFileUpdate(chatId: Int64, fileId: Int32, path: String) {
+        debugAssertAvatarStateAccess()
         let bestPath = avatarService.applyChatAvatarFileUpdate(
             chatId: chatId,
             fileId: fileId,
@@ -88,6 +99,7 @@ extension TelegramStore {
 
     @MainActor
     func clearChatAvatar(chatId: Int64) {
+        debugAssertAvatarStateAccess()
         if let meta = chatAvatarMetaByChatId.removeValue(forKey: chatId) {
             if let smallId = meta.smallFileId, chatIdByAvatarFileId[smallId] == chatId {
                 chatIdByAvatarFileId.removeValue(forKey: smallId)
@@ -102,11 +114,13 @@ extension TelegramStore {
 
     @MainActor
     func downloadFileIfNeeded(fileId: Int32, priority: Int) {
+        debugAssertAvatarStateAccess()
         scheduleDownloadFile(fileId: fileId, priority: priority, reason: "avatar-manual:\(fileId)")
     }
 
     // MARK: - Thumbnail load/make
 
+    @MainActor
     func loadOrMakeThumbNSImage(
         sourcePath: String,
         fileId: Int32?,

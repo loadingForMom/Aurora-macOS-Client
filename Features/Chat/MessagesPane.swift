@@ -17,13 +17,16 @@ struct MessagesPane: View {
     @Binding var isPagingHistory: Bool
 
     @State private var rows: [Row] = []
+    @State private var renderMessages: [TGMessage] = []
+    @State private var renderRange: Range<Int> = 0..<0
     @State private var windowMessages: [TGMessage] = []
-    @State private var previousMessageIds: [Int64] = []
+    @State private var previousRenderMessageIds: [Int64] = []
     @State private var groupRowMinYById: [String: CGFloat] = [:]
     @State private var prependAnchorMessageId: Int64? = nil
     @State private var prependAnchorRowId: String? = nil
     @State private var prependAnchorMinYBefore: CGFloat? = nil
     @State private var rowBuildTask: Task<Void, Never>? = nil
+    @State private var mediaPrefetchTask: Task<Void, Never>? = nil
     @State private var rowBuildToken = UUID()
     @State private var scrollViewRef = ScrollViewReference()
 
@@ -31,6 +34,7 @@ struct MessagesPane: View {
     @State private var pagingInFlight: Bool = false
     @State private var restoreAnchorAfterPaging: Bool = false
     @State private var pendingRestoreAnchorMessageId: Int64? = nil
+    @State private var pendingJumpAnchorMessageId: Int64? = nil
     @State private var paginationBaselineFirstMessageId: Int64? = nil
     @State private var lastRequestedTopAnchorMessageId: Int64? = nil
 
@@ -38,6 +42,9 @@ struct MessagesPane: View {
     @State private var newIncomingCount: Int = 0
     @State private var visibleMessageIds: Set<Int64> = []
     @State private var visibleReportTask: Task<Void, Never>? = nil
+    @State private var renderRangePrefetchHysteresisArmed: Bool = true
+    @State private var renderRangePrefetchDebounceTask: Task<Void, Never>? = nil
+    @State private var renderRangePrefetchRequestStartedAtNs: [UInt64] = []
 
     @State private var didInitialScrollToBottom: Bool = false
 
@@ -48,20 +55,34 @@ struct MessagesPane: View {
     @State private var isTopSentinelVisible: Bool = false
     @State private var pendingTopVisibleRetryAfterLoading: Bool = false
     @State private var isLiveScrolling: Bool = false
+    @State private var userHasInteractedWithScroll: Bool = false
     @State private var isLightweightScrollRenderMode: Bool = false
     @State private var lightweightScrollRenderModeResetTask: Task<Void, Never>? = nil
     @State private var windowingDebugTask: Task<Void, Never>? = nil
     @State private var windowFocusSyncTask: Task<Void, Never>? = nil
+    @State private var jumpToMessageTask: Task<Void, Never>? = nil
+    @State private var jumpUnavailableBannerTask: Task<Void, Never>? = nil
+    @State private var jumpUnavailableBannerText: String? = nil
     private let groupGap: Int = 5 * 60
     private let majorGap: Int = 60 * 60
     private let autoScrollAnimationCooldownNs: UInt64 = 220_000_000
     private let lightweightRenderModeResetDelayNs: UInt64 = 120_000_000
     private let paginationTopThreshold: CGFloat = 260
     private let heavyEffectsCutoffMessages: Int = 700
-    private let textPrewarmBudget: Int = 150
+    private let textPrewarmMargin: Int = 36
+    private let mediaPrefetchMargin: Int = 24
+    private let mediaPrefetchMaxConcurrency: Int = 4
     private let revealTimeMaxX: CGFloat = 72
     private let windowingDebugIntervalNs: UInt64 = 2_000_000_000
     private let windowFocusSyncDelayNs: UInt64 = 120_000_000
+    private let renderWindowLimit: Int = 320
+    private let renderWindowShiftMargin: Int = 80
+    private let renderRangePrefetchTriggerDistance: Int = 30
+    private let renderRangePrefetchReleaseDistance: Int = 80
+    private let renderRangePrefetchDebounceNs: UInt64 = 220_000_000
+    private let renderRangePrefetchRateWindowNs: UInt64 = 1_000_000_000
+    private let jumpRenderPollNs: UInt64 = 90_000_000
+    private let jumpRenderMaxAttempts: Int = 12
 
     private static let rowBuildWorker = RowsBuildWorker()
     private let scrollSpaceName = "messages-scroll-space"
@@ -81,6 +102,9 @@ struct MessagesPane: View {
         (pagingInFlight || store.isLoadingHistory) &&
         (isTopSentinelVisible || isViewportUnderfilledForPaging)
     }
+    private var activeRenderAnchorMessageId: Int64? {
+        pendingRestoreAnchorMessageId ?? pendingJumpAnchorMessageId
+    }
 
     private struct RowBuildResult: Sendable {
         let filteredMessages: [TGMessage]
@@ -99,6 +123,29 @@ struct MessagesPane: View {
             case .group(let g): return g.id
             }
         }
+    }
+
+    private struct VisibleIndexSpan: Sendable {
+        let min: Int
+        let max: Int
+
+        nonisolated var center: Int { min + ((max - min) / 2) }
+    }
+
+    private struct RenderWindowUpdate: Sendable {
+        let range: Range<Int>
+        let visibleSpan: VisibleIndexSpan?
+    }
+
+    private struct ApplyTraceInfo: Sendable {
+        let startNs: UInt64
+        let signpostId: OSSignpostID
+        let enabled: Bool
+    }
+
+    private struct MediaPrefetchRequest: Sendable, Hashable {
+        let messageId: Int64
+        let descriptor: TGMessageMediaDescriptor
     }
 
     private actor RowsBuildWorker {
@@ -355,48 +402,166 @@ struct MessagesPane: View {
         return "\(components.year ?? 0)-\(components.month ?? 0)-\(components.day ?? 0)"
     }
 
-    nonisolated private static func textPrewarmSlice(
+    nonisolated private static func finalizeApplyTrace(
+        _ traceInfo: ApplyTraceInfo?,
+        chatId: Int64
+    ) {
+        guard let traceInfo else { return }
+        if traceInfo.enabled {
+            let durationMs = ChatPerfTrace.elapsedMs(since: traceInfo.startNs)
+            ChatPerfTrace.recordApplyWindowMessages(chatId: chatId, durationMs: durationMs)
+        }
+        ChatPerfTrace.endSignpost(
+            "applyWindowMessages",
+            signpostId: traceInfo.signpostId,
+            chatId: chatId
+        )
+    }
+
+    nonisolated private static func normalizedRenderRange(
+        _ range: Range<Int>,
+        messageCount: Int,
+        limit: Int
+    ) -> Range<Int> {
+        guard messageCount > 0 else { return 0..<0 }
+        let clampedLimit = max(1, min(limit, messageCount))
+        let maxLowerBound = max(0, messageCount - clampedLimit)
+        let lowerBound = min(max(0, range.lowerBound), maxLowerBound)
+        let upperBound = min(messageCount, lowerBound + clampedLimit)
+        return lowerBound..<upperBound
+    }
+
+    nonisolated private static func centeredRenderRange(
+        anchorIndex: Int,
+        messageCount: Int,
+        limit: Int
+    ) -> Range<Int> {
+        guard messageCount > 0 else { return 0..<0 }
+        let clampedLimit = max(1, min(limit, messageCount))
+        let clampedAnchor = min(max(0, anchorIndex), messageCount - 1)
+        let halfWindow = clampedLimit / 2
+        var lowerBound = max(0, clampedAnchor - halfWindow)
+        let upperBound = min(messageCount, lowerBound + clampedLimit)
+        if upperBound - lowerBound < clampedLimit {
+            lowerBound = max(0, upperBound - clampedLimit)
+        }
+        return lowerBound..<upperBound
+    }
+
+    nonisolated private static func visibleIndexSpan(
+        indexById: [Int64: Int],
+        visibleMessageIds: Set<Int64>
+    ) -> VisibleIndexSpan? {
+        guard !visibleMessageIds.isEmpty else { return nil }
+        var minIndex = Int.max
+        var maxIndex = Int.min
+        var foundAny = false
+        for messageId in visibleMessageIds {
+            guard let index = indexById[messageId] else { continue }
+            minIndex = min(minIndex, index)
+            maxIndex = max(maxIndex, index)
+            foundAny = true
+        }
+        guard foundAny else { return nil }
+        return VisibleIndexSpan(min: minIndex, max: maxIndex)
+    }
+
+    nonisolated private static func computeRenderWindowUpdate(
         messages: [TGMessage],
         visibleMessageIds: Set<Int64>,
-        fallbackAnchorMessageId: Int64?,
-        budget: Int
-    ) -> [TGMessage] {
-        guard !messages.isEmpty else { return [] }
-        let clampedBudget = max(1, min(budget, messages.count))
+        pendingAnchorMessageId: Int64?,
+        currentRange: Range<Int>,
+        isAtBottom: Bool,
+        renderWindowLimit: Int,
+        shiftMargin: Int
+    ) -> RenderWindowUpdate {
+        guard !messages.isEmpty else {
+            return RenderWindowUpdate(range: 0..<0, visibleSpan: nil)
+        }
+
+        let clampedLimit = max(1, min(renderWindowLimit, messages.count))
+        if messages.count <= clampedLimit {
+            var indexById: [Int64: Int] = [:]
+            indexById.reserveCapacity(messages.count)
+            for (index, message) in messages.enumerated() where message.id > 0 {
+                indexById[message.id] = index
+            }
+            let visibleSpan = visibleIndexSpan(indexById: indexById, visibleMessageIds: visibleMessageIds)
+            return RenderWindowUpdate(range: 0..<messages.count, visibleSpan: visibleSpan)
+        }
 
         var indexById: [Int64: Int] = [:]
         indexById.reserveCapacity(messages.count)
-        for (index, message) in messages.enumerated() {
+        for (index, message) in messages.enumerated() where message.id > 0 {
             indexById[message.id] = index
         }
+        let visibleSpan = visibleIndexSpan(indexById: indexById, visibleMessageIds: visibleMessageIds)
+        let normalizedCurrent = normalizedRenderRange(
+            currentRange,
+            messageCount: messages.count,
+            limit: clampedLimit
+        )
 
         let anchorIndex: Int = {
-            if !visibleMessageIds.isEmpty {
-                var visibleIndices: [Int] = []
-                visibleIndices.reserveCapacity(visibleMessageIds.count)
-                for id in visibleMessageIds {
-                    if let index = indexById[id] {
-                        visibleIndices.append(index)
-                    }
-                }
-                if !visibleIndices.isEmpty {
-                    visibleIndices.sort()
-                    return visibleIndices[visibleIndices.count / 2]
-                }
+            if let pendingAnchorMessageId,
+               pendingAnchorMessageId > 0,
+               let pendingIndex = indexById[pendingAnchorMessageId] {
+                return pendingIndex
             }
-            if let fallbackAnchorMessageId,
-               let fallbackIndex = indexById[fallbackAnchorMessageId] {
-                return fallbackIndex
+            if let visibleSpan {
+                return visibleSpan.center
             }
-            return messages.count - 1
+            if !normalizedCurrent.isEmpty {
+                return normalizedCurrent.lowerBound + ((normalizedCurrent.upperBound - normalizedCurrent.lowerBound) / 2)
+            }
+            return isAtBottom ? (messages.count - 1) : max(0, messages.count - clampedLimit)
         }()
 
-        let halfWindow = clampedBudget / 2
-        var lowerBound = max(0, anchorIndex - halfWindow)
-        let upperBound = min(messages.count, lowerBound + clampedBudget)
-        if upperBound - lowerBound < clampedBudget {
-            lowerBound = max(0, upperBound - clampedBudget)
+        let centered = centeredRenderRange(
+            anchorIndex: anchorIndex,
+            messageCount: messages.count,
+            limit: clampedLimit
+        )
+
+        let margin = max(1, min(shiftMargin, clampedLimit / 2))
+        var nextRange = normalizedCurrent
+        if nextRange.isEmpty {
+            nextRange = centered
+        } else {
+            let lowerShiftBoundary = nextRange.lowerBound + margin
+            let upperShiftBoundary = nextRange.upperBound - margin
+            if anchorIndex < lowerShiftBoundary || anchorIndex >= upperShiftBoundary {
+                nextRange = centered
+            }
         }
+
+        if let visibleSpan,
+           (visibleSpan.min < nextRange.lowerBound || visibleSpan.max >= nextRange.upperBound) {
+            nextRange = centeredRenderRange(
+                anchorIndex: visibleSpan.center,
+                messageCount: messages.count,
+                limit: clampedLimit
+            )
+        }
+
+        return RenderWindowUpdate(range: nextRange, visibleSpan: visibleSpan)
+    }
+
+    nonisolated private static func textPrewarmSlice(
+        messages: [TGMessage],
+        targetRange: Range<Int>,
+        margin: Int
+    ) -> [TGMessage] {
+        guard !messages.isEmpty else { return [] }
+        let clampedTargetRange = normalizedRenderRange(
+            targetRange,
+            messageCount: messages.count,
+            limit: messages.count
+        )
+        guard !clampedTargetRange.isEmpty else { return [] }
+        let clampedMargin = max(0, margin)
+        let lowerBound = max(0, clampedTargetRange.lowerBound - clampedMargin)
+        let upperBound = min(messages.count, clampedTargetRange.upperBound + clampedMargin)
         guard lowerBound < upperBound else { return [] }
 
         return messages[lowerBound..<upperBound].filter { message in
@@ -404,16 +569,90 @@ struct MessagesPane: View {
         }
     }
 
-    @MainActor
-    private func scheduleTextPrewarm(messages: [TGMessage]) {
-        let candidates = Self.textPrewarmSlice(
-            messages: messages,
-            visibleMessageIds: visibleMessageIds,
-            fallbackAnchorMessageId: pendingRestoreAnchorMessageId,
-            budget: textPrewarmBudget
+    nonisolated private static func mediaPrefetchSlice(
+        messages: [TGMessage],
+        targetRange: Range<Int>,
+        margin: Int
+    ) -> [MediaPrefetchRequest] {
+        guard !messages.isEmpty else { return [] }
+        let clampedTargetRange = normalizedRenderRange(
+            targetRange,
+            messageCount: messages.count,
+            limit: messages.count
         )
-        guard !candidates.isEmpty else { return }
+        guard !clampedTargetRange.isEmpty else { return [] }
+        let clampedMargin = max(0, margin)
+        let lowerBound = max(0, clampedTargetRange.lowerBound - clampedMargin)
+        let upperBound = min(messages.count, clampedTargetRange.upperBound + clampedMargin)
+        guard lowerBound < upperBound else { return [] }
+
+        return messages[lowerBound..<upperBound].compactMap { message in
+            guard message.contentType == "messagePhoto" || message.contentType == "messageVideo" else {
+                return nil
+            }
+            guard let descriptor = message.media else { return nil }
+            return MediaPrefetchRequest(messageId: message.id, descriptor: descriptor)
+        }
+    }
+
+    @MainActor
+    private func scheduleTextPrewarm(
+        fullWindowMessages: [TGMessage],
+        targetRenderRange: Range<Int>
+    ) {
+        let candidates = Self.textPrewarmSlice(
+            messages: fullWindowMessages,
+            targetRange: targetRenderRange,
+            margin: textPrewarmMargin
+        )
         MessageTextPipeline.enqueuePrewarm(chatId: chat.id, messages: candidates, style: .bubbleBody)
+    }
+
+    @MainActor
+    private func scheduleMediaPrefetch(
+        fullWindowMessages: [TGMessage],
+        targetRenderRange: Range<Int>
+    ) {
+        let requests = Self.mediaPrefetchSlice(
+            messages: fullWindowMessages,
+            targetRange: targetRenderRange,
+            margin: mediaPrefetchMargin
+        )
+
+        mediaPrefetchTask?.cancel()
+        mediaPrefetchTask = nil
+        guard !requests.isEmpty else { return }
+
+        let chatId = chat.id
+        let preferThumbnailOnly = isLiveScrolling || isLightweightScrollRenderMode
+        let mediaService = store.mediaService
+        let maxConcurrency = mediaPrefetchMaxConcurrency
+
+        mediaPrefetchTask = Task.detached(priority: .utility) {
+            let workerCount = max(1, min(maxConcurrency, requests.count))
+            await withTaskGroup(of: Void.self) { group in
+                for worker in 0..<workerCount {
+                    group.addTask {
+                        var index = worker
+                        while index < requests.count {
+                            if Task.isCancelled { return }
+                            let request = requests[index]
+                            _ = await mediaService.ensureThumbnail(
+                                chatId: chatId,
+                                messageId: request.messageId,
+                                descriptor: request.descriptor,
+                                preferThumbnailOnly: preferThumbnailOnly
+                            )
+                            index += workerCount
+                            if index.isMultiple(of: 8) {
+                                await Task.yield()
+                            }
+                        }
+                    }
+                }
+                await group.waitForAll()
+            }
+        }
     }
 
     nonisolated private static func updatedMessagesByIdForContentOnlyUpdate(
@@ -537,13 +776,18 @@ struct MessagesPane: View {
     private func resetStateForChat() {
         rowBuildTask?.cancel()
         rowBuildTask = nil
+        mediaPrefetchTask?.cancel()
+        mediaPrefetchTask = nil
         rowBuildToken = UUID()
+        MessageTextPipeline.cancelPrewarm()
         stopWindowingDebugLogging(reason: "reset")
         cancelWindowFocusSyncTask()
 
         rows = []
+        renderMessages = []
+        renderRange = 0..<0
         windowMessages = []
-        previousMessageIds = []
+        previousRenderMessageIds = []
         groupRowMinYById = [:]
         clearPrependPixelAnchor()
 
@@ -552,6 +796,7 @@ struct MessagesPane: View {
         restoreAnchorAfterPaging = false
         isPagingHistory = false
         pendingRestoreAnchorMessageId = nil
+        pendingJumpAnchorMessageId = nil
         paginationBaselineFirstMessageId = nil
         lastRequestedTopAnchorMessageId = nil
 
@@ -562,72 +807,191 @@ struct MessagesPane: View {
         visibleMessageIds = []
         store.resetVisibleMessageTracking(chatId: chat.id)
         store.updateMessageWindowFocus(chatId: chat.id, isFollowingLatest: true, anchorMessageId: nil)
+        store.updateMessageStoreLiveScrolling(chatId: chat.id, isLiveScrolling: false, anchorMessageId: nil)
 
         didInitialScrollToBottom = false
 
         revealTimeX = 0
         lastAutoScrollAnimatedAtNs = 0
+        renderRangePrefetchDebounceTask?.cancel()
+        renderRangePrefetchDebounceTask = nil
+        renderRangePrefetchHysteresisArmed = true
+        renderRangePrefetchRequestStartedAtNs = []
         didCrossPaginationThreshold = false
         lastTopSentinelMinY = -.greatestFiniteMagnitude
         isTopSentinelVisible = false
         pendingTopVisibleRetryAfterLoading = false
         lightweightScrollRenderModeResetTask?.cancel()
         lightweightScrollRenderModeResetTask = nil
+        userHasInteractedWithScroll = false
         isLightweightScrollRenderMode = false
+        jumpToMessageTask?.cancel()
+        jumpToMessageTask = nil
+        jumpUnavailableBannerTask?.cancel()
+        jumpUnavailableBannerTask = nil
+        jumpUnavailableBannerText = nil
+    }
+
+    @MainActor
+    private func renderRangeReasonForSnapshot() -> String {
+        if pagingInFlight || store.isLoadingHistory {
+            return "prefetch"
+        }
+        return "snapshot"
+    }
+
+    private func renderRangeReasonForRefreshSource(_ source: String) -> String {
+        if source.localizedCaseInsensitiveContains("prefetch") {
+            return "prefetch"
+        }
+        return "scroll"
+    }
+
+    @MainActor
+    private func debugLogRenderRangeRecalculated(
+        reason: String,
+        source: String,
+        previousRange: Range<Int>,
+        nextRange: Range<Int>,
+        messageCount: Int
+    ) {
+#if DEBUG
+        guard previousRange != nextRange else { return }
+        windowingLog.debug(
+            "render-window range chatId=\(chat.id, privacy: .public) reason=\(reason, privacy: .public) source=\(source, privacy: .public) renderLower=\(nextRange.lowerBound, privacy: .public) renderUpper=\(nextRange.upperBound, privacy: .public) prevLower=\(previousRange.lowerBound, privacy: .public) prevUpper=\(previousRange.upperBound, privacy: .public) messageCount=\(messageCount, privacy: .public) isLiveScrolling=\(isLiveScrolling, privacy: .public)"
+        )
+#else
+        _ = reason
+        _ = source
+        _ = previousRange
+        _ = nextRange
+        _ = messageCount
+#endif
+    }
+
+    @MainActor
+    private func debugLogLiveScrollTrimIfNeeded(previousCount: Int, nextCount: Int, reason: String) {
+#if DEBUG
+        guard isLiveScrolling else { return }
+        guard previousCount > 0, nextCount < previousCount else { return }
+        let trimmed = previousCount - nextCount
+        windowingLog.error(
+            "live-scroll trim chatId=\(chat.id, privacy: .public) reason=\(reason, privacy: .public) trimmed=\(trimmed, privacy: .public) previousCount=\(previousCount, privacy: .public) nextCount=\(nextCount, privacy: .public) renderLower=\(renderRange.lowerBound, privacy: .public) renderUpper=\(renderRange.upperBound, privacy: .public)"
+        )
+#else
+        _ = previousCount
+        _ = nextCount
+        _ = reason
+#endif
     }
 
     @MainActor
     private func applyWindowMessages(_ messages: [TGMessage]) {
         let expectedChatId = chat.id
         let traceEnabled = ChatPerfTrace.isEnabled(for: expectedChatId)
-        let applyWindowStartNs = traceEnabled ? DispatchTime.now().uptimeNanoseconds : 0
-        let applySignpostId = ChatPerfTrace.beginSignpost("applyWindowMessages", chatId: expectedChatId)
         let filteredMessages = messages.filter { $0.chatId == expectedChatId }
-        let currentIds = filteredMessages.map(\.id)
+        let renderRecalcReason = renderRangeReasonForSnapshot()
+        debugLogLiveScrollTrimIfNeeded(
+            previousCount: windowMessages.count,
+            nextCount: filteredMessages.count,
+            reason: renderRecalcReason
+        )
+        let traceInfo = ApplyTraceInfo(
+            startNs: traceEnabled ? DispatchTime.now().uptimeNanoseconds : 0,
+            signpostId: ChatPerfTrace.beginSignpost("applyWindowMessages", chatId: expectedChatId),
+            enabled: traceEnabled
+        )
+        let renderUpdate = Self.computeRenderWindowUpdate(
+            messages: filteredMessages,
+            visibleMessageIds: visibleMessageIds,
+            pendingAnchorMessageId: activeRenderAnchorMessageId,
+            currentRange: renderRange,
+            isAtBottom: isAtBottom,
+            renderWindowLimit: renderWindowLimit,
+            shiftMargin: renderWindowShiftMargin
+        )
+        maybeRequestOlderNearRenderRangeEdge(update: renderUpdate, source: "renderWindowSnapshot")
+        applyRenderWindow(
+            fullWindowMessages: filteredMessages,
+            renderUpdate: renderUpdate,
+            expectedChatId: expectedChatId,
+            traceInfo: traceInfo,
+            recalcReason: renderRecalcReason,
+            source: "renderWindowSnapshot"
+        )
+    }
+
+    @MainActor
+    private func applyRenderWindow(
+        fullWindowMessages: [TGMessage],
+        renderUpdate: RenderWindowUpdate,
+        expectedChatId: Int64,
+        traceInfo: ApplyTraceInfo?,
+        recalcReason: String,
+        source: String
+    ) {
+        let previousRange = renderRange
+        let nextRenderRange = renderUpdate.range
+        let nextRenderMessages = nextRenderRange.isEmpty
+            ? []
+            : Array(fullWindowMessages[nextRenderRange])
+        let nextRenderIds = nextRenderMessages.map(\.id)
         let token = UUID()
-        let previousMessages = windowMessages
+        let previousRenderMessages = renderMessages
         let previousRows = rows
         let currentGroupGap = groupGap
         let currentMajorGap = majorGap
 
+        debugLogRenderRangeRecalculated(
+            reason: recalcReason,
+            source: source,
+            previousRange: previousRange,
+            nextRange: nextRenderRange,
+            messageCount: fullWindowMessages.count
+        )
         rowBuildToken = token
         rowBuildTask?.cancel()
         rowBuildTask = nil
+        renderRange = nextRenderRange
+        scheduleTextPrewarm(
+            fullWindowMessages: fullWindowMessages,
+            targetRenderRange: nextRenderRange
+        )
+        scheduleMediaPrefetch(
+            fullWindowMessages: fullWindowMessages,
+            targetRenderRange: nextRenderRange
+        )
 
-        if previousMessageIds.elementsEqual(currentIds) {
+        if previousRenderMessageIds.elementsEqual(nextRenderIds) {
             let updatedMessagesById = Self.updatedMessagesByIdForContentOnlyUpdate(
-                previousMessages: previousMessages,
-                newMessages: filteredMessages
+                previousMessages: previousRenderMessages,
+                newMessages: nextRenderMessages
             ) ?? [:]
             if !updatedMessagesById.isEmpty {
-                rows = Self.patchRowsForUpdatedMessages(previousRows: previousRows, updatedMessagesById: updatedMessagesById)
+                rows = Self.patchRowsForUpdatedMessages(
+                    previousRows: previousRows,
+                    updatedMessagesById: updatedMessagesById
+                )
             }
-            windowMessages = filteredMessages
-            previousMessageIds = currentIds
-            if traceEnabled {
+            windowMessages = fullWindowMessages
+            renderMessages = nextRenderMessages
+            previousRenderMessageIds = nextRenderIds
+            if traceInfo?.enabled == true {
                 ChatPerfTrace.recordContentOnlyFastPath(chatId: expectedChatId)
             }
-            if traceEnabled {
-                let applyWindowMessagesDurationMs = ChatPerfTrace.elapsedMs(since: applyWindowStartNs)
-                ChatPerfTrace.recordApplyWindowMessages(chatId: expectedChatId, durationMs: applyWindowMessagesDurationMs)
-            }
-            ChatPerfTrace.endSignpost("applyWindowMessages", signpostId: applySignpostId, chatId: expectedChatId)
+            Self.finalizeApplyTrace(traceInfo, chatId: expectedChatId)
             return
         }
 
-        rowBuildTask = Task.detached(priority: .userInitiated) { [token, expectedChatId, messages, previousMessages, previousRows, currentGroupGap, currentMajorGap, traceEnabled, applyWindowStartNs, applySignpostId] in
+        rowBuildTask = Task.detached(priority: .userInitiated) { [token, expectedChatId, nextRenderMessages, previousRenderMessages, previousRows, currentGroupGap, currentMajorGap, fullWindowMessages, nextRenderRange, traceInfo] in
             defer {
-                if traceEnabled {
-                    let applyWindowMessagesDurationMs = ChatPerfTrace.elapsedMs(since: applyWindowStartNs)
-                    ChatPerfTrace.recordApplyWindowMessages(chatId: expectedChatId, durationMs: applyWindowMessagesDurationMs)
-                }
-                ChatPerfTrace.endSignpost("applyWindowMessages", signpostId: applySignpostId, chatId: expectedChatId)
+                Self.finalizeApplyTrace(traceInfo, chatId: expectedChatId)
             }
 
             let buildResult = await Self.rowBuildWorker.build(
                 chatId: expectedChatId,
-                messages: messages,
-                previousMessages: previousMessages,
+                messages: nextRenderMessages,
+                previousMessages: previousRenderMessages,
                 previousRows: previousRows,
                 groupGap: currentGroupGap,
                 majorGap: currentMajorGap
@@ -636,11 +1000,226 @@ struct MessagesPane: View {
             await MainActor.run {
                 guard rowBuildToken == token else { return }
                 guard chat.id == expectedChatId else { return }
-                windowMessages = buildResult.filteredMessages
+                windowMessages = fullWindowMessages
+                renderMessages = buildResult.filteredMessages
                 rows = buildResult.rows
-                previousMessageIds = buildResult.filteredMessages.map(\.id)
+                renderRange = nextRenderRange
+                previousRenderMessageIds = buildResult.filteredMessages.map(\.id)
             }
         }
+    }
+
+    @MainActor
+    private func refreshRenderWindowIfNeeded(source: String) {
+        guard !windowMessages.isEmpty else { return }
+        let renderRecalcReason = renderRangeReasonForRefreshSource(source)
+        let renderUpdate = Self.computeRenderWindowUpdate(
+            messages: windowMessages,
+            visibleMessageIds: visibleMessageIds,
+            pendingAnchorMessageId: activeRenderAnchorMessageId,
+            currentRange: renderRange,
+            isAtBottom: isAtBottom,
+            renderWindowLimit: renderWindowLimit,
+            shiftMargin: renderWindowShiftMargin
+        )
+        maybeRequestOlderNearRenderRangeEdge(update: renderUpdate, source: source)
+        guard renderUpdate.range != renderRange else { return }
+        applyRenderWindow(
+            fullWindowMessages: windowMessages,
+            renderUpdate: renderUpdate,
+            expectedChatId: chat.id,
+            traceInfo: nil,
+            recalcReason: renderRecalcReason,
+            source: source
+        )
+    }
+
+    @MainActor
+    private func maybeRequestOlderNearRenderRangeEdge(
+        update: RenderWindowUpdate,
+        source: String
+    ) {
+        guard didInitialScrollToBottom else { return }
+        guard let visibleSpan = update.visibleSpan else { return }
+        guard !update.range.isEmpty else { return }
+        let distanceToRenderTop = visibleSpan.min - update.range.lowerBound
+        evaluateRenderRangePrefetch(source: source, distanceToTop: distanceToRenderTop)
+    }
+
+    @MainActor
+    private func evaluateRenderRangePrefetch(source: String, distanceToTop: Int) {
+        let currentRate = currentRenderRangePrefetchRequestsPerSecond()
+
+        if distanceToTop > renderRangePrefetchReleaseDistance {
+            if !renderRangePrefetchHysteresisArmed {
+                renderRangePrefetchHysteresisArmed = true
+                traceRenderRangePrefetch(
+                    event: "hysteresis",
+                    source: source,
+                    reason: "rearmed",
+                    distanceToTop: distanceToTop,
+                    requestsPerSecond: currentRate
+                )
+            }
+            cancelRenderRangePrefetchDebounce(
+                source: source,
+                reason: "leftReleaseZone",
+                distanceToTop: distanceToTop
+            )
+            return
+        }
+
+        guard distanceToTop < renderRangePrefetchTriggerDistance else {
+            traceRenderRangePrefetch(
+                event: "gate",
+                source: source,
+                reason: "betweenThresholds",
+                distanceToTop: distanceToTop,
+                requestsPerSecond: currentRate,
+                rateLimitMs: 220
+            )
+            return
+        }
+
+        if !renderRangePrefetchHysteresisArmed {
+            if renderRangePrefetchDebounceTask != nil {
+                scheduleRenderRangePrefetchDebouncedTrigger(
+                    source: source,
+                    distanceToTop: distanceToTop
+                )
+            } else {
+                traceRenderRangePrefetch(
+                    event: "gate",
+                    source: source,
+                    reason: "hysteresisLocked",
+                    distanceToTop: distanceToTop,
+                    requestsPerSecond: currentRate,
+                    rateLimitMs: 180
+                )
+            }
+            return
+        }
+
+        renderRangePrefetchHysteresisArmed = false
+        scheduleRenderRangePrefetchDebouncedTrigger(
+            source: source,
+            distanceToTop: distanceToTop
+        )
+    }
+
+    @MainActor
+    private func scheduleRenderRangePrefetchDebouncedTrigger(
+        source: String,
+        distanceToTop: Int
+    ) {
+        let existingTask = renderRangePrefetchDebounceTask
+        existingTask?.cancel()
+
+        traceRenderRangePrefetch(
+            event: "debounce",
+            source: source,
+            reason: existingTask == nil ? "scheduled" : "rescheduled",
+            distanceToTop: distanceToTop,
+            requestsPerSecond: currentRenderRangePrefetchRequestsPerSecond(),
+            rateLimitMs: 0
+        )
+
+        let chatId = chat.id
+        renderRangePrefetchDebounceTask = Task { @MainActor [chatId, source, distanceToTop] in
+            try? await Task.sleep(nanoseconds: renderRangePrefetchDebounceNs)
+            guard !Task.isCancelled else { return }
+            guard chat.id == chatId else { return }
+            renderRangePrefetchDebounceTask = nil
+
+            traceRenderRangePrefetch(
+                event: "debounce",
+                source: source,
+                reason: "fired",
+                distanceToTop: distanceToTop,
+                requestsPerSecond: currentRenderRangePrefetchRequestsPerSecond(),
+                rateLimitMs: 0
+            )
+
+            requestOlderHistoryFromTopTrigger(
+                source: source,
+                triggerReason: "renderRangeDebounced",
+                prefetchDistanceToTop: distanceToTop
+            )
+        }
+    }
+
+    @MainActor
+    private func cancelRenderRangePrefetchDebounce(
+        source: String,
+        reason: String,
+        distanceToTop: Int?
+    ) {
+        guard renderRangePrefetchDebounceTask != nil else { return }
+        renderRangePrefetchDebounceTask?.cancel()
+        renderRangePrefetchDebounceTask = nil
+        traceRenderRangePrefetch(
+            event: "debounce",
+            source: source,
+            reason: reason,
+            distanceToTop: distanceToTop,
+            requestsPerSecond: currentRenderRangePrefetchRequestsPerSecond(),
+            rateLimitMs: 0
+        )
+    }
+
+    @MainActor
+    private func currentRenderRangePrefetchRequestsPerSecond(
+        nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> Double {
+        pruneRenderRangePrefetchRequestRateWindow(nowNs: nowNs)
+        return Double(renderRangePrefetchRequestStartedAtNs.count)
+    }
+
+    @MainActor
+    private func recordRenderRangePrefetchRequestStarted(
+        nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> Double {
+        renderRangePrefetchRequestStartedAtNs.append(nowNs)
+        pruneRenderRangePrefetchRequestRateWindow(nowNs: nowNs)
+        return Double(renderRangePrefetchRequestStartedAtNs.count)
+    }
+
+    @MainActor
+    private func pruneRenderRangePrefetchRequestRateWindow(nowNs: UInt64) {
+        renderRangePrefetchRequestStartedAtNs.removeAll { timestampNs in
+            if nowNs < timestampNs { return false }
+            return (nowNs - timestampNs) > renderRangePrefetchRateWindowNs
+        }
+    }
+
+    @MainActor
+    private func traceRenderRangePrefetch(
+        event: String,
+        source: String,
+        reason: String,
+        distanceToTop: Int? = nil,
+        requestsPerSecond: Double? = nil,
+        rateLimitMs: UInt64 = 120
+    ) {
+        guard HistoryTrace.isEnabled(for: chat.id) else { return }
+        HistoryTrace.emit(
+            tag: "HIST_PREFETCH",
+            chatId: chat.id,
+            fields: [
+                ("event", event),
+                ("source", source),
+                ("reason", reason),
+                ("distanceToTop", HistoryTrace.optionalInt(distanceToTop)),
+                ("triggerDistance", String(renderRangePrefetchTriggerDistance)),
+                ("releaseDistance", String(renderRangePrefetchReleaseDistance)),
+                ("hysteresisArmed", HistoryTrace.boolValue(renderRangePrefetchHysteresisArmed)),
+                ("debouncePending", HistoryTrace.boolValue(renderRangePrefetchDebounceTask != nil)),
+                ("prefetchRequestsPerSecond", HistoryTrace.optionalDouble(requestsPerSecond, decimals: 2)),
+                ("uiTopMessageId", HistoryTrace.optionalInt64(windowMessages.first?.id))
+            ],
+            rateKey: "ui:\(chat.id):prefetch:\(event):\(source):\(reason)",
+            rateLimitMs: rateLimitMs
+        )
     }
 
     @MainActor
@@ -772,7 +1351,23 @@ struct MessagesPane: View {
     }
 
     @MainActor
-    private func requestOlderHistoryFromTopTrigger(source: String) {
+    private func requestOlderHistoryFromTopTrigger(
+        source: String,
+        triggerReason: String? = nil,
+        prefetchDistanceToTop: Int? = nil
+    ) {
+        let isRenderRangePrefetch = triggerReason != nil
+        if isRenderRangePrefetch {
+            traceRenderRangePrefetch(
+                event: "trigger",
+                source: source,
+                reason: triggerReason ?? "none",
+                distanceToTop: prefetchDistanceToTop,
+                requestsPerSecond: currentRenderRangePrefetchRequestsPerSecond(),
+                rateLimitMs: 0
+            )
+        }
+
         if HistoryTrace.isEnabled(for: chat.id) {
             HistoryTrace.emit(
                 tag: "HIST_UI",
@@ -780,6 +1375,8 @@ struct MessagesPane: View {
                 fields: [
                     ("event", "requestOlderTrigger"),
                     ("source", source),
+                    ("triggerReason", triggerReason ?? "default"),
+                    ("prefetchDistanceToTop", HistoryTrace.optionalInt(prefetchDistanceToTop)),
                     ("isTopSentinelVisible", HistoryTrace.boolValue(isTopSentinelVisible)),
                     ("isAtBottom", HistoryTrace.boolValue(isAtBottom)),
                     ("isViewportUnderfilled", HistoryTrace.boolValue(isViewportUnderfilledForPaging)),
@@ -793,6 +1390,19 @@ struct MessagesPane: View {
         }
 
         let started = requestOlderHistoryIfNeeded()
+        if isRenderRangePrefetch {
+            let rate = started
+                ? recordRenderRangePrefetchRequestStarted()
+                : currentRenderRangePrefetchRequestsPerSecond()
+            traceRenderRangePrefetch(
+                event: "result",
+                source: source,
+                reason: started ? "requestStarted" : "requestSkipped",
+                distanceToTop: prefetchDistanceToTop,
+                requestsPerSecond: rate,
+                rateLimitMs: 0
+            )
+        }
         if started {
             pendingTopVisibleRetryAfterLoading = false
             return
@@ -834,16 +1444,18 @@ struct MessagesPane: View {
         }
         scheduleVisibleMessagesReport()
         scheduleWindowFocusSync()
+        refreshRenderWindowIfNeeded(source: "visibleAreaChanged")
     }
 
     @MainActor
     private func pruneVisibleMessageIdsToWindow() {
-        let validIds = Set(windowMessages.filter { $0.id > 0 }.map(\.id))
+        let validIds = Set(renderMessages.filter { $0.id > 0 }.map(\.id))
         let pruned = visibleMessageIds.intersection(validIds)
         guard pruned != visibleMessageIds else { return }
         visibleMessageIds = pruned
         scheduleVisibleMessagesReport()
         scheduleWindowFocusSync()
+        refreshRenderWindowIfNeeded(source: "pruneVisibleIds")
     }
 
     @MainActor
@@ -977,11 +1589,11 @@ struct MessagesPane: View {
     private func emitWindowingDebugLog(reason: String, chatId: Int64) async {
 #if DEBUG
         let uiRowsCount = rows.count
-        let uiMessagesCount = windowMessages.count
+        let uiMessagesCount = renderMessages.count
         let visibleCount = visibleMessageIds.count
         let snapshot = await store.messageStore.debugWindowSnapshot(chatId: chatId)
         windowingLog.debug(
-            "chat window metrics chatId=\(chatId, privacy: .public) reason=\(reason, privacy: .public) isLiveScrolling=\(isLiveScrolling, privacy: .public) windowLimit=\(snapshot.windowLimit, privacy: .public) storeWindowCount=\(snapshot.orderedCount, privacy: .public) storeModelsCount=\(snapshot.modelsCount, privacy: .public) uiRowsCount=\(uiRowsCount, privacy: .public) uiMessagesCount=\(uiMessagesCount, privacy: .public) visibleCount=\(visibleCount, privacy: .public) storeVisibleCount=\(snapshot.visibleCount, privacy: .public)"
+            "chat window metrics chatId=\(chatId, privacy: .public) reason=\(reason, privacy: .public) isLiveScrolling=\(isLiveScrolling, privacy: .public) windowLimit=\(snapshot.windowLimit, privacy: .public) storeWindowCount=\(snapshot.orderedCount, privacy: .public) storeModelsCount=\(snapshot.modelsCount, privacy: .public) renderLower=\(renderRange.lowerBound, privacy: .public) renderUpper=\(renderRange.upperBound, privacy: .public) uiRowsCount=\(uiRowsCount, privacy: .public) uiMessagesCount=\(uiMessagesCount, privacy: .public) visibleCount=\(visibleCount, privacy: .public) storeVisibleCount=\(snapshot.visibleCount, privacy: .public) trimsDeferredCount=\(snapshot.trimsDeferredCount, privacy: .public) trimsAppliedAfterScrollCount=\(snapshot.trimsAppliedAfterScrollCount, privacy: .public) trimsDuringLiveScrollCount=\(snapshot.trimsDuringLiveScrollCount, privacy: .public)"
         )
 #else
         _ = reason
@@ -1031,6 +1643,116 @@ struct MessagesPane: View {
     }
 
     @MainActor
+    private func markUserScrollInteraction(_ source: String) {
+        guard !userHasInteractedWithScroll else { return }
+        userHasInteractedWithScroll = true
+#if DEBUG
+        windowingLog.debug(
+            "user scroll interaction chatId=\(chat.id, privacy: .public) source=\(source, privacy: .public)"
+        )
+#else
+        _ = source
+#endif
+    }
+
+    @MainActor
+    private func shouldSuppressAutoScroll(reason: String) -> Bool {
+        let suppressed = isLiveScrolling || userHasInteractedWithScroll
+        guard suppressed else { return false }
+#if DEBUG
+        windowingLog.debug(
+            "auto-scroll suppressed chatId=\(chat.id, privacy: .public) reason=\(reason, privacy: .public) isLiveScrolling=\(isLiveScrolling, privacy: .public) userHasInteracted=\(userHasInteractedWithScroll, privacy: .public)"
+        )
+#else
+        _ = reason
+#endif
+        return true
+    }
+
+    @MainActor
+    private func showJumpUnavailableBanner() {
+        jumpUnavailableBannerTask?.cancel()
+        withAnimation(.easeOut(duration: 0.16)) {
+            jumpUnavailableBannerText = "Сообщение недоступно/не загружено"
+        }
+        jumpUnavailableBannerTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_600_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.18)) {
+                jumpUnavailableBannerText = nil
+            }
+            jumpUnavailableBannerTask = nil
+        }
+    }
+
+    @MainActor
+    private func jumpToMessageEnsuringLoaded(
+        _ proxy: ScrollViewProxy,
+        messageId: Int64,
+        source: TelegramStore.MessageJumpSource
+    ) {
+        jumpToMessageTask?.cancel()
+        jumpToMessageTask = Task { @MainActor in
+            defer {
+                if pendingJumpAnchorMessageId == messageId {
+                    pendingJumpAnchorMessageId = nil
+                }
+                jumpToMessageTask = nil
+            }
+            guard messageId > 0 else {
+                showJumpUnavailableBanner()
+                return
+            }
+
+            pendingJumpAnchorMessageId = messageId
+            store.updateMessageWindowFocus(
+                chatId: chat.id,
+                isFollowingLatest: false,
+                anchorMessageId: messageId
+            )
+
+            let available = await store.ensureMessageAvailableForScroll(
+                chatId: chat.id,
+                messageId: messageId
+            )
+            guard !Task.isCancelled else { return }
+            guard available else {
+#if DEBUG
+                windowingLog.error(
+                    "jump unavailable chatId=\(chat.id, privacy: .public) messageId=\(messageId, privacy: .public) source=\(source.rawValue, privacy: .public) reason=ensureTimeout"
+                )
+#endif
+                showJumpUnavailableBanner()
+                return
+            }
+
+            var didScroll = false
+            for _ in 0..<jumpRenderMaxAttempts {
+                guard !Task.isCancelled else { return }
+                applyWindowMessages(viewModel.messages)
+                refreshRenderWindowIfNeeded(source: "jump:\(source.rawValue)")
+                let hasRow = Self.rowIdContainingMessage(messageId, rows: rows) != nil
+                if hasRow {
+                    scrollToMessageTop(proxy, messageId: messageId)
+                    didScroll = true
+                    break
+                }
+                try? await Task.sleep(nanoseconds: jumpRenderPollNs)
+            }
+
+            scheduleWindowFocusSync()
+            if !didScroll {
+#if DEBUG
+                windowingLog.error(
+                    "jump unavailable chatId=\(chat.id, privacy: .public) messageId=\(messageId, privacy: .public) source=\(source.rawValue, privacy: .public) reason=rowNotRendered"
+                )
+#endif
+                showJumpUnavailableBanner()
+            }
+        }
+    }
+
+    @MainActor
     private func handleWindowMessagesChange(
         oldMessages: [TGMessage],
         newMessages: [TGMessage],
@@ -1047,7 +1769,11 @@ struct MessagesPane: View {
                     DispatchQueue.main.async {
                         if !restorePrependPixelOffsetIfPossible(anchorMessageId: anchorId) {
                             if !hasPrependPixelMeasurement(anchorMessageId: anchorId) {
-                                scrollToMessageTop(proxy, messageId: anchorId)
+                                jumpToMessageEnsuringLoaded(
+                                    proxy,
+                                    messageId: anchorId,
+                                    source: .restore
+                                )
                             }
                         }
                         clearPrependPixelAnchor()
@@ -1065,11 +1791,13 @@ struct MessagesPane: View {
             guard !newMessages.isEmpty else { return }
             DispatchQueue.main.async {
                 guard !didInitialScrollToBottom else { return }
-                scrollToBottomSentinel(proxy, animated: false)
+                if !shouldSuppressAutoScroll(reason: "initialLoad") {
+                    scrollToBottomSentinel(proxy, animated: false)
+                    isAtBottom = true
+                    newIncomingCount = 0
+                }
                 didInitialScrollToBottom = true
                 pagingEnabled = true
-                isAtBottom = true
-                newIncomingCount = 0
                 handleTopSentinelOffset(lastTopSentinelMinY)
                 maybeRequestOlderForUnderfilledViewport(source: "initialScrollToBottom")
             }
@@ -1089,11 +1817,13 @@ struct MessagesPane: View {
             let shouldAnimate = !isBulkMutation
                 && !store.isLoadingHistory
                 && (nowNs &- lastAutoScrollAnimatedAtNs) >= autoScrollAnimationCooldownNs
-            scrollToBottomSentinel(proxy, animated: shouldAnimate)
-            if shouldAnimate {
-                lastAutoScrollAnimatedAtNs = nowNs
+            if !shouldSuppressAutoScroll(reason: "keepAtBottom") {
+                scrollToBottomSentinel(proxy, animated: shouldAnimate)
+                if shouldAnimate {
+                    lastAutoScrollAnimatedAtNs = nowNs
+                }
+                newIncomingCount = 0
             }
-            newIncomingCount = 0
             maybeRequestOlderForUnderfilledViewport(source: "atBottomMutation")
             return
         }
@@ -1117,7 +1847,8 @@ struct MessagesPane: View {
                 chat: chat,
                 group: group,
                 optimizeForLargeTimeline: optimizeBubbleEffectsNow,
-                isScrolling: isLightweightScrollRenderMode,
+                isLiveScrolling: isLiveScrolling,
+                isScrollPerformanceMode: isLightweightScrollRenderMode,
                 revealTimeX: revealTimeX,
                 jellyScrollImpulse: 0,
                 onMessageAppear: { messageId in
@@ -1180,6 +1911,9 @@ struct MessagesPane: View {
                         .id(bottomSentinelId)
                         .onAppear {
                             isAtBottom = true
+                            if userHasInteractedWithScroll && !isLiveScrolling {
+                                userHasInteractedWithScroll = false
+                            }
                             if newIncomingCount != 0 {
                                 newIncomingCount = 0
                             }
@@ -1221,6 +1955,7 @@ struct MessagesPane: View {
             .overlay(alignment: .bottomTrailing) {
                 if newIncomingCount > 0 && !isAtBottom {
                     Button {
+                        guard !shouldSuppressAutoScroll(reason: "newMessagesButton") else { return }
                         scrollToBottomSentinel(proxy, animated: true)
                         newIncomingCount = 0
                     } label: {
@@ -1243,9 +1978,25 @@ struct MessagesPane: View {
                     .padding(.bottom, 84)
                 }
             }
+            .overlay(alignment: .bottom) {
+                if let jumpUnavailableBannerText {
+                    Text(jumpUnavailableBannerText)
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(.regularMaterial, in: Capsule(style: .continuous))
+                        .overlay(
+                            Capsule(style: .continuous)
+                                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                        )
+                        .padding(.bottom, 56)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+            }
             .simultaneousGesture(
                 DragGesture(minimumDistance: 8)
                     .onChanged { value in
+                        markUserScrollInteraction("dragGesture")
                         handleTimeRevealDragChanged(value)
                     }
                     .onEnded { _ in
@@ -1258,6 +2009,15 @@ struct MessagesPane: View {
                 updateLightweightScrollRenderMode(isScrolling: isLiveScrolling)
                 startWindowingDebugLogging()
                 applyWindowMessages(viewModel.messages)
+                if let request = store.pendingMessageJumpRequest,
+                   request.chatId == chat.id {
+                    store.consumeMessageJumpRequest(requestId: request.id)
+                    jumpToMessageEnsuringLoaded(
+                        proxy,
+                        messageId: request.messageId,
+                        source: request.source
+                    )
+                }
             }
             .onPreferenceChange(ContentMinYPreferenceKey.self) { minY in
                 handleTopSentinelOffset(minY)
@@ -1269,12 +2029,32 @@ struct MessagesPane: View {
             .onChange(of: viewModel.messages) { _, newMessages in
                 applyWindowMessages(newMessages)
             }
+            .onChange(of: store.pendingMessageJumpRequest) { _, request in
+                guard let request else { return }
+                guard request.chatId == chat.id else { return }
+                store.consumeMessageJumpRequest(requestId: request.id)
+                jumpToMessageEnsuringLoaded(
+                    proxy,
+                    messageId: request.messageId,
+                    source: request.source
+                )
+            }
             .onChange(of: isAtBottom) { _, _ in
                 scheduleWindowFocusSync()
+                refreshRenderWindowIfNeeded(source: "bottomStateChanged")
             }
             .onChange(of: isLiveScrolling) { _, isScrolling in
+                if isScrolling {
+                    markUserScrollInteraction("willStartLiveScroll")
+                }
                 ChatPerfTrace.recordScrollState(chatId: chat.id, isScrolling: isScrolling)
                 updateLightweightScrollRenderMode(isScrolling: isScrolling)
+                let anchorMessageId = isScrolling ? nil : anchorMessageIdForWindowFocus()
+                store.updateMessageStoreLiveScrolling(
+                    chatId: chat.id,
+                    isLiveScrolling: isScrolling,
+                    anchorMessageId: anchorMessageId
+                )
                 Task { @MainActor in
                     await emitWindowingDebugLog(
                         reason: isScrolling ? "scrollStart" : "scrollEnd",
@@ -1290,7 +2070,6 @@ struct MessagesPane: View {
                     proxy: proxy
                 )
                 scheduleWindowFocusSync()
-                scheduleTextPrewarm(messages: newMessages)
                 maybeRequestOlderForUnderfilledViewport(source: "windowMessagesChanged")
             }
             .onChange(of: store.isLoadingHistory) { _, isLoading in
@@ -1312,6 +2091,19 @@ struct MessagesPane: View {
             .onDisappear {
                 rowBuildTask?.cancel()
                 rowBuildTask = nil
+                mediaPrefetchTask?.cancel()
+                mediaPrefetchTask = nil
+                jumpToMessageTask?.cancel()
+                jumpToMessageTask = nil
+                jumpUnavailableBannerTask?.cancel()
+                jumpUnavailableBannerTask = nil
+                jumpUnavailableBannerText = nil
+                pendingJumpAnchorMessageId = nil
+                renderRangePrefetchDebounceTask?.cancel()
+                renderRangePrefetchDebounceTask = nil
+                renderRangePrefetchRequestStartedAtNs = []
+                renderRangePrefetchHysteresisArmed = true
+                MessageTextPipeline.cancelPrewarm()
                 isPagingHistory = false
                 clearPrependPixelAnchor()
                 scrollViewRef.scrollView = nil
@@ -1319,6 +2111,7 @@ struct MessagesPane: View {
                 stopWindowingDebugLogging(reason: "disappear")
                 cancelWindowFocusSyncTask()
                 store.updateMessageWindowFocus(chatId: chat.id, isFollowingLatest: true, anchorMessageId: nil)
+                store.updateMessageStoreLiveScrolling(chatId: chat.id, isLiveScrolling: false, anchorMessageId: nil)
                 lightweightScrollRenderModeResetTask?.cancel()
                 lightweightScrollRenderModeResetTask = nil
                 isLightweightScrollRenderMode = false
@@ -1326,6 +2119,7 @@ struct MessagesPane: View {
                 visibleReportTask = nil
                 visibleMessageIds = []
                 store.resetVisibleMessageTracking(chatId: chat.id)
+                store.clearMediaState(chatId: chat.id)
             }
         }
         .id(chat.id)

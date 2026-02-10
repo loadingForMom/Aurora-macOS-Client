@@ -447,6 +447,38 @@ extension TelegramStore {
         return (fid, path)
     }
 
+    func parseUpdateFileState(_ upd: String) -> TGFileUpdate? {
+        guard let obj = parseJSON(upd) else { return nil }
+        guard (obj["@type"] as? String) == "updateFile" else { return nil }
+        guard let file = obj["file"] as? [String: Any] else { return nil }
+        return parseFileState(file)
+    }
+
+    private func parseFileState(_ file: [String: Any]) -> TGFileUpdate? {
+        guard let fileId = (file["id"] as? NSNumber)?.int32Value, fileId > 0 else { return nil }
+        let expectedSize = (file["expected_size"] as? NSNumber)?.int64Value
+            ?? (file["size"] as? NSNumber)?.int64Value
+            ?? 0
+        let local = file["local"] as? [String: Any]
+        let localPathRaw = (local?["path"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasPath = !localPathRaw.isEmpty
+        let fileExists = hasPath ? FileManager.default.fileExists(atPath: localPathRaw) : false
+        let localPath = (fileExists || ((local?["is_downloading_completed"] as? Bool) ?? false))
+            ? (hasPath ? localPathRaw : nil)
+            : nil
+        let downloadedSize = (local?["downloaded_size"] as? NSNumber)?.int64Value ?? 0
+        let isDownloadingActive = (local?["is_downloading_active"] as? Bool) ?? false
+        let isDownloadingCompleted = (local?["is_downloading_completed"] as? Bool) ?? false
+        return TGFileUpdate(
+            fileId: fileId,
+            localPath: localPath,
+            downloadedSize: downloadedSize,
+            expectedSize: expectedSize,
+            isDownloadingActive: isDownloadingActive,
+            isDownloadingCompleted: isDownloadingCompleted
+        )
+    }
+
     struct ChatPhotoUpdate {
         let chatId: Int64
         let smallId: Int32?
@@ -519,12 +551,14 @@ extension TelegramStore {
         var contentType = "unknown"
         var rawText: String? = nil
         var entities: [TGTextEntity] = []
+        var media: TGMessageMediaDescriptor? = nil
         if let content = obj["content"] as? [String: Any] {
             text = renderPreviewTextFromContent(content)
-            let parsed = parseMessageTextPayload(content)
+            let parsed = parseMessageContentPayload(content)
             contentType = parsed.contentType
             rawText = parsed.rawText
             entities = parsed.entities
+            media = parsed.media
         }
 
         var sendState: TGMessageSendState = .sent
@@ -577,6 +611,7 @@ extension TelegramStore {
             contentType: contentType,
             rawText: rawText,
             entities: entities,
+            media: media,
             sendState: sendState,
             replyToMessageId: replyToMessageId,
             localId: nil,
@@ -600,19 +635,151 @@ extension TelegramStore {
         return m
     }
 
-    func parseMessageTextPayload(_ content: [String: Any]) -> (contentType: String, rawText: String?, entities: [TGTextEntity]) {
+    func parseMessageContentPayload(
+        _ content: [String: Any]
+    ) -> (contentType: String, rawText: String?, entities: [TGTextEntity], media: TGMessageMediaDescriptor?) {
         guard let ctype = content["@type"] as? String else {
-            return ("unknown", nil, [])
+            return ("unknown", nil, [], nil)
         }
-        guard ctype == "messageText" else {
-            return (ctype, nil, [])
+
+        switch ctype {
+        case "messageText":
+            guard let textObj = content["text"] as? [String: Any] else {
+                return (ctype, nil, [], nil)
+            }
+            let rawText = textObj["text"] as? String
+            let entities = parseTextEntities(textObj)
+            return (ctype, rawText, entities, nil)
+
+        case "messagePhoto":
+            let caption = parseFormattedTextPayload(content["caption"] as? [String: Any])
+            let media = parsePhotoMediaDescriptor(content)
+            return (ctype, caption.rawText, caption.entities, media)
+
+        case "messageVideo":
+            let caption = parseFormattedTextPayload(content["caption"] as? [String: Any])
+            let media = parseVideoMediaDescriptor(content)
+            return (ctype, caption.rawText, caption.entities, media)
+
+        default:
+            return (ctype, nil, [], nil)
         }
-        guard let textObj = content["text"] as? [String: Any] else {
-            return (ctype, nil, [])
+    }
+
+    private func parseFormattedTextPayload(_ obj: [String: Any]?) -> (rawText: String?, entities: [TGTextEntity]) {
+        guard let obj else { return (nil, []) }
+        let rawText = (obj["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let entities = parseTextEntities(obj)
+        if let rawText, !rawText.isEmpty {
+            return (rawText, entities)
         }
-        let rawText = textObj["text"] as? String
-        let entities = parseTextEntities(textObj)
-        return (ctype, rawText, entities)
+        return (nil, [])
+    }
+
+    private func parsePhotoMediaDescriptor(_ content: [String: Any]) -> TGMessageMediaDescriptor? {
+        guard let photo = content["photo"] as? [String: Any] else { return nil }
+        guard let sizeItems = photo["sizes"] as? [[String: Any]], !sizeItems.isEmpty else { return nil }
+
+        let sortedSizes = sizeItems.sorted {
+            let lhsArea = ((($0["width"] as? NSNumber)?.intValue ?? 0) * (($0["height"] as? NSNumber)?.intValue ?? 0))
+            let rhsArea = ((($1["width"] as? NSNumber)?.intValue ?? 0) * (($1["height"] as? NSNumber)?.intValue ?? 0))
+            return lhsArea < rhsArea
+        }
+
+        var thumbFile: TGMessageMediaFile? = nil
+        var mediaFile: TGMessageMediaFile? = nil
+        var width = 0
+        var height = 0
+
+        if let smallest = sortedSizes.first {
+            if let file = smallest["photo"] as? [String: Any] {
+                thumbFile = parseMediaFile(file)
+            }
+        }
+
+        if let largest = sortedSizes.last {
+            width = (largest["width"] as? NSNumber)?.intValue ?? 0
+            height = (largest["height"] as? NSNumber)?.intValue ?? 0
+            if let file = largest["photo"] as? [String: Any] {
+                mediaFile = parseMediaFile(file)
+            }
+        }
+
+        if width <= 0 || height <= 0 {
+            width = (sortedSizes.first?["width"] as? NSNumber)?.intValue ?? 0
+            height = (sortedSizes.first?["height"] as? NSNumber)?.intValue ?? 0
+        }
+        if width <= 0 { width = 4 }
+        if height <= 0 { height = 3 }
+
+        guard thumbFile != nil || mediaFile != nil else { return nil }
+        return TGMessageMediaDescriptor(
+            kind: .photo,
+            width: width,
+            height: height,
+            thumbnail: thumbFile,
+            media: mediaFile
+        )
+    }
+
+    private func parseVideoMediaDescriptor(_ content: [String: Any]) -> TGMessageMediaDescriptor? {
+        guard let video = content["video"] as? [String: Any] else { return nil }
+
+        var width = (video["width"] as? NSNumber)?.intValue ?? 0
+        var height = (video["height"] as? NSNumber)?.intValue ?? 0
+
+        var thumbFile: TGMessageMediaFile? = nil
+        if let thumbnail = video["thumbnail"] as? [String: Any],
+           let thumbObj = thumbnail["file"] as? [String: Any] {
+            thumbFile = parseMediaFile(thumbObj)
+            if width <= 0 {
+                width = (thumbnail["width"] as? NSNumber)?.intValue ?? 0
+            }
+            if height <= 0 {
+                height = (thumbnail["height"] as? NSNumber)?.intValue ?? 0
+            }
+        }
+
+        let mediaFile: TGMessageMediaFile? = {
+            guard let file = video["video"] as? [String: Any] else { return nil }
+            return parseMediaFile(file)
+        }()
+
+        if width <= 0 { width = 4 }
+        if height <= 0 { height = 3 }
+        guard thumbFile != nil || mediaFile != nil else { return nil }
+        return TGMessageMediaDescriptor(
+            kind: .video,
+            width: width,
+            height: height,
+            thumbnail: thumbFile,
+            media: mediaFile
+        )
+    }
+
+    private func parseMediaFile(_ obj: [String: Any]) -> TGMessageMediaFile? {
+        guard let fileId = (obj["id"] as? NSNumber)?.int32Value, fileId > 0 else { return nil }
+        let expectedSize = (obj["expected_size"] as? NSNumber)?.int64Value
+            ?? (obj["size"] as? NSNumber)?.int64Value
+            ?? 0
+        let local = obj["local"] as? [String: Any]
+        let localPathRaw = (local?["path"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasPath = !localPathRaw.isEmpty
+        let fileExists = hasPath ? FileManager.default.fileExists(atPath: localPathRaw) : false
+        let localPath = (fileExists || ((local?["is_downloading_completed"] as? Bool) ?? false))
+            ? (hasPath ? localPathRaw : nil)
+            : nil
+        let downloadedSize = (local?["downloaded_size"] as? NSNumber)?.int64Value ?? 0
+        let isDownloadingActive = (local?["is_downloading_active"] as? Bool) ?? false
+        let isDownloadingCompleted = (local?["is_downloading_completed"] as? Bool) ?? false
+        return TGMessageMediaFile(
+            fileId: fileId,
+            localPath: localPath,
+            downloadedSize: downloadedSize,
+            expectedSize: expectedSize,
+            isDownloadingActive: isDownloadingActive,
+            isDownloadingCompleted: isDownloadingCompleted
+        )
     }
 
     func parseTextEntities(_ textObj: [String: Any]) -> [TGTextEntity] {

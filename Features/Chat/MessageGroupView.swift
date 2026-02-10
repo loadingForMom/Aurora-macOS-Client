@@ -11,7 +11,8 @@ struct ChatMessageGroupView: View {
     let chat: TGChat
     let group: MessageGroup
     let optimizeForLargeTimeline: Bool
-    let isScrolling: Bool
+    let isLiveScrolling: Bool
+    let isScrollPerformanceMode: Bool
     let onMessageAppear: (Int64) -> Void
     let onMessageDisappear: (Int64) -> Void
 
@@ -26,7 +27,8 @@ struct ChatMessageGroupView: View {
         chat: TGChat,
         group: MessageGroup,
         optimizeForLargeTimeline: Bool = false,
-        isScrolling: Bool = false,
+        isLiveScrolling: Bool = false,
+        isScrollPerformanceMode: Bool = false,
         revealTimeX: CGFloat = 0,
         jellyScrollImpulse: CGFloat = 0,
         onMessageAppear: @escaping (Int64) -> Void = { _ in },
@@ -36,15 +38,27 @@ struct ChatMessageGroupView: View {
         self.chat = chat
         self.group = group
         self.optimizeForLargeTimeline = optimizeForLargeTimeline
-        self.isScrolling = isScrolling
+        self.isLiveScrolling = isLiveScrolling
+        self.isScrollPerformanceMode = isScrollPerformanceMode
         self.revealTimeX = revealTimeX
         self.jellyScrollImpulse = jellyScrollImpulse
         self.onMessageAppear = onMessageAppear
         self.onMessageDisappear = onMessageDisappear
     }
 
+    private var heavyEffectsDisabled: Bool {
+        optimizeForLargeTimeline || isScrollPerformanceMode
+    }
+
+    private var disablesAnimations: Bool {
+        isLiveScrolling || isScrollPerformanceMode
+    }
+
+    private var scrollPerfModeActive: Bool {
+        isLiveScrolling || isScrollPerformanceMode
+    }
+
     var body: some View {
-        let lightweightRenderMode = optimizeForLargeTimeline || isScrolling
         let enableJelly = abs(jellyScrollImpulse) > 0.5
             && group.messages.count < 60
         let stretch = enableJelly ? (1 + min(abs(jellyScrollImpulse) / 320, 0.18)) : 1
@@ -64,11 +78,13 @@ struct ChatMessageGroupView: View {
             VStack(alignment: group.isOutgoing ? .trailing : .leading, spacing: 4) {
                 ForEach(group.messages, id: \.id) { msg in
                     MessageBubble(
+                        store: store,
                         msg: msg,
                         currentChatId: chat.id,
                         revealTimeX: revealTimeX,
-                        optimizeForPerformance: lightweightRenderMode,
-                        isScrolling: isScrolling,
+                        heavyEffectsDisabled: heavyEffectsDisabled,
+                        isLiveScrolling: isLiveScrolling,
+                        isScrollPerformanceMode: isScrollPerformanceMode,
                         onRetry: { store.retrySend(message: msg) },
                         onDelete: { store.deleteMessages(chatId: msg.chatId, messageIds: [msg.id], revoke: true) }
                     )
@@ -86,11 +102,23 @@ struct ChatMessageGroupView: View {
         .padding(.vertical, 2)
         .scaleEffect(x: 1, y: stretch, anchor: .bottom)
         .offset(y: y)
+        .onAppear {
+            recordHeavyEffectsDisabledIfNeeded()
+        }
+        .onChange(of: heavyEffectsDisabled) { _, disabled in
+            guard disabled else { return }
+            recordHeavyEffectsDisabledIfNeeded()
+        }
         .transaction { transaction in
-            if isScrolling {
+            if disablesAnimations {
                 transaction.disablesAnimations = true
                 transaction.animation = nil
             }
         }
+    }
+
+    private func recordHeavyEffectsDisabledIfNeeded() {
+        guard scrollPerfModeActive else { return }
+        ChatPerfTrace.recordHeavyEffectsDisabled(chatId: chat.id, count: group.messages.count)
     }
 }

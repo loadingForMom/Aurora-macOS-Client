@@ -68,7 +68,7 @@ extension NSImage {
 /// - Avoid decoding full source images via NSImage(contentsOfFile:)
 /// - Create thumbnails only when source changes (mtime in filename)
 /// - Reuse thumbnails across app launches (no "compress every startup")
-enum AuroraImageThumb {
+nonisolated enum AuroraImageThumb {
 
     static func decodeThumbnailNSImage(sourcePath: String, maxPixel: Int) -> NSImage? {
         guard maxPixel > 0 else { return nil }

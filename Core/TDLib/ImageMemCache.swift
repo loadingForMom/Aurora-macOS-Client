@@ -5,7 +5,7 @@
 import Foundation
 import AppKit
 
-final class ImageMemCache {
+nonisolated final class ImageMemCache {
     private let cache = NSCache<NSString, NSImage>()
 
     init(countLimit: Int = 256) {

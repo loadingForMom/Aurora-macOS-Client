@@ -236,6 +236,81 @@ extension TelegramStore {
         return true
     }
 
+    @discardableResult
+    func loadHistoryAroundMessage(
+        chatId: Int64,
+        messageId: Int64,
+        pageSize: Int = 80
+    ) -> Bool {
+        guard messageId > 0 else { return false }
+
+        let normalizedPageSize = max(20, min(pageSize, maxTdlibHistoryLimit))
+        let hasAroundInFlight = historyJobs.values.contains(where: {
+            $0.chatId == chatId && $0.kind == .around && $0.anchorMessageId == messageId
+        })
+        if hasAroundInFlight {
+            traceHistorySkip(
+                chatId: chatId,
+                reason: "around",
+                skipReason: "inFlight",
+                anchorMessageId: messageId
+            )
+            return false
+        }
+
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        let pausedUntilNs = historyCooldownUntilNs(chatId: chatId, nowNs: nowNs)
+        if pausedUntilNs > nowNs {
+            traceHistorySkip(
+                chatId: chatId,
+                reason: "around",
+                skipReason: "cooldown",
+                anchorMessageId: messageId,
+                flags: [
+                    ("pausedUntil", historyPausedUntilString(untilNs: pausedUntilNs, nowNs: nowNs)),
+                    ("cooldownSecondsRemaining", String(historyRemainingCooldownSeconds(untilNs: pausedUntilNs, nowNs: nowNs)))
+                ]
+            )
+            return false
+        }
+
+        let currentLimit = historyWindowLimitByChatId[chatId] ?? initialHistoryWindowLimit
+        let targetWindowLimit = min(
+            maxHistoryWindowLimit,
+            max(currentLimit, max(initialHistoryWindowLimit, normalizedPageSize * 2))
+        )
+        historyWindowLimitByChatId[chatId] = targetWindowLimit
+        setMessageWindow(chatId: chatId, windowSize: targetWindowLimit)
+
+        let extra = "history:\(chatId):around:\(UUID().uuidString)"
+        historyJobs[extra] = HistoryJob(
+            chatId: chatId,
+            kind: .around,
+            anchorMessageId: messageId,
+            requestedLimit: normalizedPageSize,
+            windowLimit: targetWindowLimit,
+            onlyLocal: false,
+            generation: historyGenerationByChatId[chatId] ?? 0,
+            anchorSource: .other,
+            uiTopMessageId: nil,
+            uiTopKind: nil,
+            storeMinIdVisible: nil
+        )
+        syncHistoryLoadingFlagForSelectedChat()
+
+        // Use a negative offset so TDLib returns a slice around the target id.
+        let aroundOffset = -max(1, normalizedPageSize / 2)
+        sendChatHistory(
+            chatId: chatId,
+            fromMessageId: messageId,
+            offset: aroundOffset,
+            limit: normalizedPageSize,
+            onlyLocal: false,
+            extra: extra
+        )
+        return true
+    }
+
     func cancelHistoryJobs(for chatId: Int64) {
         let keys = historyJobs.compactMap { (k, v) in v.chatId == chatId ? k : nil }
         for k in keys {
@@ -385,6 +460,8 @@ extension TelegramStore {
             return "initial_remote"
         case .older:
             return "older"
+        case .around:
+            return "around"
         }
     }
 
@@ -405,6 +482,8 @@ extension TelegramStore {
             reason = "initial_remote"
         } else if parts[2] == "older" {
             reason = "older"
+        } else if parts[2] == "around" {
+            reason = "around"
         } else {
             reason = "other"
         }
