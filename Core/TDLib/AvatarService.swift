@@ -231,6 +231,14 @@ final class AvatarService {
     ) -> NSImage? {
         guard !sourcePath.isEmpty else { return nil }
         guard FileManager.default.fileExists(atPath: sourcePath) else { return nil }
+        let traceEnabled = ChatPerfTrace.isEnabled(for: nil)
+        let avatarThumbStartNs = traceEnabled ? DispatchTime.now().uptimeNanoseconds : 0
+        defer {
+            if traceEnabled {
+                let avatarThumbDurationMs = ChatPerfTrace.elapsedMs(since: avatarThumbStartNs)
+                ChatPerfTrace.recordAvatarThumb(chatId: nil, durationMs: avatarThumbDurationMs)
+            }
+        }
 
         let memKey = "\(sourcePath)|\(kind)|\(maxPixel)" as NSString
         if let cached = imageMemCache.image(forKey: memKey) {

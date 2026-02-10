@@ -1536,7 +1536,7 @@ actor MessageStore {
 
     func subscribe(chatId: Int64, windowLimit: Int) -> AsyncStream<[TGMessage]> {
         let id = UUID()
-        return AsyncStream<[TGMessage]> { continuation in
+        return AsyncStream<[TGMessage]>(bufferingPolicy: .bufferingNewest(1)) { continuation in
             Task {
                 self.attach(continuation: continuation, chatId: chatId, subscriberId: id, windowLimit: windowLimit)
             }

@@ -248,7 +248,19 @@ private struct BubbleTextView: View {
     let isOutgoing: Bool
     let textSelectionEnabled: Bool
 
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     @State private var attributed: AttributedString
+    @State private var renderTask: Task<Void, Never>? = nil
+    @State private var lastRenderedSignature: RenderSignature? = nil
+    @State private var inFlightSignature: RenderSignature? = nil
+
+    private struct RenderSignature: Hashable {
+        let input: MessageTextRenderInput
+        let colorScheme: ColorScheme
+        let dynamicTypeSize: DynamicTypeSize
+    }
 
     init(
         chatId: Int64,
@@ -264,14 +276,16 @@ private struct BubbleTextView: View {
         self.entities = entities
         self.isOutgoing = isOutgoing
         self.textSelectionEnabled = textSelectionEnabled
+        let initialInput = MessageTextRenderInput(
+            chatId: chatId,
+            messageId: messageId,
+            rawText: rawText,
+            entities: entities,
+            style: .bubbleBody
+        )
         _attributed = State(
-            initialValue: MessageTextPipeline.render(
-                chatId: chatId,
-                messageId: messageId,
-                rawText: rawText,
-                entities: entities,
-                style: .bubbleBody
-            )
+            initialValue: MessageTextPipeline.cachedValue(initialInput)
+                ?? Self.fallbackAttributed(rawText: rawText)
         )
     }
 
@@ -287,24 +301,79 @@ private struct BubbleTextView: View {
         }
         .foregroundStyle(isOutgoing ? .white : .primary)
         .fixedSize(horizontal: false, vertical: true)
+        .onAppear {
+            let signature = renderSignature
+            if lastRenderedSignature == nil,
+               MessageTextPipeline.cachedValue(signature.input) != nil {
+                lastRenderedSignature = signature
+            }
+            scheduleRerenderIfNeeded()
+        }
         .onChange(of: messageId) { _, _ in
-            rerender()
+            scheduleRerenderIfNeeded()
         }
         .onChange(of: rawText) { _, _ in
-            rerender()
+            scheduleRerenderIfNeeded()
         }
         .onChange(of: entities) { _, _ in
-            rerender()
+            scheduleRerenderIfNeeded()
+        }
+        .onChange(of: colorScheme) { _, _ in
+            scheduleRerenderIfNeeded()
+        }
+        .onChange(of: dynamicTypeSize) { _, _ in
+            scheduleRerenderIfNeeded()
+        }
+        .onDisappear {
+            renderTask?.cancel()
+            renderTask = nil
+            inFlightSignature = nil
         }
     }
 
-    private func rerender() {
-        attributed = MessageTextPipeline.render(
+    private var renderInput: MessageTextRenderInput {
+        MessageTextRenderInput(
             chatId: chatId,
             messageId: messageId,
             rawText: rawText,
             entities: entities,
             style: .bubbleBody
         )
+    }
+
+    private var renderSignature: RenderSignature {
+        RenderSignature(
+            input: renderInput,
+            colorScheme: colorScheme,
+            dynamicTypeSize: dynamicTypeSize
+        )
+    }
+
+    @MainActor
+    private func scheduleRerenderIfNeeded() {
+        let signature = renderSignature
+        guard lastRenderedSignature != signature else { return }
+        guard inFlightSignature != signature else { return }
+
+        renderTask?.cancel()
+        inFlightSignature = signature
+        let input = signature.input
+
+        renderTask = Task { [signature, input] in
+            let rendered = await MessageTextPipeline.renderAsync(input, priority: .userInitiated)
+            guard !Task.isCancelled else { return }
+            guard inFlightSignature == signature else { return }
+            attributed = rendered
+            lastRenderedSignature = signature
+            inFlightSignature = nil
+            renderTask = nil
+        }
+    }
+
+    private static func fallbackAttributed(rawText: String?) -> AttributedString {
+        if let rawText, !rawText.isEmpty {
+            return AttributedString(rawText)
+        }
+        return AttributedString("[unsupported message]")
     }
 }

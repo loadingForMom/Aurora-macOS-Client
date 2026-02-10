@@ -7,6 +7,7 @@
 
 import SwiftUI
 import Foundation
+import AppKit
 
 struct MessagesPane: View {
     @ObservedObject var store: TelegramStore
@@ -16,8 +17,14 @@ struct MessagesPane: View {
 
     @State private var rows: [Row] = []
     @State private var windowMessages: [TGMessage] = []
+    @State private var previousMessageIds: [Int64] = []
+    @State private var groupRowMinYById: [String: CGFloat] = [:]
+    @State private var prependAnchorMessageId: Int64? = nil
+    @State private var prependAnchorRowId: String? = nil
+    @State private var prependAnchorMinYBefore: CGFloat? = nil
     @State private var rowBuildTask: Task<Void, Never>? = nil
     @State private var rowBuildToken = UUID()
+    @State private var scrollViewRef = ScrollViewReference()
 
     @State private var pagingEnabled: Bool = false
     @State private var pagingInFlight: Bool = false
@@ -39,11 +46,13 @@ struct MessagesPane: View {
     @State private var lastTopSentinelMinY: CGFloat = -.greatestFiniteMagnitude
     @State private var isTopSentinelVisible: Bool = false
     @State private var pendingTopVisibleRetryAfterLoading: Bool = false
+    @State private var isLiveScrolling: Bool = false
     private let groupGap: Int = 5 * 60
     private let majorGap: Int = 60 * 60
     private let autoScrollAnimationCooldownNs: UInt64 = 220_000_000
     private let paginationTopThreshold: CGFloat = 260
     private let heavyEffectsCutoffMessages: Int = 700
+    private let textPrewarmBudget: Int = 150
     private let revealTimeMaxX: CGFloat = 72
 
     private static let rowBuildWorker = RowsBuildWorker()
@@ -52,6 +61,7 @@ struct MessagesPane: View {
     private var topSentinelId: String { "top:\(chat.id)" }
     private var bottomSentinelId: String { "bottom:\(chat.id)" }
     private var optimizeBubbleEffects: Bool { windowMessages.count >= heavyEffectsCutoffMessages }
+    private var optimizeBubbleEffectsNow: Bool { optimizeBubbleEffects || isLiveScrolling }
     private var isViewportUnderfilledForPaging: Bool {
         didInitialScrollToBottom &&
         isTopSentinelVisible &&
@@ -91,6 +101,13 @@ struct MessagesPane: View {
             groupGap: Int,
             majorGap: Int
         ) -> RowBuildResult {
+            let traceEnabled = ChatPerfTrace.isEnabled(for: chatId)
+            let buildStartNs = traceEnabled ? DispatchTime.now().uptimeNanoseconds : 0
+            let signpostId = ChatPerfTrace.beginSignpost("buildRows", chatId: chatId)
+            defer {
+                ChatPerfTrace.endSignpost("buildRows", signpostId: signpostId, chatId: chatId)
+            }
+
             let filtered = messages.filter { $0.chatId == chatId }
             if let incremental = MessagesPane.buildRowsIncrementalIfPossible(
                 chatId: chatId,
@@ -100,6 +117,14 @@ struct MessagesPane: View {
                 groupGap: groupGap,
                 majorGap: majorGap
             ) {
+                if traceEnabled {
+                    let buildRowsDurationMs = ChatPerfTrace.elapsedMs(since: buildStartNs)
+                    ChatPerfTrace.recordRowsBuild(
+                        chatId: chatId,
+                        isIncremental: true,
+                        durationMs: buildRowsDurationMs
+                    )
+                }
                 return RowBuildResult(filteredMessages: filtered, rows: incremental)
             }
             let rebuilt = MessagesPane.buildRows(
@@ -108,6 +133,14 @@ struct MessagesPane: View {
                 groupGap: groupGap,
                 majorGap: majorGap
             )
+            if traceEnabled {
+                let buildRowsDurationMs = ChatPerfTrace.elapsedMs(since: buildStartNs)
+                ChatPerfTrace.recordRowsBuild(
+                    chatId: chatId,
+                    isIncremental: false,
+                    durationMs: buildRowsDurationMs
+                )
+            }
             return RowBuildResult(filteredMessages: filtered, rows: rebuilt)
         }
     }
@@ -313,6 +346,171 @@ struct MessagesPane: View {
         return "\(components.year ?? 0)-\(components.month ?? 0)-\(components.day ?? 0)"
     }
 
+    nonisolated private static func textPrewarmSlice(
+        messages: [TGMessage],
+        visibleMessageIds: Set<Int64>,
+        fallbackAnchorMessageId: Int64?,
+        budget: Int
+    ) -> [TGMessage] {
+        guard !messages.isEmpty else { return [] }
+        let clampedBudget = max(1, min(budget, messages.count))
+
+        var indexById: [Int64: Int] = [:]
+        indexById.reserveCapacity(messages.count)
+        for (index, message) in messages.enumerated() {
+            indexById[message.id] = index
+        }
+
+        let anchorIndex: Int = {
+            if !visibleMessageIds.isEmpty {
+                var visibleIndices: [Int] = []
+                visibleIndices.reserveCapacity(visibleMessageIds.count)
+                for id in visibleMessageIds {
+                    if let index = indexById[id] {
+                        visibleIndices.append(index)
+                    }
+                }
+                if !visibleIndices.isEmpty {
+                    visibleIndices.sort()
+                    return visibleIndices[visibleIndices.count / 2]
+                }
+            }
+            if let fallbackAnchorMessageId,
+               let fallbackIndex = indexById[fallbackAnchorMessageId] {
+                return fallbackIndex
+            }
+            return messages.count - 1
+        }()
+
+        let halfWindow = clampedBudget / 2
+        var lowerBound = max(0, anchorIndex - halfWindow)
+        let upperBound = min(messages.count, lowerBound + clampedBudget)
+        if upperBound - lowerBound < clampedBudget {
+            lowerBound = max(0, upperBound - clampedBudget)
+        }
+        guard lowerBound < upperBound else { return [] }
+
+        return messages[lowerBound..<upperBound].filter { message in
+            message.textForRendering != nil || !message.entities.isEmpty
+        }
+    }
+
+    @MainActor
+    private func scheduleTextPrewarm(messages: [TGMessage]) {
+        let candidates = Self.textPrewarmSlice(
+            messages: messages,
+            visibleMessageIds: visibleMessageIds,
+            fallbackAnchorMessageId: pendingRestoreAnchorMessageId,
+            budget: textPrewarmBudget
+        )
+        guard !candidates.isEmpty else { return }
+        MessageTextPipeline.enqueuePrewarm(chatId: chat.id, messages: candidates, style: .bubbleBody)
+    }
+
+    nonisolated private static func updatedMessagesByIdForInPlaceUpdate(
+        previousMessages: [TGMessage],
+        newMessages: [TGMessage]
+    ) -> [Int64: TGMessage]? {
+        guard previousMessages.count == newMessages.count else { return nil }
+        var updatedById: [Int64: TGMessage] = [:]
+        updatedById.reserveCapacity(min(8, previousMessages.count))
+
+        for index in previousMessages.indices {
+            let oldMessage = previousMessages[index]
+            let newMessage = newMessages[index]
+            guard oldMessage.id == newMessage.id else { return nil }
+            if oldMessage == newMessage {
+                continue
+            }
+            // Changes that can affect row grouping/layout require full rebuild.
+            if oldMessage.date != newMessage.date ||
+                oldMessage.senderUserId != newMessage.senderUserId ||
+                oldMessage.isOutgoing != newMessage.isOutgoing {
+                return nil
+            }
+            updatedById[newMessage.id] = newMessage
+        }
+        return updatedById
+    }
+
+    nonisolated private static func patchRowsForUpdatedMessages(
+        previousRows: [Row],
+        updatedMessagesById: [Int64: TGMessage]
+    ) -> [Row] {
+        guard !updatedMessagesById.isEmpty else { return previousRows }
+        var patchedRows: [Row] = []
+        patchedRows.reserveCapacity(previousRows.count)
+
+        for row in previousRows {
+            switch row {
+            case .group(var group):
+                var groupUpdated = false
+                for index in group.messages.indices {
+                    let messageId = group.messages[index].id
+                    guard let updatedMessage = updatedMessagesById[messageId] else { continue }
+                    guard group.messages[index] != updatedMessage else { continue }
+                    group.messages[index] = updatedMessage
+                    groupUpdated = true
+                }
+                patchedRows.append(groupUpdated ? .group(group) : row)
+            case .dayHeader, .timeSeparator:
+                patchedRows.append(row)
+            }
+        }
+        return patchedRows
+    }
+
+    nonisolated private static func rowIdContainingMessage(
+        _ messageId: Int64,
+        rows: [Row]
+    ) -> String? {
+        for row in rows {
+            guard case .group(let group) = row else { continue }
+            if group.messages.contains(where: { $0.id == messageId }) {
+                return group.id
+            }
+        }
+        return nil
+    }
+
+    @MainActor
+    private func preparePrependPixelAnchor(messageId: Int64) {
+        prependAnchorMessageId = messageId
+        let rowId = Self.rowIdContainingMessage(messageId, rows: rows)
+        prependAnchorRowId = rowId
+        prependAnchorMinYBefore = rowId.flatMap { groupRowMinYById[$0] }
+    }
+
+    @MainActor
+    private func clearPrependPixelAnchor() {
+        prependAnchorMessageId = nil
+        prependAnchorRowId = nil
+        prependAnchorMinYBefore = nil
+    }
+
+    @MainActor
+    private func restorePrependPixelOffsetIfPossible(anchorMessageId: Int64) -> Bool {
+        guard prependAnchorMessageId == anchorMessageId else { return false }
+        guard let beforeMinY = prependAnchorMinYBefore else { return false }
+        guard let currentRowId = Self.rowIdContainingMessage(anchorMessageId, rows: rows) else { return false }
+        guard let afterMinY = groupRowMinYById[currentRowId] else { return false }
+        guard let scrollView = scrollViewRef.scrollView else { return false }
+
+        let deltaY = afterMinY - beforeMinY
+        guard abs(deltaY) > 0.5 else { return true }
+
+        let clipView = scrollView.contentView
+        var newOrigin = clipView.bounds.origin
+        newOrigin.y += deltaY
+        if let documentView = scrollView.documentView {
+            let maxY = max(0, documentView.bounds.height - clipView.bounds.height)
+            newOrigin.y = min(max(0, newOrigin.y), maxY)
+        }
+        clipView.scroll(to: newOrigin)
+        scrollView.reflectScrolledClipView(clipView)
+        return true
+    }
+
     @MainActor
     private func resetStateForChat() {
         rowBuildTask?.cancel()
@@ -321,6 +519,9 @@ struct MessagesPane: View {
 
         rows = []
         windowMessages = []
+        previousMessageIds = []
+        groupRowMinYById = [:]
+        clearPrependPixelAnchor()
 
         pagingEnabled = false
         pagingInFlight = false
@@ -350,6 +551,11 @@ struct MessagesPane: View {
     @MainActor
     private func applyWindowMessages(_ messages: [TGMessage]) {
         let expectedChatId = chat.id
+        let traceEnabled = ChatPerfTrace.isEnabled(for: expectedChatId)
+        let applyWindowStartNs = traceEnabled ? DispatchTime.now().uptimeNanoseconds : 0
+        let applySignpostId = ChatPerfTrace.beginSignpost("applyWindowMessages", chatId: expectedChatId)
+        let filteredMessages = messages.filter { $0.chatId == expectedChatId }
+        let newMessageIds = filteredMessages.map(\.id)
         let token = UUID()
         let previousMessages = windowMessages
         let previousRows = rows
@@ -358,8 +564,38 @@ struct MessagesPane: View {
 
         rowBuildToken = token
         rowBuildTask?.cancel()
+        rowBuildTask = nil
 
-        rowBuildTask = Task.detached(priority: .userInitiated) { [token, expectedChatId, messages, previousMessages, previousRows, currentGroupGap, currentMajorGap] in
+        if previousMessageIds == newMessageIds,
+           let updatedMessagesById = Self.updatedMessagesByIdForInPlaceUpdate(
+                previousMessages: previousMessages,
+                newMessages: filteredMessages
+           ) {
+            if !updatedMessagesById.isEmpty {
+                rows = Self.patchRowsForUpdatedMessages(
+                    previousRows: previousRows,
+                    updatedMessagesById: updatedMessagesById
+                )
+            }
+            windowMessages = filteredMessages
+            previousMessageIds = newMessageIds
+            if traceEnabled {
+                let applyWindowMessagesDurationMs = ChatPerfTrace.elapsedMs(since: applyWindowStartNs)
+                ChatPerfTrace.recordApplyWindowMessages(chatId: expectedChatId, durationMs: applyWindowMessagesDurationMs)
+            }
+            ChatPerfTrace.endSignpost("applyWindowMessages", signpostId: applySignpostId, chatId: expectedChatId)
+            return
+        }
+
+        rowBuildTask = Task.detached(priority: .userInitiated) { [token, expectedChatId, messages, previousMessages, previousRows, currentGroupGap, currentMajorGap, traceEnabled, applyWindowStartNs, applySignpostId] in
+            defer {
+                if traceEnabled {
+                    let applyWindowMessagesDurationMs = ChatPerfTrace.elapsedMs(since: applyWindowStartNs)
+                    ChatPerfTrace.recordApplyWindowMessages(chatId: expectedChatId, durationMs: applyWindowMessagesDurationMs)
+                }
+                ChatPerfTrace.endSignpost("applyWindowMessages", signpostId: applySignpostId, chatId: expectedChatId)
+            }
+
             let buildResult = await Self.rowBuildWorker.build(
                 chatId: expectedChatId,
                 messages: messages,
@@ -374,6 +610,7 @@ struct MessagesPane: View {
                 guard chat.id == expectedChatId else { return }
                 windowMessages = buildResult.filteredMessages
                 rows = buildResult.rows
+                previousMessageIds = buildResult.filteredMessages.map(\.id)
             }
         }
     }
@@ -428,6 +665,7 @@ struct MessagesPane: View {
             return false
         }
 
+        preparePrependPixelAnchor(messageId: anchorMessageId)
         pendingRestoreAnchorMessageId = anchorMessageId
         paginationBaselineFirstMessageId = anchorMessageId
         lastRequestedTopAnchorMessageId = anchorMessageId
@@ -649,7 +887,18 @@ struct MessagesPane: View {
            let newFirstId = newMessages.first?.id,
            newFirstId != baseline {
             if restoreAnchorAfterPaging, let anchorId = pendingRestoreAnchorMessageId {
-                scrollToMessageTop(proxy, messageId: anchorId)
+                if restorePrependPixelOffsetIfPossible(anchorMessageId: anchorId) {
+                    clearPrependPixelAnchor()
+                } else {
+                    DispatchQueue.main.async {
+                        if !restorePrependPixelOffsetIfPossible(anchorMessageId: anchorId) {
+                            scrollToMessageTop(proxy, messageId: anchorId)
+                        }
+                        clearPrependPixelAnchor()
+                    }
+                }
+            } else {
+                clearPrependPixelAnchor()
             }
             lastRequestedTopAnchorMessageId = nil
             clearPagingState()
@@ -711,7 +960,7 @@ struct MessagesPane: View {
                 store: store,
                 chat: chat,
                 group: group,
-                optimizeForLargeTimeline: optimizeBubbleEffects,
+                optimizeForLargeTimeline: optimizeBubbleEffectsNow,
                 revealTimeX: revealTimeX,
                 jellyScrollImpulse: 0,
                 onMessageAppear: { messageId in
@@ -754,6 +1003,19 @@ struct MessagesPane: View {
 
                     ForEach(rows) { row in
                         rowView(row)
+                            .background {
+                                switch row {
+                                case .group:
+                                    GeometryReader { geometry in
+                                        Color.clear.preference(
+                                            key: GroupRowMinYPreferenceKey.self,
+                                            value: [row.id: geometry.frame(in: .named(scrollSpaceName)).minY]
+                                        )
+                                    }
+                                case .dayHeader, .timeSeparator:
+                                    Color.clear
+                                }
+                            }
                     }
 
                     Color.clear
@@ -784,6 +1046,21 @@ struct MessagesPane: View {
             .coordinateSpace(name: scrollSpaceName)
             .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
             .opacity((didInitialScrollToBottom || windowMessages.isEmpty) ? 1 : 0)
+            .background(
+                ScrollLiveStateObserver(
+                    isLiveScrolling: $isLiveScrolling,
+                    onResolveScrollView: { scrollView in
+                        scrollViewRef.scrollView = scrollView
+                    }
+                )
+                    .frame(width: 0, height: 0)
+            )
+            .transaction { transaction in
+                if isLiveScrolling {
+                    transaction.disablesAnimations = true
+                    transaction.animation = nil
+                }
+            }
             .overlay(alignment: .bottomTrailing) {
                 if newIncomingCount > 0 && !isAtBottom {
                     Button {
@@ -826,6 +1103,9 @@ struct MessagesPane: View {
                 handleTopSentinelOffset(minY)
                 maybeRequestOlderForUnderfilledViewport(source: "contentOffsetChanged")
             }
+            .onPreferenceChange(GroupRowMinYPreferenceKey.self) { map in
+                groupRowMinYById = map
+            }
             .onChange(of: viewModel.messages) { _, newMessages in
                 applyWindowMessages(newMessages)
             }
@@ -836,6 +1116,7 @@ struct MessagesPane: View {
                     newMessages: newMessages,
                     proxy: proxy
                 )
+                scheduleTextPrewarm(messages: newMessages)
                 maybeRequestOlderForUnderfilledViewport(source: "windowMessagesChanged")
             }
             .onChange(of: store.isLoadingHistory) { _, isLoading in
@@ -858,6 +1139,8 @@ struct MessagesPane: View {
                 rowBuildTask?.cancel()
                 rowBuildTask = nil
                 isPagingHistory = false
+                clearPrependPixelAnchor()
+                scrollViewRef.scrollView = nil
                 visibleReportTask?.cancel()
                 visibleReportTask = nil
                 visibleMessageIds = []
@@ -928,5 +1211,127 @@ private struct ContentMinYPreferenceKey: PreferenceKey {
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
+    }
+}
+
+private struct GroupRowMinYPreferenceKey: PreferenceKey {
+    static var defaultValue: [String: CGFloat] = [:]
+
+    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private final class ScrollViewReference {
+    weak var scrollView: NSScrollView?
+}
+
+private struct ScrollLiveStateObserver: NSViewRepresentable {
+    @Binding var isLiveScrolling: Bool
+    let onResolveScrollView: (NSScrollView?) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            isLiveScrolling: $isLiveScrolling,
+            onResolveScrollView: onResolveScrollView
+        )
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.attach(to: view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.updateBinding($isLiveScrolling)
+        context.coordinator.updateResolveCallback(onResolveScrollView)
+        context.coordinator.attach(to: nsView)
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.detach()
+    }
+
+    final class Coordinator {
+        private var isLiveScrolling: Binding<Bool>
+        private var onResolveScrollView: (NSScrollView?) -> Void
+        private weak var scrollView: NSScrollView?
+        private var willStartObserver: NSObjectProtocol?
+        private var didEndObserver: NSObjectProtocol?
+
+        init(
+            isLiveScrolling: Binding<Bool>,
+            onResolveScrollView: @escaping (NSScrollView?) -> Void
+        ) {
+            self.isLiveScrolling = isLiveScrolling
+            self.onResolveScrollView = onResolveScrollView
+        }
+
+        deinit {
+            removeObservers()
+        }
+
+        func updateBinding(_ binding: Binding<Bool>) {
+            isLiveScrolling = binding
+        }
+
+        func updateResolveCallback(_ callback: @escaping (NSScrollView?) -> Void) {
+            onResolveScrollView = callback
+        }
+
+        func attach(to nsView: NSView) {
+            DispatchQueue.main.async { [weak self, weak nsView] in
+                guard let self, let nsView else { return }
+                guard let enclosing = nsView.enclosingScrollView else { return }
+                guard self.scrollView !== enclosing else { return }
+                self.bind(to: enclosing)
+            }
+        }
+
+        func detach() {
+            removeObservers()
+            scrollView = nil
+            setLiveScrolling(false)
+            onResolveScrollView(nil)
+        }
+
+        private func bind(to scrollView: NSScrollView) {
+            removeObservers()
+            self.scrollView = scrollView
+            onResolveScrollView(scrollView)
+            let center = NotificationCenter.default
+            willStartObserver = center.addObserver(
+                forName: NSScrollView.willStartLiveScrollNotification,
+                object: scrollView,
+                queue: .main
+            ) { [weak self] _ in
+                self?.setLiveScrolling(true)
+            }
+            didEndObserver = center.addObserver(
+                forName: NSScrollView.didEndLiveScrollNotification,
+                object: scrollView,
+                queue: .main
+            ) { [weak self] _ in
+                self?.setLiveScrolling(false)
+            }
+        }
+
+        private func removeObservers() {
+            let center = NotificationCenter.default
+            if let willStartObserver {
+                center.removeObserver(willStartObserver)
+                self.willStartObserver = nil
+            }
+            if let didEndObserver {
+                center.removeObserver(didEndObserver)
+                self.didEndObserver = nil
+            }
+        }
+
+        private func setLiveScrolling(_ value: Bool) {
+            guard isLiveScrolling.wrappedValue != value else { return }
+            isLiveScrolling.wrappedValue = value
+        }
     }
 }

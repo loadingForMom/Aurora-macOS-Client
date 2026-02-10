@@ -137,6 +137,38 @@ final class ChatHeaderDebugState: ObservableObject {
     }
 }
 
+private enum ChatLayoutMetrics {
+    static let sidebarMinWidth: CGFloat = 220
+    static let sidebarIdealWidth: CGFloat = 250
+    static let sidebarMaxWidth: CGFloat = 320
+
+    static let detailMinWidthNoInspector: CGFloat = 420
+    static let detailMinWidthWithInspector: CGFloat = 620
+
+    static let inspectorMinWidth: CGFloat = 280
+    static let inspectorIdealWidth: CGFloat = 320
+    static let inspectorMaxWidth: CGFloat = 420
+
+    static let emptyInspectorMinWidth: CGFloat = 260
+    static let emptyInspectorIdealWidth: CGFloat = 300
+    static let emptyInspectorMaxWidth: CGFloat = 360
+
+    static let baseWindowMinWidth: CGFloat = 780
+    static let windowMinHeight: CGFloat = 620
+
+    // Reserve extra space for split dividers/chrome between columns.
+    static let splitChromeAllowanceNoInspector: CGFloat = 16
+    static let splitChromeAllowanceWithInspector: CGFloat = 36
+
+    static var minWindowWidthWithInspector: CGFloat {
+        sidebarMinWidth + detailMinWidthWithInspector + inspectorMinWidth + splitChromeAllowanceWithInspector
+    }
+
+    static var minWindowWidthWithoutInspector: CGFloat {
+        sidebarMinWidth + detailMinWidthNoInspector + splitChromeAllowanceNoInspector
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var store: TelegramStore
     @StateObject private var chatListViewModel: ChatListViewModel
@@ -144,6 +176,7 @@ struct ContentView: View {
     @State private var searchText: String = ""
     @State private var inspectorShown: Bool = false
     @State private var listSelection: Int64? = nil
+    @State private var hostWindow: NSWindow? = nil
 
     private func filteredChats(_ base: [TGChat], query: String) -> [TGChat] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -180,9 +213,32 @@ struct ContentView: View {
         _chatListViewModel = StateObject(wrappedValue: ChatListViewModel(dbPool: store.dbPool))
     }
 
+    @MainActor
+    private func ensureWindowMinSize(minWidth: CGFloat) {
+        guard let hostWindow else { return }
+
+        let required = NSSize(width: minWidth, height: ChatLayoutMetrics.windowMinHeight)
+        if hostWindow.minSize != required {
+            hostWindow.minSize = required
+        }
+
+        var frame = hostWindow.frame
+        let targetWidth = max(frame.width, required.width)
+        let targetHeight = max(frame.height, required.height)
+        guard targetWidth != frame.width || targetHeight != frame.height else { return }
+        frame.size = NSSize(width: targetWidth, height: targetHeight)
+        hostWindow.setFrame(frame, display: true, animate: false)
+    }
+
     var body: some View {
         let baseChats = chatListViewModel.chats
         let chats = filteredChats(baseChats, query: searchText)
+        let detailMinWidth = inspectorShown
+            ? ChatLayoutMetrics.detailMinWidthWithInspector
+            : ChatLayoutMetrics.detailMinWidthNoInspector
+        let minWindowWidth = inspectorShown
+            ? max(ChatLayoutMetrics.baseWindowMinWidth, ChatLayoutMetrics.minWindowWidthWithInspector)
+            : max(ChatLayoutMetrics.baseWindowMinWidth, ChatLayoutMetrics.minWindowWidthWithoutInspector)
 
         ZStack {
             NavigationSplitView {
@@ -198,6 +254,11 @@ struct ContentView: View {
                 }
                 .listStyle(.sidebar)
                 .searchable(text: $searchText, placement: .sidebar)
+                .navigationSplitViewColumnWidth(
+                    min: ChatLayoutMetrics.sidebarMinWidth,
+                    ideal: ChatLayoutMetrics.sidebarIdealWidth,
+                    max: ChatLayoutMetrics.sidebarMaxWidth
+                )
             } detail: {
                 Group {
                     if let chat = selectedChat {
@@ -214,16 +275,29 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                .frame(
+                    minWidth: detailMinWidth,
+                    maxWidth: .infinity,
+                    maxHeight: .infinity
+                )
             }
             .toolbar(removing: .title)
             .inspector(isPresented: $inspectorShown) {
                 if let chat = selectedChat {
                     ChatInspectorView(chat: chat)
-                        .inspectorColumnWidth(min: 320, ideal: 360, max: 420)
+                        .inspectorColumnWidth(
+                            min: ChatLayoutMetrics.inspectorMinWidth,
+                            ideal: ChatLayoutMetrics.inspectorIdealWidth,
+                            max: ChatLayoutMetrics.inspectorMaxWidth
+                        )
                 } else {
                     ContentUnavailableView("No chat selected", systemImage: "sidebar.right")
                         .padding(16)
-                        .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
+                        .inspectorColumnWidth(
+                            min: ChatLayoutMetrics.emptyInspectorMinWidth,
+                            ideal: ChatLayoutMetrics.emptyInspectorIdealWidth,
+                            max: ChatLayoutMetrics.emptyInspectorMaxWidth
+                        )
                 }
             }
             .task {
@@ -276,8 +350,49 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { _ in
             store.flushDatabaseNow()
         }
+        .background(
+            WindowResolutionView { window in
+                guard hostWindow !== window else { return }
+                hostWindow = window
+                ensureWindowMinSize(minWidth: minWindowWidth)
+            }
+        )
+        .onAppear {
+            ensureWindowMinSize(minWidth: minWindowWidth)
+        }
+        .onChange(of: inspectorShown) { _, newValue in
+            let requiredMinWidth = newValue
+                ? max(ChatLayoutMetrics.baseWindowMinWidth, ChatLayoutMetrics.minWindowWidthWithInspector)
+                : max(ChatLayoutMetrics.baseWindowMinWidth, ChatLayoutMetrics.minWindowWidthWithoutInspector)
+            DispatchQueue.main.async {
+                ensureWindowMinSize(minWidth: requiredMinWidth)
+            }
+        }
+        .frame(minWidth: minWindowWidth, minHeight: ChatLayoutMetrics.windowMinHeight)
         .transaction { _ in
             ViewUpdatePhaseTracker.shared.markUpdating(source: "ContentView")
+        }
+    }
+}
+
+private struct WindowResolutionView: NSViewRepresentable {
+    let onResolve: (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        DispatchQueue.main.async {
+            if let window = view.window {
+                onResolve(window)
+            }
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            if let window = nsView.window {
+                onResolve(window)
+            }
         }
     }
 }

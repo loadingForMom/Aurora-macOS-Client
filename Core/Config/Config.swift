@@ -9,6 +9,7 @@ import Foundation
 import Dispatch
 import AppKit
 import OSLog
+import os.signpost
 
 final class AppSessionLogRecorder {
     static let shared = AppSessionLogRecorder()
@@ -599,6 +600,323 @@ nonisolated enum HistoryTrace {
     }
 #endif
 }
+
+nonisolated enum ChatPerfTrace {
+#if DEBUG
+    private static let enabledFlag: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DEBUG_CHAT_PERF"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty
+        else { return false }
+        return raw == "1" || raw.caseInsensitiveCompare("true") == .orderedSame
+    }()
+    private static let chatIdFilter: Int64? = {
+        guard let raw = ProcessInfo.processInfo.environment["DEBUG_CHAT_PERF_CHAT_ID"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let value = Int64(raw)
+        else { return nil }
+        return value
+    }()
+    private static let signpostLog = OSLog(subsystem: "com.aurora.app", category: "points_of_interest")
+    private static let collector: ChatPerfTraceCollector? = enabledFlag
+        ? ChatPerfTraceCollector(chatIdFilter: chatIdFilter)
+        : nil
+#endif
+
+    static var isEnabled: Bool {
+#if DEBUG
+        enabledFlag
+#else
+        false
+#endif
+    }
+
+    static func isEnabled(for chatId: Int64?) -> Bool {
+#if DEBUG
+        guard enabledFlag else { return false }
+        guard let filter = chatIdFilter else { return true }
+        guard let chatId else { return false }
+        return chatId == filter
+#else
+        _ = chatId
+        return false
+#endif
+    }
+
+    static func elapsedMs(since startUptimeNs: UInt64) -> Double {
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        return Double(nowNs &- startUptimeNs) / 1_000_000
+    }
+
+    static func recordSnapshotReceived(chatId: Int64) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        collector?.recordSnapshotReceived()
+#else
+        _ = chatId
+#endif
+    }
+
+    static func recordSnapshotApplied(chatId: Int64) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        collector?.recordSnapshotApplied()
+#else
+        _ = chatId
+#endif
+    }
+
+    static func recordRowsBuild(chatId: Int64, isIncremental: Bool, durationMs: Double) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        collector?.recordRowsBuild(isIncremental: isIncremental, durationMs: durationMs)
+#else
+        _ = chatId
+        _ = isIncremental
+        _ = durationMs
+#endif
+    }
+
+    static func recordApplyWindowMessages(chatId: Int64, durationMs: Double) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        collector?.recordApplyWindowMessages(durationMs)
+#else
+        _ = chatId
+        _ = durationMs
+#endif
+    }
+
+    static func recordTextRender(chatId: Int64, durationMs: Double) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        collector?.recordTextRender(durationMs)
+#else
+        _ = chatId
+        _ = durationMs
+#endif
+    }
+
+    static func recordAvatarThumb(chatId: Int64?, durationMs: Double) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        collector?.recordAvatarThumb(durationMs)
+#else
+        _ = chatId
+        _ = durationMs
+#endif
+    }
+
+    static func beginSignpost(_ name: StaticString, chatId: Int64?) -> OSSignpostID {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return .invalid }
+        let signpostId = OSSignpostID(log: signpostLog)
+        os_signpost(.begin, log: signpostLog, name: name, signpostID: signpostId)
+        return signpostId
+#else
+        _ = name
+        _ = chatId
+        return .invalid
+#endif
+    }
+
+    static func endSignpost(_ name: StaticString, signpostId: OSSignpostID, chatId: Int64?) {
+#if DEBUG
+        guard isEnabled(for: chatId) else { return }
+        guard signpostId != .invalid else { return }
+        os_signpost(.end, log: signpostLog, name: name, signpostID: signpostId)
+#else
+        _ = name
+        _ = signpostId
+        _ = chatId
+#endif
+    }
+}
+
+#if DEBUG
+nonisolated final class ChatPerfTraceCollector: @unchecked Sendable {
+    private struct DurationAggregate {
+        var count: Int = 0
+        var totalMs: Double = 0
+        var maxMs: Double = 0
+
+        mutating func record(_ durationMs: Double) {
+            guard durationMs.isFinite else { return }
+            guard durationMs >= 0 else { return }
+            count += 1
+            totalMs += durationMs
+            if durationMs > maxMs {
+                maxMs = durationMs
+            }
+        }
+
+        var avgMs: Double {
+            guard count > 0 else { return 0 }
+            return totalMs / Double(count)
+        }
+    }
+
+    private let log = Logger(subsystem: "com.aurora.app", category: "chat.perf")
+    private let queue = DispatchQueue(label: "com.aurora.app.chat.perf.trace.queue")
+    private let flushIntervalSec: Double = 2.0
+    private let chatIdFilter: Int64?
+    private var flushTimer: DispatchSourceTimer?
+
+    private var windowStartNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    private var snapshotReceivedCount: Int = 0
+    private var snapshotAppliedCount: Int = 0
+    private var fullRowsRebuildCount: Int = 0
+    private var incrementalRowsBuildCount: Int = 0
+    private var buildRowsDurationMs = DurationAggregate()
+    private var applyWindowMessagesDurationMs = DurationAggregate()
+    private var textRenderDurationMs = DurationAggregate()
+    private var avatarThumbDurationMs = DurationAggregate()
+    private var snapshotInRateSamples: [Double] = []
+    private var snapshotOutRateSamples: [Double] = []
+    private let rateSamplesLimit = 64
+
+    init(chatIdFilter: Int64?) {
+        self.chatIdFilter = chatIdFilter
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + flushIntervalSec, repeating: flushIntervalSec)
+        timer.setEventHandler { [weak self] in
+            self?.flush()
+        }
+        flushTimer = timer
+        timer.resume()
+    }
+
+    func recordSnapshotReceived() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.snapshotReceivedCount += 1
+        }
+    }
+
+    func recordSnapshotApplied() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.snapshotAppliedCount += 1
+        }
+    }
+
+    func recordRowsBuild(isIncremental: Bool, durationMs: Double) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if isIncremental {
+                self.incrementalRowsBuildCount += 1
+            } else {
+                self.fullRowsRebuildCount += 1
+            }
+            self.buildRowsDurationMs.record(durationMs)
+        }
+    }
+
+    func recordApplyWindowMessages(_ durationMs: Double) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.applyWindowMessagesDurationMs.record(durationMs)
+        }
+    }
+
+    func recordTextRender(_ durationMs: Double) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.textRenderDurationMs.record(durationMs)
+        }
+    }
+
+    func recordAvatarThumb(_ durationMs: Double) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.avatarThumbDurationMs.record(durationMs)
+        }
+    }
+
+    private func flush() {
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        let elapsedSec = max(0.001, Double(nowNs &- windowStartNs) / 1_000_000_000)
+
+        let hasActivity =
+            snapshotReceivedCount > 0 ||
+            snapshotAppliedCount > 0 ||
+            fullRowsRebuildCount > 0 ||
+            incrementalRowsBuildCount > 0 ||
+            buildRowsDurationMs.count > 0 ||
+            applyWindowMessagesDurationMs.count > 0 ||
+            textRenderDurationMs.count > 0 ||
+            avatarThumbDurationMs.count > 0
+
+        guard hasActivity else {
+            resetWindow(nowNs: nowNs)
+            return
+        }
+
+        let chatLabel = chatIdFilter.map(String.init) ?? "all"
+        let snapshotsInPerSec = Double(snapshotReceivedCount) / elapsedSec
+        let snapshotsOutPerSec = Double(snapshotAppliedCount) / elapsedSec
+        appendRateSample(&snapshotInRateSamples, value: snapshotsInPerSec)
+        appendRateSample(&snapshotOutRateSamples, value: snapshotsOutPerSec)
+        let medianSnapshotsInPerSec = median(snapshotInRateSamples) ?? 0
+        let medianSnapshotsOutPerSec = median(snapshotOutRateSamples) ?? 0
+        let fullRebuildsPerSec = Double(fullRowsRebuildCount) / elapsedSec
+        let incrementalBuildsPerSec = Double(incrementalRowsBuildCount) / elapsedSec
+
+        let line = [
+            "CHAT_PERF",
+            "chatId=\(chatLabel)",
+            "windowSec=\(format(elapsedSec))",
+            "snapshots/s=\(format(snapshotsInPerSec))",
+            "snapshotsApplied/s=\(format(snapshotsOutPerSec))",
+            "medianSnapshots/s(before/after)=\(format(medianSnapshotsInPerSec))/\(format(medianSnapshotsOutPerSec))",
+            "fullRebuilds/s=\(format(fullRebuildsPerSec))",
+            "incrementalBuilds/s=\(format(incrementalBuildsPerSec))",
+            "buildRowsMs(avg/max)=\(format(buildRowsDurationMs.avgMs))/\(format(buildRowsDurationMs.maxMs))",
+            "applyWindowMessagesMs(avg/max)=\(format(applyWindowMessagesDurationMs.avgMs))/\(format(applyWindowMessagesDurationMs.maxMs))",
+            "textRenderMs(avg/max)=\(format(textRenderDurationMs.avgMs))/\(format(textRenderDurationMs.maxMs))",
+            "avatarThumbMs(avg/max)=\(format(avatarThumbDurationMs.avgMs))/\(format(avatarThumbDurationMs.maxMs))"
+        ].joined(separator: " ")
+        log.debug("\(line, privacy: .public)")
+
+        resetWindow(nowNs: nowNs)
+    }
+
+    private func resetWindow(nowNs: UInt64) {
+        windowStartNs = nowNs
+        snapshotReceivedCount = 0
+        snapshotAppliedCount = 0
+        fullRowsRebuildCount = 0
+        incrementalRowsBuildCount = 0
+        buildRowsDurationMs = DurationAggregate()
+        applyWindowMessagesDurationMs = DurationAggregate()
+        textRenderDurationMs = DurationAggregate()
+        avatarThumbDurationMs = DurationAggregate()
+    }
+
+    private func appendRateSample(_ samples: inout [Double], value: Double) {
+        guard value.isFinite else { return }
+        samples.append(max(0, value))
+        if samples.count > rateSamplesLimit {
+            samples.removeFirst(samples.count - rateSamplesLimit)
+        }
+    }
+
+    private func median(_ values: [Double]) -> Double? {
+        guard !values.isEmpty else { return nil }
+        let sorted = values.sorted()
+        let middle = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[middle - 1] + sorted[middle]) / 2
+        }
+        return sorted[middle]
+    }
+
+    private func format(_ value: Double) -> String {
+        String(format: "%.2f", value)
+    }
+}
+#endif
 
 nonisolated final class ViewUpdatePhaseTracker: @unchecked Sendable {
     static let shared = ViewUpdatePhaseTracker()
