@@ -6,85 +6,22 @@
 //
 
 import SwiftUI
-import AppKit
 
 struct ChatScreen: View {
     @ObservedObject var store: TelegramStore
     let chat: TGChat
-    let avatarPath: String?
-    let onToggleInspector: () -> Void
     @StateObject private var messagesViewModel: ChatMessagesViewModel
 
     @State private var draft: String = ""
     @State private var isPagingHistory: Bool = false
-    @State private var loadingIndicatorVisible: Bool = false
-    @State private var loadingIndicatorTask: Task<Void, Never>? = nil
-
-    private let loadingIndicatorShowDelayNs: UInt64 = 0
-    private let loadingIndicatorHideDelayNs: UInt64 = 120_000_000
-
-    private var isTimelineLoading: Bool {
-        messagesViewModel.isBootstrapping || store.isLoadingHistory || isPagingHistory
-    }
 
     init(
         store: TelegramStore,
-        chat: TGChat,
-        avatarPath: String?,
-        onToggleInspector: @escaping () -> Void
+        chat: TGChat
     ) {
         self.store = store
         self.chat = chat
-        self.avatarPath = avatarPath
-        self.onToggleInspector = onToggleInspector
         _messagesViewModel = StateObject(wrappedValue: ChatMessagesViewModel(store: store, chatId: chat.id))
-    }
-
-    @MainActor
-    private func updateLoadingIndicatorVisibility(isLoading: Bool) {
-        loadingIndicatorTask?.cancel()
-        let delayNs = isLoading ? loadingIndicatorShowDelayNs : loadingIndicatorHideDelayNs
-        loadingIndicatorTask = Task { @MainActor in
-            if delayNs > 0 {
-                try? await Task.sleep(nanoseconds: delayNs)
-            }
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.14)) {
-                loadingIndicatorVisible = isLoading
-            }
-        }
-    }
-
-    @MainActor
-    private func refreshToolbarLoadingIndicator() {
-        updateLoadingIndicatorVisibility(isLoading: isTimelineLoading)
-    }
-
-    // MARK: - Toolbar content (macOS titlebar)
-    @ToolbarContentBuilder
-    private var chatTitlebarToolbar: some ToolbarContent {
-        ToolbarItem(placement: .principal) {
-            Button(action: onToggleInspector) {
-                HStack(spacing: 8) {
-                    ChatTitleButtonInline(
-                        title: chat.title,
-                        chatId: chat.id,
-                        avatarPath: avatarPath
-                    )
-
-                    ZStack {
-                        MacSpinningIndicator()
-                            .frame(width: 14, height: 14)
-                            .opacity(loadingIndicatorVisible ? 1 : 0)
-                    }
-                    .frame(width: 14, height: 14)
-                }
-                .padding(.vertical, 2)
-            }
-            .buttonStyle(.plain)
-        }
-        // ChatTitleButtonInline already draws its own plate.
-        .sharedBackgroundVisibility(.hidden)
     }
 
     var body: some View {
@@ -110,42 +47,9 @@ struct ChatScreen: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
             }
-            .toolbar {
-                chatTitlebarToolbar
-            }
             .task(id: chat.id) {
                 draft = ""
-                refreshToolbarLoadingIndicator()
             }
-            .onChange(of: messagesViewModel.isBootstrapping) { _, _ in
-                refreshToolbarLoadingIndicator()
-            }
-            .onChange(of: store.isLoadingHistory) { _, _ in
-                refreshToolbarLoadingIndicator()
-            }
-            .onChange(of: isPagingHistory) { _, _ in
-                refreshToolbarLoadingIndicator()
-            }
-            .onDisappear {
-                loadingIndicatorTask?.cancel()
-                loadingIndicatorTask = nil
-            }
-    }
-}
-
-private struct MacSpinningIndicator: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSProgressIndicator {
-        let indicator = NSProgressIndicator()
-        indicator.style = .spinning
-        indicator.controlSize = .small
-        indicator.isIndeterminate = true
-        indicator.usesThreadedAnimation = true
-        indicator.startAnimation(nil)
-        return indicator
-    }
-
-    func updateNSView(_ nsView: NSProgressIndicator, context: Context) {
-        nsView.startAnimation(nil)
     }
 }
 
@@ -164,9 +68,7 @@ private struct ChatScreenPreviewContainer: View {
     var body: some View {
         ChatScreen(
             store: store,
-            chat: chat,
-            avatarPath: nil,
-            onToggleInspector: {}
+            chat: chat
         )
         .environmentObject(store)
         .frame(width: 980, height: 680)

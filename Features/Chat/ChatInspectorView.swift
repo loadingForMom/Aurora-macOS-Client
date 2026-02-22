@@ -10,6 +10,7 @@
 import SwiftUI
 import AppKit
 import Foundation
+import Combine
 
 private enum _InspectorCS {
     static let scroll = "InspectorScroll"
@@ -29,6 +30,10 @@ private enum _InspectorLiquidGlass {
     static let posterBlurDefault = 4.0
     static let actionsBlurDefault = 1.2
     static let chromeOpacityDefault = 0.92
+}
+
+private enum _PinnedHeaderChromeMetrics {
+    static let glassOffsetY: CGFloat = 10
 }
 
 private struct _PinnedTitleSlotProbe: View {
@@ -63,7 +68,7 @@ private struct _PinnedTitleSlotProbe: View {
 }
 
 struct ChatInspectorView: View {
-    @EnvironmentObject private var store: TelegramStore
+    let store: TelegramStore
     let chat: TGChat
 
     @AppStorage(_InspectorLiquidGlass.enabledKey) private var liquidGlassEnabled = _InspectorLiquidGlass.enabledDefault
@@ -98,28 +103,8 @@ struct ChatInspectorView: View {
     @State private var scrollTopMinY: CGFloat = .nan
     @State private var baselineScrollTopMinY: CGFloat = .nan
     @State private var settleBaselineWork: DispatchWorkItem?
-
-    // IMPORTANT:
-    // Для инспектора берём две разные миниатюры:
-    // - posterImage: крупная (для постера/blur), но всё ещё thumbnail, не полный decode исходника.
-    // - chromeAvatarImage: маленькая (для pinned chrome), чтобы не тащить огромную картинку в UI.
-    //
-    // Ключевое: размер постера зависит от ширины окна. Если брать фиксированное значение,
-    // на широких инспекторах (и особенно на Retina) получится “мыло”.
-    private func posterImage(forWidth width: CGFloat) -> NSImage? {
-        let posterPointSize = max(width, heroHeight) // points
-        return store.chatAvatarNSImage(
-            chatId: chat.id,
-            pointSize: posterPointSize,
-            preferHiRes: true,
-            maxClamp: 3072,
-            kindOverride: "chat_poster"
-        )
-    }
-
-    private var chromeAvatarImage: NSImage? {
-        store.chatAvatarNSImage(chatId: chat.id, pointSize: pinnedAvatarSize, preferHiRes: true)
-    }
+    @State private var avatarVersion: Int = 0
+    @StateObject private var avatarLoader = InspectorAvatarLoader()
 
     private var beyondPin: CGFloat {
         guard heroTitleScrollMinY.isFinite, pinnedTitleScrollMinY.isFinite else { return 0 }
@@ -180,6 +165,16 @@ struct ChatInspectorView: View {
 
     private var subtitleOpacity: Double {
         Double((1 - (handoffProgress * 1.35)).clamped(0, 1))
+    }
+
+    private func posterWidthBucket(_ width: CGFloat) -> CGFloat {
+        let clamped = max(240, width)
+        return (clamped / 16).rounded() * 16
+    }
+
+    private func loaderTaskKey(for width: CGFloat) -> String {
+        let bucket = Int(posterWidthBucket(width).rounded())
+        return "\(chat.id):\(avatarVersion):\(bucket)"
     }
 
     private func resetBaseline() {
@@ -254,13 +249,71 @@ struct ChatInspectorView: View {
         return abs(previous - next) >= epsilon
     }
 
+    private func handleHeroTitlePreferenceChange(_ value: CGFloat) {
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "ChatInspectorView.preference.heroTitleMinY",
+            details: "chatId=\(chat.id) value=\(value)"
+        )
+        PerfCounters.emitPOIEvent("ChatInspectorView.preference.heroTitleMinY", chatId: chat.id)
+#endif
+        DispatchQueue.main.async {
+            guard shouldAcceptScrollMetricUpdate(previous: heroTitleScrollMinY, next: value) else { return }
+            heroTitleScrollMinY = value
+            updateBaseline()
+        }
+    }
+
+    private func handlePinnedTitlePreferenceChange(_ value: CGFloat) {
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "ChatInspectorView.preference.pinnedTitleMinY",
+            details: "chatId=\(chat.id) value=\(value)"
+        )
+        PerfCounters.emitPOIEvent("ChatInspectorView.preference.pinnedTitleMinY", chatId: chat.id)
+#endif
+        DispatchQueue.main.async {
+            guard shouldAcceptScrollMetricUpdate(previous: pinnedTitleScrollMinY, next: value) else { return }
+            pinnedTitleScrollMinY = value
+            updateBaseline()
+        }
+    }
+
+    private func handleScrollTopPreferenceChange(_ value: CGFloat) {
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "ChatInspectorView.preference.scrollTopMinY",
+            details: "chatId=\(chat.id) value=\(value)"
+        )
+        PerfCounters.emitPOIEvent("ChatInspectorView.preference.scrollTopMinY", chatId: chat.id)
+#endif
+        DispatchQueue.main.async {
+            guard shouldAcceptScrollMetricUpdate(previous: scrollTopMinY, next: value) else { return }
+            scrollTopMinY = value
+
+            if !baselineScrollTopMinY.isFinite, value.isFinite {
+                baselineScrollTopMinY = value
+            }
+
+            updateBaseline()
+            scheduleBaselineSettleCheck()
+        }
+    }
+
     var body: some View {
+#if DEBUG
+        let _ = PerfCounters.isPrintChangesEnabled ? Self._printChanges() : ()
+        let _ = PerfCounters.bumpRender(
+            "ChatInspectorView.body",
+            details: "chatId=\(chat.id) handoffProgress=\(handoffProgress) chromeAlpha=\(chromeAlpha)"
+        )
+#endif
         GeometryReader { geo in
             let width = geo.size.width
 
             ZStack(alignment: .top) {
                 PosterBackground(
-                    image: posterImage(forWidth: width),
+                    image: avatarLoader.posterImage,
                     headerHeight: heroHeight,
                     overlapFraction: overlapFraction,
                     posterBlurRadius: posterBlurRadius,
@@ -316,24 +369,25 @@ struct ChatInspectorView: View {
                 }
                 .scrollEdgeEffectStyle(.soft, for: .top)
                 .onPreferenceChange(_HeroTitleMinYKey.self) {
-                    let value = $0
-                    DispatchQueue.main.async {
-                        guard shouldAcceptScrollMetricUpdate(previous: heroTitleScrollMinY, next: value) else { return }
-                        heroTitleScrollMinY = value
-                        updateBaseline()
-                    }
+                    handleHeroTitlePreferenceChange($0)
                 }
                 .onPreferenceChange(_PinnedTitleMinYKey.self) {
-                    let value = $0
-                    DispatchQueue.main.async {
-                        guard shouldAcceptScrollMetricUpdate(previous: pinnedTitleScrollMinY, next: value) else { return }
-                        pinnedTitleScrollMinY = value
-                        updateBaseline()
-                    }
+                    handlePinnedTitlePreferenceChange($0)
                 }
                 .onAppear {
-                    // Important: попросим hi-res у TDLib только когда инспектор реально открыт
-                    store.prefetchChatAvatarHiResIfNeeded(chatId: chat.id)
+#if DEBUG
+                    PerfCounters.bumpEvent(
+                        "ChatInspectorView.onAppear",
+                        details: "chatId=\(chat.id)"
+                    )
+#endif
+                    let initialVersion = store.chatAvatarVersionByChatId[chat.id] ?? 0
+                    avatarVersion = initialVersion
+                    avatarLoader.prefetchHiResIfNeeded(
+                        chatId: chat.id,
+                        avatarVersion: initialVersion,
+                        store: store
+                    )
                     DispatchQueue.main.async {
                         resetBaseline()
                         updateBaseline()
@@ -342,23 +396,12 @@ struct ChatInspectorView: View {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { updateBaseline() }
                 }
                 .onPreferenceChange(_ScrollTopMinYKey.self) {
-                    let value = $0
-                    DispatchQueue.main.async {
-                        guard shouldAcceptScrollMetricUpdate(previous: scrollTopMinY, next: value) else { return }
-                        scrollTopMinY = value
-
-                        if !baselineScrollTopMinY.isFinite, value.isFinite {
-                            baselineScrollTopMinY = value
-                        }
-
-                        updateBaseline()
-                        scheduleBaselineSettleCheck()
-                    }
+                    handleScrollTopPreferenceChange($0)
                 }
 
                 PinnedHeaderChrome(
                     title: chat.title,
-                    avatar: chromeAvatarImage,
+                    avatar: avatarLoader.chromeAvatarImage,
                     height: pinnedChromeHeight,
                     topPadding: pinnedTopPadding,
                     avatarSize: pinnedAvatarSize,
@@ -372,6 +415,32 @@ struct ChatInspectorView: View {
                 .allowsHitTesting(false)
             }
             .background(Color(nsColor: .windowBackgroundColor))
+            .task(id: loaderTaskKey(for: width)) {
+                // Preload avatar thumbnails once per chat/version/width bucket.
+                avatarLoader.prefetchHiResIfNeeded(
+                    chatId: chat.id,
+                    avatarVersion: avatarVersion,
+                    store: store
+                )
+                avatarLoader.update(
+                    chatId: chat.id,
+                    avatarVersion: avatarVersion,
+                    posterWidth: posterWidthBucket(width),
+                    heroHeight: heroHeight,
+                    pinnedAvatarSize: pinnedAvatarSize,
+                    store: store
+                )
+            }
+        }
+        .onReceive(
+            store.$chatAvatarVersionByChatId
+                .map { $0[chat.id] ?? 0 }
+                .removeDuplicates()
+        ) { nextVersion in
+            avatarVersion = nextVersion
+        }
+        .onDisappear {
+            avatarLoader.clear()
         }
     }
 }
@@ -464,25 +533,7 @@ private struct PosterBackground: View {
         let strength = liquidGlassStrength.clamped(0, 1.5)
         let tint = liquidGlassTint.clamped(0, 1)
 
-        let base: AnyView = {
-            if reduceTransparency {
-                return AnyView(Rectangle().fill(Color(nsColor: .windowBackgroundColor).opacity(0.22)))
-            } else if liquidGlassEnabled {
-                return AnyView(
-                    Color.clear
-                        .glassEffect(in: Rectangle())
-                        .overlay(
-                            Rectangle()
-                                .fill(.ultraThinMaterial)
-                                .opacity(0.14 + (0.30 * strength))
-                        )
-                )
-            } else {
-                return AnyView(Rectangle().fill(.ultraThinMaterial))
-            }
-        }()
-
-        return base
+        return photoMaterialBase(strength: strength)
             .overlay(colorScheme == .dark
                      ? Color.black.opacity(0.04 + (0.18 * tint))
                      : Color(nsColor: .windowBackgroundColor).opacity(0.02 + (0.11 * tint)))
@@ -504,6 +555,24 @@ private struct PosterBackground: View {
             .allowsHitTesting(false)
     }
 
+    @ViewBuilder
+    private func photoMaterialBase(strength: CGFloat) -> some View {
+        if reduceTransparency {
+            Rectangle().fill(Color(nsColor: .windowBackgroundColor).opacity(0.22))
+        } else if liquidGlassEnabled {
+            Color.clear
+                .glassEffect(in: Rectangle())
+                .overlay(
+                    Rectangle()
+                        .fill(.ultraThinMaterial)
+                        .opacity(0.14 + (0.30 * strength))
+                )
+        } else {
+            Rectangle().fill(.ultraThinMaterial)
+        }
+    }
+
+    @ViewBuilder
     private func overlapBlurOverlay(totalHeight: CGFloat, width: CGFloat) -> some View {
         let strength = liquidGlassStrength.clamped(0, 1.5)
         let tint = liquidGlassTint.clamped(0, 1)
@@ -511,45 +580,20 @@ private struct PosterBackground: View {
         let overlayTop = headerHeight - overlapHeight
         let overlayHeight = max(0, totalHeight - overlayTop)
 
-        // 1) если высоты почти нет — нечего маскировать
-        guard overlayHeight > 1 else {
-            return AnyView(EmptyView())
-        }
+        if overlayHeight > 1 {
+            let raw = overlapHeight / overlayHeight
+            let r: CGFloat = raw.isFinite ? raw.clamped(0, 1) : 0
 
-        // 2) clamp ratio в 0...1 и защитимся от NaN/inf
-        let raw = overlapHeight / overlayHeight
-        let r: CGFloat = raw.isFinite ? raw.clamped(0, 1) : 0
+            let eps: CGFloat = 0.0005
+            let s0: CGFloat = 0.0
+            let s1: CGFloat = max(s0 + eps, min(r * 0.10, 1 - eps * 5))
+            let s2: CGFloat = max(s1 + eps, min(r * 0.30, 1 - eps * 4))
+            let s3: CGFloat = max(s2 + eps, min(r * 0.60, 1 - eps * 3))
+            let s4: CGFloat = max(s3 + eps, min(r * 0.85, 1 - eps * 2))
+            let s5: CGFloat = max(s4 + eps, min(r,        1 - eps))
+            let s6: CGFloat = 1.0
 
-        // 3) гарантируем строго возрастающие стопы
-        let eps: CGFloat = 0.0005
-        let s0: CGFloat = 0.0
-        let s1: CGFloat = max(s0 + eps, min(r * 0.10, 1 - eps * 5))
-        let s2: CGFloat = max(s1 + eps, min(r * 0.30, 1 - eps * 4))
-        let s3: CGFloat = max(s2 + eps, min(r * 0.60, 1 - eps * 3))
-        let s4: CGFloat = max(s3 + eps, min(r * 0.85, 1 - eps * 2))
-        let s5: CGFloat = max(s4 + eps, min(r,        1 - eps))
-        let s6: CGFloat = 1.0
-
-        let base: AnyView = {
-            if reduceTransparency {
-                return AnyView(Rectangle().fill(Color(nsColor: .windowBackgroundColor).opacity(0.92)))
-            } else if liquidGlassEnabled {
-                return AnyView(
-                    Color.clear
-                        .glassEffect(in: Rectangle())
-                        .overlay(
-                            Rectangle()
-                                .fill(.thinMaterial)
-                                .opacity(0.14 + (0.34 * strength))
-                        )
-                )
-            } else {
-                return AnyView(Rectangle().fill(.ultraThinMaterial))
-            }
-        }()
-
-        return AnyView(
-            base
+            overlapBlurBase(strength: strength)
                 .frame(width: width, height: overlayHeight)
                 .overlay(colorScheme == .dark
                          ? Color.black.opacity(0.02 + (0.10 * tint))
@@ -571,7 +615,24 @@ private struct PosterBackground: View {
                 )
                 .offset(y: overlayTop)
                 .allowsHitTesting(false)
-        )
+        }
+    }
+
+    @ViewBuilder
+    private func overlapBlurBase(strength: CGFloat) -> some View {
+        if reduceTransparency {
+            Rectangle().fill(Color(nsColor: .windowBackgroundColor).opacity(0.92))
+        } else if liquidGlassEnabled {
+            Color.clear
+                .glassEffect(in: Rectangle())
+                .overlay(
+                    Rectangle()
+                        .fill(.thinMaterial)
+                        .opacity(0.14 + (0.34 * strength))
+                )
+        } else {
+            Rectangle().fill(.ultraThinMaterial)
+        }
     }
 }
 
@@ -726,7 +787,7 @@ private struct PinnedHeaderChrome: View {
     var body: some View {
         ZStack(alignment: .top) {
             chromeBackground
-                .offset(y: ChatHeaderFixedMetrics.inspectorGlassOffsetY)
+                .offset(y: _PinnedHeaderChromeMetrics.glassOffsetY)
                 .opacity(chromeAlpha)
 
             VStack(spacing: titleSpacing) {
@@ -749,25 +810,7 @@ private struct PinnedHeaderChrome: View {
         let strength = liquidGlassStrength.clamped(0, 1.5)
         let tint = liquidGlassTint.clamped(0, 1)
 
-        let base: AnyView = {
-            if reduceTransparency {
-                return AnyView(Rectangle().fill(Color(nsColor: .windowBackgroundColor).opacity(0.95)))
-            } else if liquidGlassEnabled {
-                return AnyView(
-                    Color.clear
-                        .glassEffect(in: Rectangle())
-                        .overlay(
-                            Rectangle()
-                                .fill(.regularMaterial)
-                                .opacity(0.10 + (0.28 * strength))
-                        )
-                )
-            } else {
-                return AnyView(Color.clear.glassEffect(in: Rectangle()))
-            }
-        }()
-
-        return base
+        return chromeBackgroundBase(strength: strength)
             .overlay(
                 LinearGradient(
                     colors: [
@@ -779,34 +822,7 @@ private struct PinnedHeaderChrome: View {
                 )
                 .opacity(0.52 + (0.24 * tint))
             )
-            .overlay(
-                Group {
-                    if reduceTransparency {
-                        EmptyView()
-                    } else {
-                        Rectangle()
-                            .fill(liquidGlassEnabled ? .thinMaterial : .ultraThinMaterial)
-                            .overlay(
-                                colorScheme == .dark
-                                    ? Color.black.opacity(liquidGlassEnabled ? (0.03 + (0.08 * tint)) : 0.06)
-                                    : Color.clear
-                            )
-                            .mask(
-                                LinearGradient(
-                                    stops: [
-                                        .init(color: .black,               location: 0.00),
-                                        .init(color: .black.opacity(0.95), location: 0.35),
-                                        .init(color: .black.opacity(0.55), location: 0.60),
-                                        .init(color: .black.opacity(0.20), location: 0.78),
-                                        .init(color: .clear,              location: 1.00),
-                                    ],
-                                    startPoint: .top,
-                                    endPoint: .bottom
-                                )
-                            )
-                    }
-                }
-            )
+            .overlay(chromeTopFrost(tint: tint))
             .mask(
                 LinearGradient(
                     stops: [
@@ -823,6 +839,51 @@ private struct PinnedHeaderChrome: View {
                     endPoint: .bottom
                 )
             )
+    }
+
+    @ViewBuilder
+    private func chromeBackgroundBase(strength: CGFloat) -> some View {
+        if reduceTransparency {
+            Rectangle()
+                .fill(Color(nsColor: .windowBackgroundColor).opacity(0.95))
+        } else if liquidGlassEnabled {
+            Color.clear
+                .glassEffect(in: Rectangle())
+                .overlay(
+                    Rectangle()
+                        .fill(.regularMaterial)
+                        .opacity(0.10 + (0.28 * strength))
+                )
+        } else {
+            Color.clear
+                .glassEffect(in: Rectangle())
+        }
+    }
+
+    @ViewBuilder
+    private func chromeTopFrost(tint: CGFloat) -> some View {
+        if !reduceTransparency {
+            Rectangle()
+                .fill(liquidGlassEnabled ? .thinMaterial : .ultraThinMaterial)
+                .overlay(
+                    colorScheme == .dark
+                        ? Color.black.opacity(liquidGlassEnabled ? (0.03 + (0.08 * tint)) : 0.06)
+                        : Color.clear
+                )
+                .mask(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .black,               location: 0.00),
+                            .init(color: .black.opacity(0.95), location: 0.35),
+                            .init(color: .black.opacity(0.55), location: 0.60),
+                            .init(color: .black.opacity(0.20), location: 0.78),
+                            .init(color: .clear,              location: 1.00),
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+        }
     }
 }
 
@@ -1072,8 +1133,7 @@ private struct ChatInspectorViewPreviewContainer: View {
     )
 
     var body: some View {
-        ChatInspectorView(chat: chat)
-            .environmentObject(store)
+        ChatInspectorView(store: store, chat: chat)
             .frame(width: 380, height: 820)
     }
 }

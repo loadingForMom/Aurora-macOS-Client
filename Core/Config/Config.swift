@@ -717,6 +717,179 @@ nonisolated enum HistoryTrace {
 #endif
 }
 
+nonisolated enum PerfCounters {
+#if DEBUG
+    private static let enabledDefaultsKey = "debug.ui.perf.enabled"
+    private static let printChangesDefaultsKey = "debug.ui.perf.printChanges"
+    private static let enabledEnvDefault = parseBoolEnv("DEBUG_UI_PERF")
+    private static let printChangesEnvDefault = parseBoolEnv("DEBUG_UI_PERF_PRINT_CHANGES")
+    private static let emitEveryCount = 25
+    private static let emitIntervalNs: UInt64 = 1_000_000_000
+    private static let logger = Logger(subsystem: "com.aurora.app", category: "ui.perf")
+    private static let signpostLog = OSLog(subsystem: "com.aurora.app", category: "points_of_interest")
+    private static let lock = NSLock()
+    private static var countsByKey: [String: Int] = [:]
+    private static var lastLoggedNsByKey: [String: UInt64] = [:]
+#endif
+
+    static var isEnabled: Bool {
+#if DEBUG
+        boolSetting(for: enabledDefaultsKey, fallback: enabledEnvDefault)
+#else
+        false
+#endif
+    }
+
+    static var isPrintChangesEnabled: Bool {
+#if DEBUG
+        boolSetting(for: printChangesDefaultsKey, fallback: printChangesEnvDefault)
+#else
+        false
+#endif
+    }
+
+    static func setEnabled(_ enabled: Bool) {
+#if DEBUG
+        UserDefaults.standard.set(enabled, forKey: enabledDefaultsKey)
+        logger.debug("perf counters enabled=\(enabled, privacy: .public)")
+#else
+        _ = enabled
+#endif
+    }
+
+    static func setPrintChangesEnabled(_ enabled: Bool) {
+#if DEBUG
+        UserDefaults.standard.set(enabled, forKey: printChangesDefaultsKey)
+        logger.debug("perf printChanges enabled=\(enabled, privacy: .public)")
+#else
+        _ = enabled
+#endif
+    }
+
+    @discardableResult
+    static func bumpRender(
+        _ key: StaticString,
+        details: @autoclosure () -> String? = nil
+    ) -> Int {
+#if DEBUG
+        bump(kind: "render", key: key, details: details)
+#else
+        _ = key
+        _ = details
+        return 0
+#endif
+    }
+
+    @discardableResult
+    static func bumpEvent(
+        _ key: StaticString,
+        details: @autoclosure () -> String? = nil
+    ) -> Int {
+#if DEBUG
+        bump(kind: "event", key: key, details: details)
+#else
+        _ = key
+        _ = details
+        return 0
+#endif
+    }
+
+    static func emitPOIEvent(_ name: StaticString, chatId: Int64? = nil) {
+#if DEBUG
+        guard isEnabled else { return }
+        if let chatId {
+            os_signpost(.event, log: signpostLog, name: name, "chatId=%{public}lld", chatId)
+        } else {
+            os_signpost(.event, log: signpostLog, name: name)
+        }
+#else
+        _ = name
+        _ = chatId
+#endif
+    }
+
+    static func beginPOI(_ name: StaticString, chatId: Int64? = nil) -> OSSignpostID {
+#if DEBUG
+        guard isEnabled else { return .invalid }
+        let signpostId = OSSignpostID(log: signpostLog)
+        if let chatId {
+            os_signpost(.begin, log: signpostLog, name: name, signpostID: signpostId, "chatId=%{public}lld", chatId)
+        } else {
+            os_signpost(.begin, log: signpostLog, name: name, signpostID: signpostId)
+        }
+        return signpostId
+#else
+        _ = name
+        _ = chatId
+        return .invalid
+#endif
+    }
+
+    static func endPOI(_ name: StaticString, signpostId: OSSignpostID, chatId: Int64? = nil) {
+#if DEBUG
+        guard isEnabled else { return }
+        guard signpostId != .invalid else { return }
+        if let chatId {
+            os_signpost(.end, log: signpostLog, name: name, signpostID: signpostId, "chatId=%{public}lld", chatId)
+        } else {
+            os_signpost(.end, log: signpostLog, name: name, signpostID: signpostId)
+        }
+#else
+        _ = name
+        _ = signpostId
+        _ = chatId
+#endif
+    }
+
+#if DEBUG
+    private static func bump(kind: String, key: StaticString, details: () -> String?) -> Int {
+        guard isEnabled else { return 0 }
+        let fullKey = "\(kind).\(String(describing: key))"
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+
+        lock.lock()
+        let count = (countsByKey[fullKey] ?? 0) + 1
+        countsByKey[fullKey] = count
+        let lastLoggedNs = lastLoggedNsByKey[fullKey] ?? 0
+        let thresholdReached = count == 1 || count.isMultiple(of: emitEveryCount)
+        let intervalReached = lastLoggedNs == 0 || (nowNs &- lastLoggedNs) >= emitIntervalNs
+        let shouldLog = thresholdReached && intervalReached
+        if shouldLog {
+            lastLoggedNsByKey[fullKey] = nowNs
+        }
+        lock.unlock()
+
+        guard shouldLog else { return count }
+        let detailsText = details() ?? "none"
+        logger.debug(
+            "perf-counter key=\(fullKey, privacy: .public) count=\(count, privacy: .public) details=\(sanitize(detailsText), privacy: .public)"
+        )
+        return count
+    }
+
+    private static func boolSetting(for defaultsKey: String, fallback: Bool) -> Bool {
+        guard UserDefaults.standard.object(forKey: defaultsKey) != nil else {
+            return fallback
+        }
+        return UserDefaults.standard.bool(forKey: defaultsKey)
+    }
+
+    private static func parseBoolEnv(_ key: String) -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment[key]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty
+        else { return false }
+        return raw == "1" || raw.caseInsensitiveCompare("true") == .orderedSame
+    }
+
+    private static func sanitize(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+    }
+#endif
+}
+
 nonisolated enum ChatPerfTrace {
 #if DEBUG
     private static let enabledFlag: Bool = {

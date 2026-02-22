@@ -23,7 +23,7 @@ struct MessagesPane: View {
     @State private var renderRange: Range<Int> = 0..<0
     @State private var windowMessages: [TGMessage] = []
     @State private var previousRenderMessageIds: [Int64] = []
-    @State private var groupRowMinYById: [String: CGFloat] = [:]
+    @State private var scrollStateCoordinator = ScrollStateCoordinator()
     @State private var prependAnchorMessageId: Int64? = nil
     @State private var prependAnchorRowId: String? = nil
     @State private var prependAnchorMinYBefore: CGFloat? = nil
@@ -44,6 +44,11 @@ struct MessagesPane: View {
     @State private var newIncomingCount: Int = 0
     @State private var visibleMessageIds: Set<Int64> = []
     @State private var visibleReportTask: Task<Void, Never>? = nil
+    @State private var visibilityBatcher = VisibilityBatcher()
+    @State private var visibilityBatchFlushTask: Task<Void, Never>? = nil
+    @State private var renderWindowRefreshThrottleTask: Task<Void, Never>? = nil
+    @State private var pendingRenderWindowRefreshSource: String? = nil
+    @State private var lastRenderWindowRefreshAtNs: UInt64 = 0
     @State private var renderRangePrefetchHysteresisArmed: Bool = true
     @State private var renderRangePrefetchDebounceTask: Task<Void, Never>? = nil
     @State private var renderRangePrefetchRequestStartedAtNs: [UInt64] = []
@@ -52,8 +57,6 @@ struct MessagesPane: View {
 
     @State private var revealTimeX: CGFloat = 0
     @State private var lastAutoScrollAnimatedAtNs: UInt64 = 0
-    @State private var didCrossPaginationThreshold: Bool = false
-    @State private var lastTopSentinelMinY: CGFloat = -.greatestFiniteMagnitude
     @State private var isTopSentinelVisible: Bool = false
     @State private var pendingTopVisibleRetryAfterLoading: Bool = false
     @State private var isLiveScrolling: Bool = false
@@ -69,7 +72,6 @@ struct MessagesPane: View {
     private let majorGap: Int = 60 * 60
     private let autoScrollAnimationCooldownNs: UInt64 = 220_000_000
     private let lightweightRenderModeResetDelayNs: UInt64 = 120_000_000
-    private let paginationTopThreshold: CGFloat = 260
     private let heavyEffectsCutoffMessages: Int = 700
     private let textPrewarmMargin: Int = 36
     private let mediaPrefetchMargin: Int = 24
@@ -77,6 +79,8 @@ struct MessagesPane: View {
     private let revealTimeMaxX: CGFloat = 72
     private let windowingDebugIntervalNs: UInt64 = 2_000_000_000
     private let windowFocusSyncDelayNs: UInt64 = 120_000_000
+    private let visibilityBatchDebounceNs: UInt64 = 120_000_000
+    private let renderWindowRefreshThrottleNs: UInt64 = 125_000_000
     private let renderWindowLimit: Int = 320
     private let renderWindowShiftMargin: Int = 80
     private let renderRangePrefetchTriggerDistance: Int = 30
@@ -116,7 +120,7 @@ struct MessagesPane: View {
         let rows: [Row]
     }
 
-    private enum Row: Identifiable, Hashable, Sendable {
+    enum Row: Identifiable, Hashable, Sendable {
         case dayHeader(id: String, date: Date)
         case timeSeparator(id: String, date: Date)
         case group(MessageGroup)
@@ -727,7 +731,7 @@ struct MessagesPane: View {
         prependAnchorMessageId = messageId
         let rowId = Self.rowIdContainingMessage(messageId, rows: rows)
         prependAnchorRowId = rowId
-        prependAnchorMinYBefore = rowId.flatMap { groupRowMinYById[$0] }
+        prependAnchorMinYBefore = rowId.flatMap { scrollStateCoordinator.groupRowMinY(for: $0) }
     }
 
     @MainActor
@@ -753,7 +757,7 @@ struct MessagesPane: View {
         guard prependAnchorMessageId == anchorMessageId else { return false }
         guard prependAnchorMinYBefore != nil else { return false }
         guard let currentRowId = Self.rowIdContainingMessage(anchorMessageId, rows: rows) else { return false }
-        return groupRowMinYById[currentRowId] != nil
+        return scrollStateCoordinator.groupRowMinY(for: currentRowId) != nil
     }
 
     @MainActor
@@ -761,7 +765,7 @@ struct MessagesPane: View {
         guard prependAnchorMessageId == anchorMessageId else { return false }
         guard let beforeMinY = prependAnchorMinYBefore else { return false }
         guard let currentRowId = Self.rowIdContainingMessage(anchorMessageId, rows: rows) else { return false }
-        guard let afterMinY = groupRowMinYById[currentRowId] else { return false }
+        guard let afterMinY = scrollStateCoordinator.groupRowMinY(for: currentRowId) else { return false }
         guard let scrollView = scrollViewRef.scrollView else { return false }
 
         let deltaY = afterMinY - beforeMinY
@@ -795,7 +799,7 @@ struct MessagesPane: View {
         renderRange = 0..<0
         windowMessages = []
         previousRenderMessageIds = []
-        groupRowMinYById = [:]
+        scrollStateCoordinator.reset()
         clearPrependPixelAnchor()
 
         pagingEnabled = false
@@ -809,8 +813,12 @@ struct MessagesPane: View {
 
         isAtBottom = true
         newIncomingCount = 0
+        cancelVisibilityBatchFlushTask()
+        visibilityBatcher.clear()
         visibleReportTask?.cancel()
         visibleReportTask = nil
+        cancelRenderWindowRefreshThrottleTask()
+        lastRenderWindowRefreshAtNs = 0
         visibleMessageIds = []
         store.resetVisibleMessageTracking(chatId: chat.id)
         store.updateMessageWindowFocus(chatId: chat.id, isFollowingLatest: true, anchorMessageId: nil)
@@ -824,8 +832,6 @@ struct MessagesPane: View {
         renderRangePrefetchDebounceTask = nil
         renderRangePrefetchHysteresisArmed = true
         renderRangePrefetchRequestStartedAtNs = []
-        didCrossPaginationThreshold = false
-        lastTopSentinelMinY = -.greatestFiniteMagnitude
         isTopSentinelVisible = false
         pendingTopVisibleRetryAfterLoading = false
         lightweightScrollRenderModeResetTask?.cancel()
@@ -1018,6 +1024,16 @@ struct MessagesPane: View {
 
     @MainActor
     private func refreshRenderWindowIfNeeded(source: String) {
+#if DEBUG
+        let signpostId = PerfCounters.beginPOI("MessagesPane.refreshRenderWindowIfNeeded", chatId: chat.id)
+        defer {
+            PerfCounters.endPOI("MessagesPane.refreshRenderWindowIfNeeded", signpostId: signpostId, chatId: chat.id)
+        }
+        PerfCounters.bumpEvent(
+            "MessagesPane.refreshRenderWindowIfNeeded",
+            details: "chatId=\(chat.id) source=\(source) windowCount=\(windowMessages.count) visibleCount=\(visibleMessageIds.count)"
+        )
+#endif
         guard !windowMessages.isEmpty else { return }
         let renderRecalcReason = renderRangeReasonForRefreshSource(source)
         let renderUpdate = Self.computeRenderWindowUpdate(
@@ -1340,21 +1356,50 @@ struct MessagesPane: View {
 
     @MainActor
     private func handleTopSentinelOffset(_ minY: CGFloat) {
-        lastTopSentinelMinY = minY
-        guard didInitialScrollToBottom else {
-            didCrossPaginationThreshold = false
-            return
-        }
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "MessagesPane.handleTopSentinelOffset",
+            details: "chatId=\(chat.id) minY=\(minY)"
+        )
+        PerfCounters.emitPOIEvent("MessagesPane.handleTopSentinelOffset", chatId: chat.id)
+#endif
+        let update = scrollStateCoordinator.ingestTopSentinelOffset(
+            minY,
+            allowTrigger: didInitialScrollToBottom
+        )
 
-        let nearTop = minY >= -paginationTopThreshold
-        if nearTop {
-            guard !didCrossPaginationThreshold else { return }
-            didCrossPaginationThreshold = true
-            requestOlderHistoryFromTopTrigger(source: "nearTopThreshold")
-            return
+#if DEBUG
+        if let ignoreReason = update.ignoreReason {
+            PerfCounters.bumpEvent(
+                "MessagesPane.topSentinelOffsetIgnored",
+                details: "chatId=\(chat.id) reason=\(ignoreReason.rawValue)"
+            )
         }
+        if update.nearTopChanged || update.triggerStateChanged {
+            PerfCounters.bumpEvent(
+                "MessagesPane.topSentinelStateUpdated",
+                details: "chatId=\(chat.id) nearTop=\(update.isNearTop) triggerState=\(update.triggerState.rawValue)"
+            )
+        }
+#endif
 
-        didCrossPaginationThreshold = false
+        guard update.shouldTriggerLoad else { return }
+        requestOlderHistoryFromTopTrigger(source: "nearTopThreshold")
+    }
+
+    @MainActor
+    private func reconcileTopSentinelTriggerIfNeeded(source: String) {
+        let shouldTrigger = scrollStateCoordinator.reconcileTopSentinelTrigger(
+            allowTrigger: didInitialScrollToBottom
+        )
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "MessagesPane.topSentinelReconcile",
+            details: "chatId=\(chat.id) source=\(source) shouldTrigger=\(shouldTrigger)"
+        )
+#endif
+        guard shouldTrigger else { return }
+        requestOlderHistoryFromTopTrigger(source: source)
     }
 
     @MainActor
@@ -1441,28 +1486,277 @@ struct MessagesPane: View {
     }
 
     @MainActor
-    private func handleMessageVisibilityChange(messageId: Int64, isVisible: Bool) {
-        guard messageId > 0 else { return }
-        if isVisible {
-            let inserted = visibleMessageIds.insert(messageId).inserted
-            guard inserted else { return }
-        } else {
-            guard visibleMessageIds.remove(messageId) != nil else { return }
+    private func handleContentMinYPreferenceChange(_ minY: CGFloat) {
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "MessagesPane.preference.contentMinY",
+            details: "chatId=\(chat.id) minY=\(minY)"
+        )
+        PerfCounters.emitPOIEvent("MessagesPane.preference.contentMinY", chatId: chat.id)
+#endif
+        handleTopSentinelOffset(minY)
+        maybeRequestOlderForUnderfilledViewport(source: "contentOffsetChanged")
+    }
+
+    @MainActor
+    private var shouldTrackGroupRowOffsets: Bool {
+        guard didInitialScrollToBottom else { return false }
+        if pagingInFlight || restoreAnchorAfterPaging { return true }
+        if pendingRestoreAnchorMessageId != nil || prependAnchorMessageId != nil { return true }
+        // Prime anchor measurement only near top/prefetch; skip steady-state scroll.
+        return isTopSentinelVisible
+            || renderRangePrefetchDebounceTask != nil
+            || !renderRangePrefetchHysteresisArmed
+    }
+
+    @MainActor
+    private func trackedGroupRowMeasurementMessageId() -> Int64? {
+        if let pendingRestoreAnchorMessageId, pendingRestoreAnchorMessageId > 0 {
+            return pendingRestoreAnchorMessageId
         }
+        if let prependAnchorMessageId, prependAnchorMessageId > 0 {
+            return prependAnchorMessageId
+        }
+        guard shouldTrackGroupRowOffsets else { return nil }
+        if let topVisibleMessageId = topVisibleMessageIdForPrependAnchor(), topVisibleMessageId > 0 {
+            return topVisibleMessageId
+        }
+        return windowMessages.first(where: { $0.id > 0 })?.id
+    }
+
+    @MainActor
+    private func shouldPublishGroupRowMinY(for row: Row, trackedMessageId: Int64?) -> Bool {
+        guard shouldTrackGroupRowOffsets else { return false }
+        guard let trackedMessageId else { return false }
+        guard case .group(let group) = row else { return false }
+        return group.messages.contains(where: { $0.id == trackedMessageId })
+    }
+
+    @MainActor
+    private func handleGroupRowMinYPreferenceChange(_ map: [String: CGFloat]) {
+        guard shouldTrackGroupRowOffsets else {
+#if DEBUG
+            PerfCounters.bumpEvent(
+                "MessagesPane.preference.groupRowMinYSkipped",
+                details: "chatId=\(chat.id) reason=trackingDisabled"
+            )
+#endif
+            return
+        }
+        guard !map.isEmpty else {
+#if DEBUG
+            PerfCounters.bumpEvent(
+                "MessagesPane.preference.groupRowMinYSkipped",
+                details: "chatId=\(chat.id) reason=emptyMap"
+            )
+#endif
+            return
+        }
+        let update = scrollStateCoordinator.updateGroupRowMinY(map)
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "MessagesPane.preference.groupRowMinY",
+            details: "chatId=\(chat.id) rows=\(map.count) didChange=\(update.didChange)"
+        )
+        if update.didChange {
+            PerfCounters.emitPOIEvent("MessagesPane.preference.groupRowMinY", chatId: chat.id)
+        }
+#endif
+    }
+
+    @MainActor
+    private func cancelVisibilityBatchFlushTask() {
+        visibilityBatchFlushTask?.cancel()
+        visibilityBatchFlushTask = nil
+    }
+
+    @MainActor
+    private func scheduleVisibilityBatchFlush() {
+        guard visibilityBatcher.hasPendingChanges else { return }
+        // Keep a fixed coalescing window so continuous scroll still flushes periodically.
+        guard visibilityBatchFlushTask == nil else {
+#if DEBUG
+            PerfCounters.bumpEvent(
+                "MessagesPane.visibilityBatchFlushSkipped",
+                details: "chatId=\(chat.id) reason=alreadyScheduled pendingMessages=\(visibilityBatcher.pendingMessageCount)"
+            )
+#endif
+            return
+        }
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "MessagesPane.visibilityBatchFlushScheduled",
+            details: "chatId=\(chat.id) pendingMessages=\(visibilityBatcher.pendingMessageCount)"
+        )
+#endif
+        let chatId = chat.id
+        visibilityBatchFlushTask = Task { @MainActor [chatId] in
+            try? await Task.sleep(nanoseconds: visibilityBatchDebounceNs)
+            guard !Task.isCancelled else { return }
+            guard chat.id == chatId else { return }
+            visibilityBatchFlushTask = nil
+            applyVisibilityBatch(source: "debouncedVisibility")
+        }
+    }
+
+    @MainActor
+    private func applyVisibilityBatch(source: String) {
+        guard visibilityBatcher.hasPendingChanges else { return }
+#if DEBUG
+        let signpostId = PerfCounters.beginPOI("MessagesPane.applyVisibilityBatch", chatId: chat.id)
+        defer {
+            PerfCounters.endPOI("MessagesPane.applyVisibilityBatch", signpostId: signpostId, chatId: chat.id)
+        }
+#endif
+        let drainResult = visibilityBatcher.drain()
+        guard !drainResult.latestVisibilityByMessageId.isEmpty else { return }
+
+        var nextVisibleIds = visibleMessageIds
+        var insertions = 0
+        var removals = 0
+        for (messageId, isVisible) in drainResult.latestVisibilityByMessageId {
+            guard messageId > 0 else { continue }
+            if isVisible {
+                if nextVisibleIds.insert(messageId).inserted {
+                    insertions += 1
+                }
+            } else if nextVisibleIds.remove(messageId) != nil {
+                removals += 1
+            }
+        }
+
+        let didChange = nextVisibleIds != visibleMessageIds
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "MessagesPane.visibilityBatchApplied",
+            details: "chatId=\(chat.id) source=\(source) bufferedEvents=\(drainResult.bufferedEvents) pendingMessages=\(drainResult.latestVisibilityByMessageId.count) insertions=\(insertions) removals=\(removals) didChange=\(didChange)"
+        )
+        if didChange {
+            PerfCounters.emitPOIEvent("MessagesPane.visibilityBatchApplied", chatId: chat.id)
+        }
+#endif
+        guard didChange else { return }
+        visibleMessageIds = nextVisibleIds
         scheduleVisibleMessagesReport()
         scheduleWindowFocusSync()
-        refreshRenderWindowIfNeeded(source: "visibleAreaChanged")
+        requestRenderWindowRefreshThrottled(source: "visibilityBatch:\(source)")
+    }
+
+    @MainActor
+    private func flushPendingVisibilityBatchIfNeeded(source: String) {
+        guard visibilityBatcher.hasPendingChanges else { return }
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "MessagesPane.visibilityBatchFlushForced",
+            details: "chatId=\(chat.id) source=\(source)"
+        )
+#endif
+        cancelVisibilityBatchFlushTask()
+        applyVisibilityBatch(source: source)
+    }
+
+    @MainActor
+    private func cancelRenderWindowRefreshThrottleTask() {
+        renderWindowRefreshThrottleTask?.cancel()
+        renderWindowRefreshThrottleTask = nil
+        pendingRenderWindowRefreshSource = nil
+    }
+
+    @MainActor
+    private func requestRenderWindowRefreshThrottled(source: String) {
+        pendingRenderWindowRefreshSource = source
+
+        // Coalesce rapid visibility churn into one refresh per throttle window.
+        guard renderWindowRefreshThrottleTask == nil else {
+#if DEBUG
+            PerfCounters.bumpEvent(
+                "MessagesPane.renderWindowRefreshThrottle",
+                details: "chatId=\(chat.id) action=coalesced source=\(source)"
+            )
+#endif
+            return
+        }
+
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        let elapsedNs: UInt64
+        if lastRenderWindowRefreshAtNs == 0 {
+            elapsedNs = renderWindowRefreshThrottleNs
+        } else if nowNs >= lastRenderWindowRefreshAtNs {
+            elapsedNs = nowNs - lastRenderWindowRefreshAtNs
+        } else {
+            elapsedNs = renderWindowRefreshThrottleNs
+        }
+        let delayNs = elapsedNs >= renderWindowRefreshThrottleNs ? 0 : (renderWindowRefreshThrottleNs - elapsedNs)
+
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "MessagesPane.renderWindowRefreshThrottle",
+            details: "chatId=\(chat.id) action=scheduled source=\(source) delayMs=\(delayNs / 1_000_000)"
+        )
+#endif
+        let chatId = chat.id
+        renderWindowRefreshThrottleTask = Task { @MainActor [chatId, delayNs] in
+            if delayNs > 0 {
+                try? await Task.sleep(nanoseconds: delayNs)
+            }
+            guard !Task.isCancelled else { return }
+            guard chat.id == chatId else { return }
+            renderWindowRefreshThrottleTask = nil
+            performThrottledRenderWindowRefresh()
+        }
+    }
+
+    @MainActor
+    private func performThrottledRenderWindowRefresh() {
+        guard let source = pendingRenderWindowRefreshSource else { return }
+        pendingRenderWindowRefreshSource = nil
+        lastRenderWindowRefreshAtNs = DispatchTime.now().uptimeNanoseconds
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "MessagesPane.renderWindowRefreshThrottle",
+            details: "chatId=\(chat.id) action=fired source=\(source)"
+        )
+        PerfCounters.emitPOIEvent("MessagesPane.renderWindowRefreshThrottled", chatId: chat.id)
+#endif
+        refreshRenderWindowIfNeeded(source: source)
+    }
+
+    @MainActor
+    private func handleMessageVisibilityChange(messageId: Int64, isVisible: Bool) {
+#if DEBUG
+        let signpostId = PerfCounters.beginPOI("MessagesPane.handleMessageVisibilityChange", chatId: chat.id)
+        defer {
+            PerfCounters.endPOI("MessagesPane.handleMessageVisibilityChange", signpostId: signpostId, chatId: chat.id)
+        }
+        PerfCounters.bumpEvent(
+            "MessagesPane.handleMessageVisibilityChange",
+            details: "chatId=\(chat.id) messageId=\(messageId) isVisible=\(isVisible)"
+        )
+#endif
+        guard messageId > 0 else { return }
+        let changed = visibilityBatcher.record(messageId: messageId, isVisible: isVisible)
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "MessagesPane.handleMessageVisibilityBuffered",
+            details: "chatId=\(chat.id) messageId=\(messageId) isVisible=\(isVisible) changed=\(changed) pendingMessages=\(visibilityBatcher.pendingMessageCount)"
+        )
+#endif
+        if !changed && visibilityBatchFlushTask != nil {
+            return
+        }
+        scheduleVisibilityBatchFlush()
     }
 
     @MainActor
     private func pruneVisibleMessageIdsToWindow() {
+        flushPendingVisibilityBatchIfNeeded(source: "pruneVisibleIds")
         let validIds = Set(renderMessages.filter { $0.id > 0 }.map(\.id))
         let pruned = visibleMessageIds.intersection(validIds)
         guard pruned != visibleMessageIds else { return }
         visibleMessageIds = pruned
         scheduleVisibleMessagesReport()
         scheduleWindowFocusSync()
-        refreshRenderWindowIfNeeded(source: "pruneVisibleIds")
+        requestRenderWindowRefreshThrottled(source: "pruneVisibleIds")
     }
 
     @MainActor
@@ -1791,7 +2085,7 @@ struct MessagesPane: View {
             }
             lastRequestedTopAnchorMessageId = nil
             clearPagingState()
-            handleTopSentinelOffset(lastTopSentinelMinY)
+            reconcileTopSentinelTriggerIfNeeded(source: "nearTopThreshold")
         }
 
         if !didInitialScrollToBottom {
@@ -1805,7 +2099,7 @@ struct MessagesPane: View {
                 }
                 didInitialScrollToBottom = true
                 pagingEnabled = true
-                handleTopSentinelOffset(lastTopSentinelMinY)
+                reconcileTopSentinelTriggerIfNeeded(source: "nearTopThreshold")
                 maybeRequestOlderForUnderfilledViewport(source: "initialScrollToBottom")
             }
             return
@@ -1839,37 +2133,41 @@ struct MessagesPane: View {
         newIncomingCount += max(1, newMessages.count - oldMessages.count)
     }
 
-    @ViewBuilder
-    private func rowView(_ row: Row) -> some View {
-        switch row {
-        case .dayHeader(_, let day):
-            DayHeaderView(day: day)
-
-        case .timeSeparator(_, let time):
-            TimeSeparatorView(date: time)
-
-        case .group(let group):
-            ChatMessageGroupView(
-                store: store,
-                chat: chat,
-                group: group,
-                optimizeForLargeTimeline: optimizeBubbleEffectsNow,
-                isLiveScrolling: isLiveScrolling,
-                isScrollPerformanceMode: isLightweightScrollRenderMode,
-                revealTimeX: revealTimeX,
-                jellyScrollImpulse: 0,
-                onMessageAppear: { messageId in
-                    handleMessageVisibilityChange(messageId: messageId, isVisible: true)
-                },
-                onMessageDisappear: { messageId in
-                    handleMessageVisibilityChange(messageId: messageId, isVisible: false)
-                }
-            )
-            .id(group.id)
+    @MainActor
+    private func handleMessageRowAction(_ action: MessageRowAction) {
+        switch action {
+        case .visibilityChanged(let messageId, let isVisible):
+            handleMessageVisibilityChange(messageId: messageId, isVisible: isVisible)
         }
     }
 
+    @MainActor
+    private func senderName(for row: Row) -> String? {
+        guard case .group(let group) = row else { return nil }
+        guard chat.kind.isGroup && !group.isOutgoing else { return nil }
+        let name = store.userDisplayName(group.senderUserId)
+        return name.isEmpty ? nil : name
+    }
+
+    @MainActor
+    private func retryMessageFromRow(_ message: TGMessage) {
+        store.retrySend(message: message)
+    }
+
+    @MainActor
+    private func deleteMessageFromRow(_ message: TGMessage) {
+        store.deleteMessages(chatId: message.chatId, messageIds: [message.id], revoke: true)
+    }
+
     var body: some View {
+#if DEBUG
+        let _ = PerfCounters.isPrintChangesEnabled ? Self._printChanges() : ()
+        let _ = PerfCounters.bumpRender(
+            "MessagesPane.body",
+            details: "chatId=\(chat.id) rows=\(rows.count) renderMessages=\(renderMessages.count) visible=\(visibleMessageIds.count)"
+        )
+#endif
+        let trackedMeasurementMessageId = trackedGroupRowMeasurementMessageId()
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
@@ -1886,31 +2184,32 @@ struct MessagesPane: View {
                         }
 
                     if showTopHistoryLoader {
-                        HStack {
-                            Spacer(minLength: 0)
-                            ProgressView()
-                                .controlSize(.small)
-                                .progressViewStyle(.circular)
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.vertical, 4)
+                        TopLoaderView()
                     }
 
                     ForEach(rows) { row in
-                        rowView(row)
-                            .background {
-                                switch row {
-                                case .group:
-                                    GeometryReader { geometry in
-                                        Color.clear.preference(
-                                            key: GroupRowMinYPreferenceKey.self,
-                                            value: [row.id: geometry.frame(in: .named(scrollSpaceName)).minY]
-                                        )
-                                    }
-                                case .dayHeader, .timeSeparator:
-                                    Color.clear
-                                }
-                            }
+                        MessageRowContainer(
+                            row: row,
+                            chatId: chat.id,
+                            isGroupChat: chat.kind.isGroup,
+                            senderName: senderName(for: row),
+                            optimizeForLargeTimeline: optimizeBubbleEffectsNow,
+                            isLiveScrolling: isLiveScrolling,
+                            isScrollPerformanceMode: isLightweightScrollRenderMode,
+                            revealTimeX: revealTimeX,
+                            shouldMeasureMinY: shouldPublishGroupRowMinY(
+                                for: row,
+                                trackedMessageId: trackedMeasurementMessageId
+                            ),
+                            scrollSpaceName: scrollSpaceName,
+                            mediaService: store.mediaService,
+                            mediaProgressProvider: store.mediaProgressProvider,
+                            onRetryMessage: retryMessageFromRow,
+                            onDeleteMessage: deleteMessageFromRow,
+                            onAction: handleMessageRowAction
+                        )
+                        // Keep unrelated pane state from re-diffing each row subtree.
+                        .equatable()
                     }
 
                     Color.clear
@@ -1961,44 +2260,18 @@ struct MessagesPane: View {
             }
             .overlay(alignment: .bottomTrailing) {
                 if newIncomingCount > 0 && !isAtBottom {
-                    Button {
+                    IncomingBadgeView(count: newIncomingCount) {
                         guard !shouldSuppressAutoScroll(reason: "newMessagesButton") else { return }
                         scrollToBottomSentinel(proxy, animated: true)
                         newIncomingCount = 0
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "arrow.down")
-                                .font(.system(size: 12, weight: .semibold))
-                            Text("\(newIncomingCount) new")
-                                .font(.caption.weight(.semibold))
-                        }
-                        .padding(.vertical, 8)
-                        .padding(.horizontal, 12)
-                        .background(.regularMaterial, in: Capsule(style: .continuous))
-                        .overlay(
-                            Capsule(style: .continuous)
-                                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
-                        )
                     }
-                    .buttonStyle(.plain)
                     .padding(.trailing, 18)
                     .padding(.bottom, 84)
                 }
             }
             .overlay(alignment: .bottom) {
-                if let jumpUnavailableBannerText {
-                    Text(jumpUnavailableBannerText)
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(.regularMaterial, in: Capsule(style: .continuous))
-                        .overlay(
-                            Capsule(style: .continuous)
-                                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
-                        )
-                        .padding(.bottom, 56)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
-                }
+                JumpBannerView(text: jumpUnavailableBannerText)
+                    .padding(.bottom, 56)
             }
             .simultaneousGesture(
                 DragGesture(minimumDistance: 8)
@@ -2027,11 +2300,10 @@ struct MessagesPane: View {
                 }
             }
             .onPreferenceChange(ContentMinYPreferenceKey.self) { minY in
-                handleTopSentinelOffset(minY)
-                maybeRequestOlderForUnderfilledViewport(source: "contentOffsetChanged")
+                handleContentMinYPreferenceChange(minY)
             }
             .onPreferenceChange(GroupRowMinYPreferenceKey.self) { map in
-                groupRowMinYById = map
+                handleGroupRowMinYPreferenceChange(map)
             }
             .onChange(of: viewModel.messages) { _, newMessages in
                 applyWindowMessages(newMessages)
@@ -2122,8 +2394,12 @@ struct MessagesPane: View {
                 lightweightScrollRenderModeResetTask?.cancel()
                 lightweightScrollRenderModeResetTask = nil
                 isLightweightScrollRenderMode = false
+                cancelVisibilityBatchFlushTask()
+                visibilityBatcher.clear()
                 visibleReportTask?.cancel()
                 visibleReportTask = nil
+                cancelRenderWindowRefreshThrottleTask()
+                lastRenderWindowRefreshAtNs = 0
                 visibleMessageIds = []
                 store.resetVisibleMessageTracking(chatId: chat.id)
                 store.clearMediaState(chatId: chat.id)
@@ -2212,53 +2488,6 @@ private struct Checkerboard: View {
     }
 }
 
-private enum ChatFormatters {
-    static let dayFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .none
-        return formatter
-    }()
-
-    static let timeFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .none
-        formatter.timeStyle = .short
-        return formatter
-    }()
-}
-
-private struct DayHeaderView: View {
-    let day: Date
-
-    var body: some View {
-        Text(dayLabel(day))
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
-    }
-
-    private func dayLabel(_ date: Date) -> String {
-        let calendar = Calendar.current
-        if calendar.isDateInToday(date) { return "Today" }
-        if calendar.isDateInYesterday(date) { return "Yesterday" }
-        return ChatFormatters.dayFormatter.string(from: date)
-    }
-}
-
-private struct TimeSeparatorView: View {
-    let date: Date
-
-    var body: some View {
-        Text(ChatFormatters.timeFormatter.string(from: date))
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 6)
-    }
-}
-
 struct MessageGroup: Identifiable, Hashable, Sendable {
     let id: String
     let isOutgoing: Bool
@@ -2266,7 +2495,7 @@ struct MessageGroup: Identifiable, Hashable, Sendable {
     var messages: [TGMessage]
 }
 
-private struct ContentMinYPreferenceKey: PreferenceKey {
+struct ContentMinYPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = -.greatestFiniteMagnitude
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -2274,7 +2503,7 @@ private struct ContentMinYPreferenceKey: PreferenceKey {
     }
 }
 
-private struct GroupRowMinYPreferenceKey: PreferenceKey {
+struct GroupRowMinYPreferenceKey: PreferenceKey {
     static var defaultValue: [String: CGFloat] = [:]
 
     static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {

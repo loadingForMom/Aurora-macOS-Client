@@ -233,17 +233,11 @@ struct AvatarCircle: View {
 }
 
 struct ChatRow: View {
-    @EnvironmentObject private var store: TelegramStore
-
     let chat: TGChat
     let previewText: String
-    let avatarPath: String? // keep (legacy), but we prefer store thumbs
-
-    private var avatarRevision: String {
-        let pathPart = avatarPath ?? "nil"
-        let version = store.chatAvatarVersionByChatId[chat.id] ?? 0
-        return "\(pathPart)#\(version)"
-    }
+    let avatarPath: String?
+    let avatarRevision: String
+    let avatarImageProvider: () async -> NSImage?
 
     private var avatarIdentity: AvatarCacheKey {
         AvatarCacheKey(
@@ -263,17 +257,7 @@ struct ChatRow: View {
                 reloadToken: avatarRevision,
                 size: 34,
                 font: .caption.weight(.semibold),
-                imageProvider: {
-                    if let image = await store.chatAvatarNSImageAsync(
-                        chatId: chat.id,
-                        pointSize: 34,
-                        preferHiRes: false
-                    ) {
-                        return image
-                    }
-                    guard let avatarPath else { return nil }
-                    return await DiskImageCache.shared.imageAsync(path: avatarPath)
-                }
+                imageProvider: avatarImageProvider
             )
             .overlay(
                 Circle().strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
@@ -323,15 +307,28 @@ private struct ChatRowPreviewContainer: View {
     )
 
     var body: some View {
+        let avatarPath = store.chatAvatarPathByChatId[chat.id]
+        let avatarRevision = "\(avatarPath ?? "nil")#\(store.chatAvatarVersionByChatId[chat.id] ?? 0)"
         List {
             ChatRow(
                 chat: chat,
                 previewText: chat.lastMessagePreview,
-                avatarPath: nil
+                avatarPath: avatarPath,
+                avatarRevision: avatarRevision,
+                avatarImageProvider: { [store, avatarPath] in
+                    if let image = await store.chatAvatarNSImageAsync(
+                        chatId: chat.id,
+                        pointSize: 34,
+                        preferHiRes: false
+                    ) {
+                        return image
+                    }
+                    guard let avatarPath else { return nil }
+                    return await DiskImageCache.shared.imageAsync(path: avatarPath)
+                }
             )
         }
         .listStyle(.sidebar)
-        .environmentObject(store)
         .frame(width: 360, height: 110)
     }
 }

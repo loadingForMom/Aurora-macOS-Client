@@ -87,7 +87,8 @@ final class TelegramStore: ObservableObject {
 
     // MARK: - Message media thumbs (photo/video)
 
-    @Published var mediaStateByMessageKey: [TGMessageMediaKey: TGMediaState] = [:]
+    var mediaStateByMessageKey: [TGMessageMediaKey: TGMediaState] = [:]
+    let mediaProgressProvider = MediaProgressProvider()
     private var pendingMediaStateUpdates: [TGMessageMediaKey: TGMediaState?] = [:]
     private var mediaStatePublishTask: Task<Void, Never>?
     private let mediaStatePublishDelayNs: UInt64 = 40_000_000
@@ -893,7 +894,7 @@ final class TelegramStore: ObservableObject {
 
     @MainActor
     func mediaState(chatId: Int64, messageId: Int64) -> TGMediaState? {
-        mediaStateByMessageKey[TGMessageMediaKey(chatId: chatId, messageId: messageId)]
+        mediaProgressProvider.state(chatId: chatId, messageId: messageId)
     }
 
     func handleMediaFileUpdate(_ update: TGFileUpdate) async {
@@ -902,6 +903,9 @@ final class TelegramStore: ObservableObject {
 
     @MainActor
     func clearMediaState(chatId: Int64) {
+        pendingMediaStateUpdates = pendingMediaStateUpdates.filter { $0.key.chatId != chatId }
+        mediaStateByMessageKey = mediaStateByMessageKey.filter { $0.key.chatId != chatId }
+        mediaProgressProvider.clear(chatId: chatId)
         Task {
             await mediaService.clear(chatId: chatId)
         }
@@ -1229,6 +1233,7 @@ final class TelegramStore: ObservableObject {
         mediaStatePublishTask = nil
         pendingMediaStateUpdates = [:]
         mediaStateByMessageKey = [:]
+        mediaProgressProvider.reset()
         Task { await mediaService.reset() }
 
         lastParsedUpdate = nil
@@ -1460,18 +1465,23 @@ final class TelegramStore: ObservableObject {
         }
 
         var nextStateByKey = mediaStateByMessageKey
+        var changedStates: [(key: TGMessageMediaKey, state: TGMediaState?)] = []
         for (key, state) in pendingMediaStateUpdates {
+            if nextStateByKey[key] == state { continue }
             if let state {
                 nextStateByKey[key] = state
             } else {
                 nextStateByKey.removeValue(forKey: key)
             }
+            changedStates.append((key: key, state: state))
         }
         pendingMediaStateUpdates.removeAll(keepingCapacity: true)
         mediaStatePublishTask = nil
 
-        if nextStateByKey != mediaStateByMessageKey {
-            mediaStateByMessageKey = nextStateByKey
+        guard !changedStates.isEmpty else { return }
+        mediaStateByMessageKey = nextStateByKey
+        for changed in changedStates {
+            mediaProgressProvider.setState(changed.state, for: changed.key)
         }
     }
 }

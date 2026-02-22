@@ -9,7 +9,6 @@ import SwiftUI
 import AppKit
 
 struct MessageBubble: View {
-    @ObservedObject var store: TelegramStore
     let msg: TGMessage
     let currentChatId: Int64
 
@@ -25,6 +24,8 @@ struct MessageBubble: View {
     /// Transient lightweight mode that may outlive live scroll for a short debounce.
     let isScrollPerformanceMode: Bool
 
+    let mediaService: MediaService
+    let mediaStateObserver: MediaProgressProvider.Observer
     var onRetry: () -> Void = {}
     var onDelete: () -> Void = {}
 
@@ -35,24 +36,26 @@ struct MessageBubble: View {
     private let bubbleMaxWidth: CGFloat = 560
 
     init(
-        store: TelegramStore,
         msg: TGMessage,
         currentChatId: Int64,
         revealTimeX: CGFloat = 0,
         heavyEffectsDisabled: Bool = false,
         isLiveScrolling: Bool = false,
         isScrollPerformanceMode: Bool = false,
+        mediaService: MediaService,
+        mediaStateObserver: MediaProgressProvider.Observer,
         onRetry: @escaping () -> Void = {},
         onDelete: @escaping () -> Void = {},
         jellyOffsetY: CGFloat = 0
     ) {
-        self.store = store
         self.msg = msg
         self.currentChatId = currentChatId
         self.revealTimeX = revealTimeX
         self.heavyEffectsDisabled = heavyEffectsDisabled
         self.isLiveScrolling = isLiveScrolling
         self.isScrollPerformanceMode = isScrollPerformanceMode
+        self.mediaService = mediaService
+        self.mediaStateObserver = mediaStateObserver
         self.onRetry = onRetry
         self.onDelete = onDelete
         self.jellyOffsetY = jellyOffsetY
@@ -60,6 +63,13 @@ struct MessageBubble: View {
     }
 
     var body: some View {
+#if DEBUG
+        let _ = PerfCounters.isPrintChangesEnabled ? Self._printChanges() : ()
+        let _ = PerfCounters.bumpRender(
+            "MessageBubble.body",
+            details: "chatId=\(msg.chatId) messageId=\(msg.id) outgoing=\(msg.isOutgoing)"
+        )
+#endif
         let reveal = min(max(0, revealTimeX), maxReveal)
         let isRevealingTime = reveal > 0.5
 
@@ -77,7 +87,17 @@ struct MessageBubble: View {
                     HStack {
                         if msg.isOutgoing { Spacer(minLength: 40) }
 
-                        content(isRevealingTime: isRevealingTime)
+                        MessageBubbleContentView(
+                            msg: msg,
+                            bubbleMaxWidth: bubbleMaxWidth,
+                            isRevealingTime: isRevealingTime,
+                            heavyEffectsDisabled: heavyEffectsDisabled,
+                            isLiveScrolling: isLiveScrolling,
+                            isScrollPerformanceMode: isScrollPerformanceMode,
+                            mediaService: mediaService,
+                            mediaStateObserver: mediaStateObserver,
+                            onRetry: onRetry
+                        )
                             .offset(x: -reveal)
 
                         if !msg.isOutgoing { Spacer(minLength: 40) }
@@ -110,6 +130,22 @@ struct MessageBubble: View {
                 transaction.disablesAnimations = true
                 transaction.animation = nil
             }
+        }
+        .onAppear {
+#if DEBUG
+            PerfCounters.bumpEvent(
+                "MessageBubble.onAppear",
+                details: "chatId=\(msg.chatId) messageId=\(msg.id) liveScrolling=\(isLiveScrolling)"
+            )
+#endif
+        }
+        .onDisappear {
+#if DEBUG
+            PerfCounters.bumpEvent(
+                "MessageBubble.onDisappear",
+                details: "chatId=\(msg.chatId) messageId=\(msg.id)"
+            )
+#endif
         }
     }
 
@@ -149,164 +185,10 @@ struct MessageBubble: View {
         }
     }
 
-    @ViewBuilder
-    private func content(isRevealingTime: Bool) -> some View {
-        let hideStatusLine = isRevealingTime && isSentState
-        let hasMedia = mediaDescriptor != nil
-        let shouldRenderText = shouldRenderTextContent
-
-        VStack(alignment: msg.isOutgoing ? .trailing : .leading, spacing: 4) {
-            VStack(alignment: msg.isOutgoing ? .trailing : .leading, spacing: hasMedia && shouldRenderText ? 8 : 0) {
-                if let descriptor = mediaDescriptor {
-                    MessageMediaAttachmentView(
-                        store: store,
-                        chatId: msg.chatId,
-                        messageId: msg.id,
-                        descriptor: descriptor,
-                        isLiveScrolling: isLiveScrolling,
-                        isScrollPerformanceMode: isScrollPerformanceMode
-                    )
-                    .padding(.horizontal, 8)
-                    .padding(.top, 8)
-                    .padding(.bottom, shouldRenderText ? 0 : 8)
-                }
-
-                if shouldRenderText {
-                    BubbleTextView(
-                        chatId: msg.chatId,
-                        messageId: msg.id,
-                        rawText: msg.textForRendering,
-                        entities: msg.entities,
-                        isOutgoing: msg.isOutgoing,
-                        textSelectionEnabled: !isLiveScrolling
-                    )
-                    .padding(.vertical, 8)
-                    .padding(.horizontal, 12)
-                }
-            }
-            .background {
-                let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
-
-                if msg.isOutgoing {
-                    shape.fill(Color(nsColor: .systemBlue).opacity(0.5))
-                } else {
-                    ZStack {
-                        shape
-                            .fill(Color.white.opacity(0.2))
-
-                        Color.clear
-                            .glassEffect(.clear, in: shape)
-                            .clipShape(shape)
-                    }
-                }
-            }
-            .overlay {
-                if !heavyEffectsDisabled {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
-                }
-            }
-
-            HStack(spacing: 6) {
-                if msg.isEdited {
-                    Text("edited")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .opacity(isRevealingTime ? 0 : 1)
-                }
-                statusView
-            }
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            // Keep status row in layout while revealing so bubbles do not jump on Y.
-            .opacity(hideStatusLine ? 0 : 1)
-            .allowsHitTesting(!hideStatusLine)
-        }
-        .frame(maxWidth: bubbleMaxWidth, alignment: msg.isOutgoing ? .trailing : .leading)
-    }
-
-    private var mediaDescriptor: TGMessageMediaDescriptor? {
-        guard msg.contentType == "messagePhoto" || msg.contentType == "messageVideo" else { return nil }
-        return msg.media
-    }
-
-    private var shouldRenderTextContent: Bool {
-        if mediaDescriptor != nil {
-            guard let text = msg.textForRendering?.trimmingCharacters(in: .whitespacesAndNewlines) else {
-                return false
-            }
-            return !text.isEmpty
-        }
-        return true
-    }
-
-    private var isSentState: Bool {
-        if case .sent = msg.sendState { return true }
-        return false
-    }
-
-    @ViewBuilder
-    private var statusView: some View {
-        switch msg.sendState {
-        case .sent:
-            Text(relativeTime(msg.date))
-
-        case .pending:
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.mini)
-                Text("Sending…")
-            }
-
-        case .sending:
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.mini)
-                Text("Sending…")
-            }
-
-        case .failed:
-            HStack(spacing: 6) {
-                Image(systemName: "exclamationmark.circle.fill")
-                    .foregroundStyle(.red)
-
-                if msg.canRetry {
-                    Button("Retry") { onRetry() }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.red)
-                } else {
-                    Text("Failed")
-                        .foregroundStyle(.red)
-                }
-            }
-        }
-    }
-
-    private var bubbleBackground: some ShapeStyle {
-        if msg.isOutgoing {
-            // Make outgoing bubbles always “Messages blue” on macOS.
-            return AnyShapeStyle(Color(nsColor: .systemBlue))
-        } else {
-            if heavyEffectsDisabled {
-                return AnyShapeStyle(Color(nsColor: .controlBackgroundColor))
-            }
-            return AnyShapeStyle(.thinMaterial)
-        }
-    }
-
-    private func relativeTime(_ unix: Int) -> String {
-        let date = Date(timeIntervalSince1970: TimeInterval(unix))
-        return Self.relativeFormatter.localizedString(for: date, relativeTo: Date())
-    }
-
     private func exactTime(_ unix: Int) -> String {
         let date = Date(timeIntervalSince1970: TimeInterval(unix))
         return Self.timeFormatter.string(from: date)
     }
-
-    private static let relativeFormatter: RelativeDateTimeFormatter = {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .abbreviated
-        return f
-    }()
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -316,20 +198,21 @@ struct MessageBubble: View {
     }()
 }
 
-private struct MessageMediaAttachmentView: View {
-    @ObservedObject var store: TelegramStore
+struct MessageMediaAttachmentView: View {
     let chatId: Int64
     let messageId: Int64
     let descriptor: TGMessageMediaDescriptor
     let isLiveScrolling: Bool
     let isScrollPerformanceMode: Bool
+    let mediaService: MediaService
+    @ObservedObject var mediaStateObserver: MediaProgressProvider.Observer
 
     @State private var thumbImage: NSImage?
     @State private var thumbPath: String?
     @State private var imageLoadTask: Task<Void, Never>? = nil
 
     private var mediaState: TGMediaState? {
-        store.mediaStateByMessageKey[TGMessageMediaKey(chatId: chatId, messageId: messageId)]
+        mediaStateObserver.state
     }
 
     private var perfMode: Bool {
@@ -402,24 +285,15 @@ private struct MessageMediaAttachmentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .task(id: taskId) {
             let scale = NSScreen.main?.backingScaleFactor ?? 2.0
-            let state: TGMediaState
-            if perfMode {
-                state = await store.ensureMediaThumbnail(
-                    chatId: chatId,
-                    messageId: messageId,
-                    descriptor: descriptor,
-                    targetPointSize: size,
-                    screenScale: scale
-                )
-            } else {
-                state = await store.ensureMediaImage(
-                    chatId: chatId,
-                    messageId: messageId,
-                    descriptor: descriptor,
-                    targetPointSize: size,
-                    screenScale: scale
-                )
-            }
+            let request = MediaEnsureRequest(
+                chatId: chatId,
+                messageId: messageId,
+                descriptor: descriptor,
+                targetPointSize: size,
+                screenScale: scale,
+                preferThumbnail: perfMode
+            )
+            let state = await ensureMediaState(for: request)
             scheduleImageLoad(path: state.thumbnailPath)
         }
         .onChange(of: mediaState?.thumbnailPath) { _, newPath in
@@ -456,9 +330,28 @@ private struct MessageMediaAttachmentView: View {
         guard thumbPath == path else { return }
         thumbImage = loaded
     }
+
+    private func ensureMediaState(for request: MediaEnsureRequest) async -> TGMediaState {
+        if request.preferThumbnail {
+            return await mediaService.ensureThumbnail(
+                chatId: request.chatId,
+                messageId: request.messageId,
+                descriptor: request.descriptor,
+                targetPointSize: request.targetPointSize,
+                screenScale: request.screenScale
+            )
+        }
+        return await mediaService.ensureImage(
+            chatId: request.chatId,
+            messageId: request.messageId,
+            descriptor: request.descriptor,
+            targetPointSize: request.targetPointSize,
+            screenScale: request.screenScale
+        )
+    }
 }
 
-private struct BubbleTextView: View {
+struct BubbleTextView: View {
     let chatId: Int64
     let messageId: Int64
     let rawText: String?
@@ -605,6 +498,7 @@ private struct BubbleTextView: View {
 
 private struct MessageBubblePreviewContainer: View {
     @StateObject private var store = TelegramStore.preview
+    private let mediaProgressProvider = MediaProgressProvider()
 
     private var incomingMessage: TGMessage {
         TGMessage(
@@ -631,14 +525,16 @@ private struct MessageBubblePreviewContainer: View {
     var body: some View {
         VStack(spacing: 12) {
             MessageBubble(
-                store: store,
                 msg: incomingMessage,
-                currentChatId: 101
+                currentChatId: 101,
+                mediaService: store.mediaService,
+                mediaStateObserver: mediaProgressProvider.observer(chatId: 101, messageId: incomingMessage.id)
             )
             MessageBubble(
-                store: store,
                 msg: outgoingMessage,
-                currentChatId: 101
+                currentChatId: 101,
+                mediaService: store.mediaService,
+                mediaStateObserver: mediaProgressProvider.observer(chatId: 101, messageId: outgoingMessage.id)
             )
         }
         .padding(16)

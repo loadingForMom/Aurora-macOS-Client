@@ -7,14 +7,18 @@ import SwiftUI
 
 
 struct ChatMessageGroupView: View {
-    @ObservedObject var store: TelegramStore
-    let chat: TGChat
+    let chatId: Int64
+    let isGroupChat: Bool
     let group: MessageGroup
+    let senderName: String?
     let optimizeForLargeTimeline: Bool
     let isLiveScrolling: Bool
     let isScrollPerformanceMode: Bool
-    let onMessageAppear: (Int64) -> Void
-    let onMessageDisappear: (Int64) -> Void
+    let mediaService: MediaService
+    let mediaProgressProvider: MediaProgressProvider
+    let onRetryMessage: (TGMessage) -> Void
+    let onDeleteMessage: (TGMessage) -> Void
+    let onMessageVisibilityChange: (Int64, Bool) -> Void
 
     /// Trackpad “reveal exact time” (0…maxReveal)
     let revealTimeX: CGFloat
@@ -23,27 +27,35 @@ struct ChatMessageGroupView: View {
     let jellyScrollImpulse: CGFloat
 
     init(
-        store: TelegramStore,
-        chat: TGChat,
+        chatId: Int64,
+        isGroupChat: Bool,
         group: MessageGroup,
+        senderName: String? = nil,
         optimizeForLargeTimeline: Bool = false,
         isLiveScrolling: Bool = false,
         isScrollPerformanceMode: Bool = false,
         revealTimeX: CGFloat = 0,
         jellyScrollImpulse: CGFloat = 0,
-        onMessageAppear: @escaping (Int64) -> Void = { _ in },
-        onMessageDisappear: @escaping (Int64) -> Void = { _ in }
+        mediaService: MediaService,
+        mediaProgressProvider: MediaProgressProvider,
+        onRetryMessage: @escaping (TGMessage) -> Void = { _ in },
+        onDeleteMessage: @escaping (TGMessage) -> Void = { _ in },
+        onMessageVisibilityChange: @escaping (Int64, Bool) -> Void = { _, _ in }
     ) {
-        self.store = store
-        self.chat = chat
+        self.chatId = chatId
+        self.isGroupChat = isGroupChat
         self.group = group
+        self.senderName = senderName
         self.optimizeForLargeTimeline = optimizeForLargeTimeline
         self.isLiveScrolling = isLiveScrolling
         self.isScrollPerformanceMode = isScrollPerformanceMode
         self.revealTimeX = revealTimeX
         self.jellyScrollImpulse = jellyScrollImpulse
-        self.onMessageAppear = onMessageAppear
-        self.onMessageDisappear = onMessageDisappear
+        self.mediaService = mediaService
+        self.mediaProgressProvider = mediaProgressProvider
+        self.onRetryMessage = onRetryMessage
+        self.onDeleteMessage = onDeleteMessage
+        self.onMessageVisibilityChange = onMessageVisibilityChange
     }
 
     private var heavyEffectsDisabled: Bool {
@@ -59,16 +71,22 @@ struct ChatMessageGroupView: View {
     }
 
     var body: some View {
+#if DEBUG
+        let _ = PerfCounters.isPrintChangesEnabled ? Self._printChanges() : ()
+        let _ = PerfCounters.bumpRender(
+            "ChatMessageGroupView.body",
+            details: "chatId=\(chatId) groupId=\(group.id) messages=\(group.messages.count) outgoing=\(group.isOutgoing)"
+        )
+#endif
         let enableJelly = abs(jellyScrollImpulse) > 0.5
             && group.messages.count < 60
         let stretch = enableJelly ? (1 + min(abs(jellyScrollImpulse) / 320, 0.18)) : 1
         let y = enableJelly ? (-jellyScrollImpulse * 1.1) : 0
 
         VStack(alignment: group.isOutgoing ? .trailing : .leading, spacing: 6) {
-            if chat.kind.isGroup && !group.isOutgoing {
-                let name = store.userDisplayName(group.senderUserId)
-                if !name.isEmpty {
-                    Text(name)
+            if isGroupChat && !group.isOutgoing {
+                if let senderName, !senderName.isEmpty {
+                    Text(senderName)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 6)
@@ -78,22 +96,26 @@ struct ChatMessageGroupView: View {
             VStack(alignment: group.isOutgoing ? .trailing : .leading, spacing: 4) {
                 ForEach(group.messages, id: \.id) { msg in
                     MessageBubble(
-                        store: store,
                         msg: msg,
-                        currentChatId: chat.id,
+                        currentChatId: chatId,
                         revealTimeX: revealTimeX,
                         heavyEffectsDisabled: heavyEffectsDisabled,
                         isLiveScrolling: isLiveScrolling,
                         isScrollPerformanceMode: isScrollPerformanceMode,
-                        onRetry: { store.retrySend(message: msg) },
-                        onDelete: { store.deleteMessages(chatId: msg.chatId, messageIds: [msg.id], revoke: true) }
+                        mediaService: mediaService,
+                        mediaStateObserver: mediaProgressProvider.observer(
+                            chatId: msg.chatId,
+                            messageId: msg.id
+                        ),
+                        onRetry: { onRetryMessage(msg) },
+                        onDelete: { onDeleteMessage(msg) }
                     )
                     .id(msg.id)
                     .onAppear {
-                        onMessageAppear(msg.id)
+                        onMessageVisibilityChange(msg.id, true)
                     }
                     .onDisappear {
-                        onMessageDisappear(msg.id)
+                        onMessageVisibilityChange(msg.id, false)
                     }
                 }
             }
@@ -103,9 +125,21 @@ struct ChatMessageGroupView: View {
         .scaleEffect(x: 1, y: stretch, anchor: .bottom)
         .offset(y: y)
         .onAppear {
+#if DEBUG
+            PerfCounters.bumpEvent(
+                "ChatMessageGroupView.onAppear",
+                details: "chatId=\(chatId) groupId=\(group.id) messages=\(group.messages.count)"
+            )
+#endif
             recordHeavyEffectsDisabledIfNeeded()
         }
         .onChange(of: heavyEffectsDisabled) { _, disabled in
+#if DEBUG
+            PerfCounters.bumpEvent(
+                "ChatMessageGroupView.onChangeHeavyEffectsDisabled",
+                details: "chatId=\(chatId) groupId=\(group.id) disabled=\(disabled)"
+            )
+#endif
             guard disabled else { return }
             recordHeavyEffectsDisabledIfNeeded()
         }
@@ -119,12 +153,13 @@ struct ChatMessageGroupView: View {
 
     private func recordHeavyEffectsDisabledIfNeeded() {
         guard scrollPerfModeActive else { return }
-        ChatPerfTrace.recordHeavyEffectsDisabled(chatId: chat.id, count: group.messages.count)
+        ChatPerfTrace.recordHeavyEffectsDisabled(chatId: chatId, count: group.messages.count)
     }
 }
 
 private struct ChatMessageGroupViewPreviewContainer: View {
     @StateObject private var store = TelegramStore.preview
+    private let mediaProgressProvider = MediaProgressProvider()
 
     private let chat = TGChat(
         id: 101,
@@ -162,9 +197,12 @@ private struct ChatMessageGroupViewPreviewContainer: View {
     var body: some View {
         ScrollView {
             ChatMessageGroupView(
-                store: store,
-                chat: chat,
-                group: previewGroup
+                chatId: chat.id,
+                isGroupChat: true,
+                group: previewGroup,
+                senderName: "Preview Sender",
+                mediaService: store.mediaService,
+                mediaProgressProvider: mediaProgressProvider,
             )
             .padding(.horizontal, 16)
             .padding(.vertical, 12)

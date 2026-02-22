@@ -11,12 +11,17 @@ import OSLog
 @MainActor
 final class ChatListViewModel: ObservableObject {
     @Published private(set) var chats: [TGChat] = []
+    @Published private(set) var filteredChats: [TGChat] = []
 
     private let log = Logger(subsystem: "com.aurora.app", category: "chat.list.vm")
     private let observationQueue = DispatchQueue(label: "com.aurora.app.chat.list.observation", qos: .utility)
     private let publishDebouncer = MainThreadPublishDebouncer<[TGChat]>(delay: 0.033)
-    private var cancellable: AnyCancellable?
+    private var cancellables: Set<AnyCancellable> = []
+    private let searchQuerySubject = PassthroughSubject<String, Never>()
+    private var latestNormalizedSearchQuery: String = ""
+    private var lastFilterInput: (query: String, chats: [TGChat])?
     private var applyCount = 0
+    private var filterComputeCount = 0
 
     init(dbPool: DatabasePool) {
         let observation = ValueObservation.tracking { db in
@@ -31,7 +36,7 @@ final class ChatListViewModel: ObservableObject {
             )
         }
 
-        cancellable = observation
+        observation
             .publisher(in: dbPool, scheduling: .async(onQueue: observationQueue))
             .map { rows in rows.map(TGChat.init(row:)) }
             .removeDuplicates()
@@ -63,6 +68,7 @@ final class ChatListViewModel: ObservableObject {
                             isViewUpdating: isViewUpdating
                         )
                         self.chats = snapshot
+                        self.recomputeFilteredChats(source: "chats")
                         AuroraRuntimeMetrics.shared.incrementPublish("chatList")
 #if DEBUG
                         if self.applyCount == 1 || self.applyCount % 20 == 0 {
@@ -72,5 +78,56 @@ final class ChatListViewModel: ObservableObject {
                     }
                 }
             )
+            .store(in: &cancellables)
+
+        searchQuerySubject
+            .map(Self.normalizeSearchQuery)
+            .removeDuplicates()
+            .debounce(for: .milliseconds(140), scheduler: RunLoop.main)
+            .sink { [weak self] normalizedQuery in
+                guard let self else { return }
+                guard self.latestNormalizedSearchQuery != normalizedQuery else { return }
+                self.latestNormalizedSearchQuery = normalizedQuery
+                self.recomputeFilteredChats(source: "search")
+            }
+            .store(in: &cancellables)
+
+        recomputeFilteredChats(source: "initial")
+    }
+
+    func updateSearchQuery(_ query: String) {
+        searchQuerySubject.send(query)
+    }
+
+    private func recomputeFilteredChats(source: String) {
+        if let lastFilterInput,
+           lastFilterInput.query == latestNormalizedSearchQuery,
+           lastFilterInput.chats == chats {
+            return
+        }
+        lastFilterInput = (latestNormalizedSearchQuery, chats)
+
+        filterComputeCount += 1
+        let nextFilteredChats = Self.filterChats(chats, normalizedQuery: latestNormalizedSearchQuery)
+#if DEBUG
+        PerfCounters.bumpEvent(
+            "ChatListViewModel.filteredChatsComputed",
+            details: "source=\(source) computeCount=\(filterComputeCount) chats=\(chats.count) filtered=\(nextFilteredChats.count) queryLen=\(latestNormalizedSearchQuery.count)"
+        )
+#endif
+        guard nextFilteredChats != filteredChats else { return }
+        filteredChats = nextFilteredChats
+    }
+
+    private static func normalizeSearchQuery(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func filterChats(_ chats: [TGChat], normalizedQuery: String) -> [TGChat] {
+        guard !normalizedQuery.isEmpty else { return chats }
+        return chats.filter { chat in
+            chat.title.lowercased().contains(normalizedQuery)
+                || chat.lastMessagePreview.lowercased().contains(normalizedQuery)
+        }
     }
 }

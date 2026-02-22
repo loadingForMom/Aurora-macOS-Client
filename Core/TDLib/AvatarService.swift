@@ -5,7 +5,7 @@
 import Foundation
 import AppKit
 
-final class AvatarService {
+nonisolated final class AvatarService {
     struct ChatAvatarMeta {
         var smallFileId: Int32?
         var bigFileId: Int32?
