@@ -15,6 +15,8 @@ struct MessagesPane: View {
     let chat: TGChat
     @ObservedObject var viewModel: ChatMessagesViewModel
     @Binding var isPagingHistory: Bool
+    @AppStorage("appearance_chat_background_choice")
+    private var chatBackgroundChoiceRawValue = ChatBackgroundChoice.blobs.rawValue
 
     @State private var rows: [Row] = []
     @State private var renderMessages: [TGMessage] = []
@@ -104,6 +106,9 @@ struct MessagesPane: View {
     }
     private var activeRenderAnchorMessageId: Int64? {
         pendingRestoreAnchorMessageId ?? pendingJumpAnchorMessageId
+    }
+    private var chatBackgroundChoice: ChatBackgroundChoice {
+        ChatBackgroundChoice(rawValue: chatBackgroundChoiceRawValue) ?? .blobs
     }
 
     private struct RowBuildResult: Sendable {
@@ -2125,7 +2130,85 @@ struct MessagesPane: View {
             }
         }
         .id(chat.id)
-        .background(Color(nsColor: .textBackgroundColor))
+        .background(DemoBackground(choice: chatBackgroundChoice))
+    }
+}
+
+private enum ChatBackgroundChoice: String {
+    case gradient
+    case blobs
+    case checker
+}
+
+private struct DemoBackground: View {
+    let choice: ChatBackgroundChoice
+    @State private var animate = false
+
+    var body: some View {
+        switch choice {
+        case .gradient:
+            LinearGradient(
+                colors: [.blue, .purple, .pink, .orange],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+        case .blobs:
+            ZStack {
+                LinearGradient(
+                    colors: [.black, .indigo, .purple],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .ignoresSafeArea()
+
+                Circle()
+                    .fill(.blue.gradient)
+                    .frame(width: 420, height: 420)
+                    .offset(x: animate ? -120 : 120, y: -180)
+                    .blur(radius: 30)
+
+                Circle()
+                    .fill(.pink.gradient)
+                    .frame(width: 360, height: 360)
+                    .offset(x: animate ? 140 : -140, y: 80)
+                    .blur(radius: 30)
+
+                Circle()
+                    .fill(.orange.gradient)
+                    .frame(width: 300, height: 300)
+                    .offset(x: animate ? -60 : 60, y: 260)
+                    .blur(radius: 34)
+            }
+            .ignoresSafeArea()
+            .task {
+                withAnimation(.easeInOut(duration: 6).repeatForever(autoreverses: true)) {
+                    animate = true
+                }
+            }
+
+        case .checker:
+            Checkerboard()
+                .ignoresSafeArea()
+        }
+    }
+}
+
+private struct Checkerboard: View {
+    var body: some View {
+        Canvas { context, size in
+            let cell: CGFloat = 36
+            for y in stride(from: 0, to: size.height, by: cell) {
+                for x in stride(from: 0, to: size.width, by: cell) {
+                    let isDark = (Int(x / cell) + Int(y / cell)) % 2 == 0
+                    context.fill(
+                        Path(CGRect(x: x, y: y, width: cell, height: cell)),
+                        with: .color(isDark ? .black : .white.opacity(0.9))
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -2311,4 +2394,45 @@ private struct ScrollLiveStateObserver: NSViewRepresentable {
             isLiveScrolling.wrappedValue = value
         }
     }
+}
+
+@MainActor
+private struct MessagesPanePreviewContainer: View {
+    @StateObject private var store: TelegramStore
+    @StateObject private var viewModel: ChatMessagesViewModel
+    @State private var isPagingHistory: Bool = false
+
+    private let chat: TGChat
+
+    init() {
+        let previewStore = TelegramStore.preview
+        let previewChat = TGChat(
+            id: 101,
+            title: "Preview Playground",
+            kind: .basicGroup,
+            order: 9_999_999,
+            lastMessagePreview: "Looks great. Let's ship this setup.",
+            lastMessageDate: Int(Date().timeIntervalSince1970) - 75
+        )
+
+        _store = StateObject(wrappedValue: previewStore)
+        _viewModel = StateObject(
+            wrappedValue: ChatMessagesViewModel(store: previewStore, chatId: previewChat.id)
+        )
+        chat = previewChat
+    }
+
+    var body: some View {
+        MessagesPane(
+            store: store,
+            chat: chat,
+            viewModel: viewModel,
+            isPagingHistory: $isPagingHistory
+        )
+        .frame(width: 920, height: 620)
+    }
+}
+
+#Preview("MessagesPane") {
+    MessagesPanePreviewContainer()
 }

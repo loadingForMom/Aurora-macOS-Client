@@ -753,3 +753,16 @@ private struct DonutChart: View {
         .accessibilityHidden(true)
     }
 }
+
+private struct SettingsRootViewPreviewContainer: View {
+    @StateObject private var store = TelegramStore.preview
+
+    var body: some View {
+        SettingsRootView(store: store)
+            .frame(width: 980, height: 640)
+    }
+}
+
+#Preview("SettingsRootView") {
+    SettingsRootViewPreviewContainer()
+}

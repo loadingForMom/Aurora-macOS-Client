@@ -11,6 +11,122 @@ import AppKit
 import OSLog
 import os.signpost
 
+extension ProcessInfo {
+    nonisolated static var isRunningForPreviews: Bool {
+        processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
+    }
+}
+
+nonisolated enum Env {
+    private static let lock = NSLock()
+    private static var didLoad = false
+
+    static func loadIfNeeded() {
+        if ProcessInfo.isRunningForPreviews {
+            return
+        }
+
+        lock.lock()
+        if didLoad {
+            lock.unlock()
+            return
+        }
+        didLoad = true
+        lock.unlock()
+
+        let env = ProcessInfo.processInfo.environment
+        guard let path = resolveEnvFilePath(from: env) else {
+            return
+        }
+
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+            print("Env.loadIfNeeded: failed to read env file at \(path)")
+            return
+        }
+
+        for rawLine in content.components(separatedBy: .newlines) {
+            var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix("#") {
+                continue
+            }
+            if line.hasPrefix("export ") {
+                line = String(line.dropFirst("export ".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard let separatorIndex = line.firstIndex(of: "=") else {
+                continue
+            }
+
+            let key = String(line[..<separatorIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { continue }
+
+            var value = String(line[line.index(after: separatorIndex)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if value.count >= 2 {
+                if (value.hasPrefix("\"") && value.hasSuffix("\"")) ||
+                    (value.hasPrefix("'") && value.hasSuffix("'")) {
+                    value = String(value.dropFirst().dropLast())
+                }
+            }
+            // Keep explicitly provided non-empty values (e.g. shell export) as source of truth.
+            if let existing = getenv(key), existing.pointee != 0 {
+                continue
+            }
+            setenv(key, value, 1)
+        }
+    }
+
+    private static func resolveEnvFilePath(from env: [String: String]) -> String? {
+        if let explicitPath = env["ENV_FILE_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicitPath.isEmpty,
+           let resolvedExplicitPath = existingPath(for: explicitPath) {
+            return resolvedExplicitPath
+        }
+
+        if let root = env["AURORA_PROJECT_ROOT"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !root.isEmpty {
+            let candidate = URL(fileURLWithPath: root, isDirectory: true)
+                .appendingPathComponent("Aurora.env", isDirectory: false)
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate.path
+            }
+        }
+
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        if let candidate = findAuroraEnv(startingAt: cwd) {
+            return candidate.path
+        }
+
+        var sourceURL = URL(fileURLWithPath: #filePath)
+        sourceURL.deleteLastPathComponent()
+        if let candidate = findAuroraEnv(startingAt: sourceURL) {
+            return candidate.path
+        }
+
+        return nil
+    }
+
+    private static func existingPath(for rawPath: String) -> String? {
+        let expandedPath = (rawPath as NSString).expandingTildeInPath
+        guard FileManager.default.fileExists(atPath: expandedPath) else {
+            return nil
+        }
+        return expandedPath
+    }
+
+    private static func findAuroraEnv(startingAt startingURL: URL) -> URL? {
+        var url = startingURL
+        while true {
+            let candidate = url.appendingPathComponent("Aurora.env", isDirectory: false)
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+            if url.path == "/" {
+                return nil
+            }
+            url.deleteLastPathComponent()
+        }
+    }
+}
+
 final class AppSessionLogRecorder {
     static let shared = AppSessionLogRecorder()
 

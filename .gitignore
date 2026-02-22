@@ -5,6 +5,9 @@ DerivedData/
 .build/
 Logs/
 Aurora.env
+.env
+.env.*
+*.env.local
 *.swp
 *.orig
 .derivedData/

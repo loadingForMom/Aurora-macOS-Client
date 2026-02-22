@@ -110,6 +110,27 @@ struct ChatHeader: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(.ultraThinMaterial)
+        .background(Color.clear)
+        .compositingGroup()
     }
+}
+
+private struct ChatHeaderPreviewContainer: View {
+    @StateObject private var store = TelegramStore.preview
+
+    var body: some View {
+        ChatHeader(
+            title: "Preview Playground",
+            isGroup: true,
+            chatId: 101,
+            avatarPath: nil,
+            onToggleInspector: {}
+        )
+        .environmentObject(store)
+        .frame(width: 760)
+    }
+}
+
+#Preview("ChatHeader") {
+    ChatHeaderPreviewContainer()
 }

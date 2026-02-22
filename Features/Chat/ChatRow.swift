@@ -309,3 +309,33 @@ struct ChatRow: View {
         return Self.relativeFormatter.localizedString(for: date, relativeTo: Date())
     }
 }
+
+private struct ChatRowPreviewContainer: View {
+    @StateObject private var store = TelegramStore.preview
+
+    private let chat = TGChat(
+        id: 101,
+        title: "Preview Playground",
+        kind: .basicGroup,
+        order: 9_999_999,
+        lastMessagePreview: "Looks great. Let's ship this setup.",
+        lastMessageDate: Int(Date().timeIntervalSince1970) - 75
+    )
+
+    var body: some View {
+        List {
+            ChatRow(
+                chat: chat,
+                previewText: chat.lastMessagePreview,
+                avatarPath: nil
+            )
+        }
+        .listStyle(.sidebar)
+        .environmentObject(store)
+        .frame(width: 360, height: 110)
+    }
+}
+
+#Preview("ChatRow") {
+    ChatRowPreviewContainer()
+}

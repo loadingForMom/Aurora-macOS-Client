@@ -7,13 +7,27 @@ import Foundation
 import GRDB
 
 final class AppDatabase {
+    enum StorageMode {
+        case persistent
+        case preview
+    }
+
     let dbPool: DatabasePool
 
-    init() throws {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("Aurora/app-db", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let dbURL = dir.appendingPathComponent("aurora.sqlite")
+    init(storageMode: StorageMode = .persistent) throws {
+        let dbURL: URL
+        switch storageMode {
+        case .persistent:
+            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            let dir = appSupport.appendingPathComponent("Aurora/app-db", isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            dbURL = dir.appendingPathComponent("aurora.sqlite")
+        case .preview:
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("AuroraPreviewDB", isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            dbURL = dir.appendingPathComponent("aurora-preview-\(UUID().uuidString).sqlite")
+        }
 
         var config = Configuration()
         config.prepareDatabase { db in

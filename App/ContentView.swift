@@ -34,106 +34,37 @@ enum HeaderPlateStyle: String, CaseIterable, Identifiable {
     }
 }
 
-final class ChatHeaderDebugState: ObservableObject {
-    static let defaultAvatarSize: Double = 34
-    static let defaultAvatarOverlap: Double = 3
-    static let defaultAvatarLowering: Double = 8
-    static let defaultToolbarOffsetY: Double = 6
-    static let defaultInspectorGlassOffsetY: Double = 0
-    static let defaultHeaderPlateOffsetX: Double = 0
-    static let defaultHeaderPlateOffsetY: Double = 0
-    static let defaultHeaderPlatePaddingX: Double = 14
-    static let defaultHeaderPlatePaddingY: Double = 6
-    static let defaultHeaderPlateCornerRadius: Double = 14
-    static let defaultHeaderPlateStyle: HeaderPlateStyle = .systemGlass
-    static let defaultHeaderPlateIntensity: Double = 0.38
-    static let defaultHeaderPlateOpacity: Double = 0.78
+enum ChatHeaderFixedMetrics {
+    // Размер круглого аватара в кнопке заголовка чата.
+    static let avatarSize: CGFloat = 34
+    // Насколько аватар перекрывает плашку заголовка.
+    static let avatarOverlap: CGFloat = 3
+    // Насколько аватар опущен вниз относительно верхней кромки.
+    static let avatarLowering: CGFloat = 8
+    // Вертикальный отступ блока заголовка в верхней панели чата.
+    static let toolbarOffsetY: CGFloat = 6
+    // Вертикальный сдвиг glass-фона в pinned-заголовке инспектора.
+    static let inspectorGlassOffsetY: CGFloat = 0
 
-    @Published var isEnabled: Bool = true
-    @Published var avatarSize: Double = defaultAvatarSize
-    @Published var avatarOverlap: Double = defaultAvatarOverlap
-    @Published var avatarLowering: Double = defaultAvatarLowering
-    @Published var toolbarOffsetY: Double = defaultToolbarOffsetY
-    @Published var inspectorGlassOffsetY: Double = defaultInspectorGlassOffsetY
-    @Published var headerPlateOffsetX: Double = defaultHeaderPlateOffsetX
-    @Published var headerPlateOffsetY: Double = defaultHeaderPlateOffsetY
-    @Published var headerPlatePaddingX: Double = defaultHeaderPlatePaddingX
-    @Published var headerPlatePaddingY: Double = defaultHeaderPlatePaddingY
-    @Published var headerPlateCornerRadius: Double = defaultHeaderPlateCornerRadius
-    @Published var headerPlateStyleRawValue: String = defaultHeaderPlateStyle.rawValue
-    @Published var headerPlateIntensity: Double = defaultHeaderPlateIntensity
-    @Published var headerPlateOpacity: Double = defaultHeaderPlateOpacity
+    // Горизонтальный сдвиг плашки заголовка.
+    static let plateOffsetX: CGFloat = 0
+    // Вертикальный сдвиг плашки заголовка.
+    static let plateOffsetY: CGFloat = 0
+    // Горизонтальный внутренний отступ текста в плашке.
+    static let platePaddingX: CGFloat = 14
+    // Вертикальный внутренний отступ текста в плашке.
+    static let platePaddingY: CGFloat = 6
+    // Скругление углов плашки заголовка.
+    static let plateCornerRadius: CGFloat = 14
+    // Визуальный стиль фона плашки.
+    static let plateStyle: HeaderPlateStyle = .systemGlass
+    // Интенсивность стеклянного/подсветочного эффекта плашки.
+    static let plateIntensity: Double = 0.38
+    // Общая непрозрачность плашки заголовка.
+    static let plateOpacity: Double = 0.78
 
-    var resolvedAvatarSize: CGFloat {
-        CGFloat(isEnabled ? avatarSize : Self.defaultAvatarSize)
-    }
-
-    var resolvedAvatarOverlap: CGFloat {
-        CGFloat(isEnabled ? avatarOverlap : Self.defaultAvatarOverlap)
-    }
-
-    var resolvedAvatarLowering: CGFloat {
-        CGFloat(isEnabled ? avatarLowering : Self.defaultAvatarLowering)
-    }
-
-    var resolvedAvatarLift: CGFloat {
-        max(0, resolvedAvatarSize - resolvedAvatarOverlap - resolvedAvatarLowering)
-    }
-
-    var resolvedToolbarOffsetY: CGFloat {
-        CGFloat(isEnabled ? toolbarOffsetY : Self.defaultToolbarOffsetY)
-    }
-
-    var resolvedInspectorGlassOffsetY: CGFloat {
-        CGFloat(isEnabled ? inspectorGlassOffsetY : Self.defaultInspectorGlassOffsetY)
-    }
-
-    var resolvedHeaderPlateOffsetX: CGFloat {
-        CGFloat(isEnabled ? headerPlateOffsetX : Self.defaultHeaderPlateOffsetX)
-    }
-
-    var resolvedHeaderPlateOffsetY: CGFloat {
-        CGFloat(isEnabled ? headerPlateOffsetY : Self.defaultHeaderPlateOffsetY)
-    }
-
-    var resolvedHeaderPlatePaddingX: CGFloat {
-        CGFloat(isEnabled ? headerPlatePaddingX : Self.defaultHeaderPlatePaddingX)
-    }
-
-    var resolvedHeaderPlatePaddingY: CGFloat {
-        CGFloat(isEnabled ? headerPlatePaddingY : Self.defaultHeaderPlatePaddingY)
-    }
-
-    var resolvedHeaderPlateCornerRadius: CGFloat {
-        CGFloat(isEnabled ? headerPlateCornerRadius : Self.defaultHeaderPlateCornerRadius)
-    }
-
-    var resolvedHeaderPlateStyle: HeaderPlateStyle {
-        .systemGlass
-    }
-
-    var resolvedHeaderPlateIntensity: Double {
-        isEnabled ? headerPlateIntensity : Self.defaultHeaderPlateIntensity
-    }
-
-    var resolvedHeaderPlateOpacity: Double {
-        isEnabled ? headerPlateOpacity : Self.defaultHeaderPlateOpacity
-    }
-
-    func reset() {
-        avatarSize = Self.defaultAvatarSize
-        avatarOverlap = Self.defaultAvatarOverlap
-        avatarLowering = Self.defaultAvatarLowering
-        toolbarOffsetY = Self.defaultToolbarOffsetY
-        inspectorGlassOffsetY = Self.defaultInspectorGlassOffsetY
-        headerPlateOffsetX = Self.defaultHeaderPlateOffsetX
-        headerPlateOffsetY = Self.defaultHeaderPlateOffsetY
-        headerPlatePaddingX = Self.defaultHeaderPlatePaddingX
-        headerPlatePaddingY = Self.defaultHeaderPlatePaddingY
-        headerPlateCornerRadius = Self.defaultHeaderPlateCornerRadius
-        headerPlateStyleRawValue = Self.defaultHeaderPlateStyle.rawValue
-        headerPlateIntensity = Self.defaultHeaderPlateIntensity
-        headerPlateOpacity = Self.defaultHeaderPlateOpacity
+    static var avatarLift: CGFloat {
+        max(0, avatarSize - avatarOverlap - avatarLowering)
     }
 }
 
@@ -177,6 +108,7 @@ struct ContentView: View {
     @State private var inspectorShown: Bool = false
     @State private var listSelection: Int64? = nil
     @State private var hostWindow: NSWindow? = nil
+    @State private var didApplyWindowChromeFix: Bool = false
 
     private func filteredChats(_ base: [TGChat], query: String) -> [TGChat] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -228,6 +160,32 @@ struct ContentView: View {
         guard targetWidth != frame.width || targetHeight != frame.height else { return }
         frame.size = NSSize(width: targetWidth, height: targetHeight)
         hostWindow.setFrame(frame, display: true, animate: false)
+    }
+
+    @MainActor
+    private func applyWindowChromeFixIfNeeded(window: NSWindow) {
+        guard !didApplyWindowChromeFix else { return }
+        didApplyWindowChromeFix = true
+
+        window.styleMask.insert(.fullSizeContentView)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+
+        // macOS 26.0 titlebar rendering workaround:
+        // force a second chrome pass after first layout.
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        if os.majorVersion == 26 && os.minorVersion == 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak window] in
+                guard let window else { return }
+                window.titlebarAppearsTransparent = false
+                window.titlebarAppearsTransparent = true
+                window.titlebarSeparatorStyle = .none
+                window.styleMask.insert(.fullSizeContentView)
+                window.titleVisibility = .hidden
+                window.displayIfNeeded()
+            }
+        }
     }
 
     var body: some View {
@@ -282,6 +240,7 @@ struct ContentView: View {
                 )
             }
             .toolbar(removing: .title)
+            .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
             .inspector(isPresented: $inspectorShown) {
                 if let chat = selectedChat {
                     ChatInspectorView(chat: chat)
@@ -353,7 +312,11 @@ struct ContentView: View {
         .background(
             WindowResolutionView { window in
                 guard hostWindow !== window else { return }
+                didApplyWindowChromeFix = false
                 hostWindow = window
+                Task { @MainActor in
+                    applyWindowChromeFixIfNeeded(window: window)
+                }
                 ensureWindowMinSize(minWidth: minWindowWidth)
             }
         )
@@ -399,7 +362,6 @@ private struct WindowResolutionView: NSViewRepresentable {
 
 struct ChatTitleButtonInline: View {
     @EnvironmentObject private var store: TelegramStore
-    @EnvironmentObject private var headerDebug: ChatHeaderDebugState
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     let title: String
@@ -413,16 +375,16 @@ struct ChatTitleButtonInline: View {
     }
 
     var body: some View {
-        let avatarSize = headerDebug.resolvedAvatarSize
-        let avatarLift = headerDebug.resolvedAvatarLift
-        let plateOffsetX = headerDebug.resolvedHeaderPlateOffsetX
-        let plateOffsetY = headerDebug.resolvedHeaderPlateOffsetY
-        let platePaddingX = headerDebug.resolvedHeaderPlatePaddingX
-        let platePaddingY = headerDebug.resolvedHeaderPlatePaddingY
-        let plateCornerRadius = headerDebug.resolvedHeaderPlateCornerRadius
-        let plateStyle = headerDebug.resolvedHeaderPlateStyle
-        let plateIntensity = headerDebug.resolvedHeaderPlateIntensity
-        let plateOpacity = headerDebug.resolvedHeaderPlateOpacity
+        let avatarSize = ChatHeaderFixedMetrics.avatarSize
+        let avatarLift = ChatHeaderFixedMetrics.avatarLift
+        let plateOffsetX = ChatHeaderFixedMetrics.plateOffsetX
+        let plateOffsetY = ChatHeaderFixedMetrics.plateOffsetY
+        let platePaddingX = ChatHeaderFixedMetrics.platePaddingX
+        let platePaddingY = ChatHeaderFixedMetrics.platePaddingY
+        let plateCornerRadius = ChatHeaderFixedMetrics.plateCornerRadius
+        let plateStyle = ChatHeaderFixedMetrics.plateStyle
+        let plateIntensity = ChatHeaderFixedMetrics.plateIntensity
+        let plateOpacity = ChatHeaderFixedMetrics.plateOpacity
 
         ZStack(alignment: .top) {
             Text(title)
@@ -693,4 +655,18 @@ private struct TelegramLoginView: View {
         guard (3...8).contains(compact.count) else { return nil }
         return compact
     }
+}
+
+private struct ContentViewPreviewContainer: View {
+    @StateObject private var store = TelegramStore.preview
+
+    var body: some View {
+        ContentView(store: store)
+            .environmentObject(store)
+            .frame(width: 980, height: 680)
+    }
+}
+
+#Preview("ContentView") {
+    ContentViewPreviewContainer()
 }

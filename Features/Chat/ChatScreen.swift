@@ -10,7 +10,6 @@ import AppKit
 
 struct ChatScreen: View {
     @ObservedObject var store: TelegramStore
-    @EnvironmentObject private var headerDebug: ChatHeaderDebugState
     let chat: TGChat
     let avatarPath: String?
     let onToggleInspector: () -> Void
@@ -61,6 +60,33 @@ struct ChatScreen: View {
         updateLoadingIndicatorVisibility(isLoading: isTimelineLoading)
     }
 
+    // MARK: - Toolbar content (macOS titlebar)
+    @ToolbarContentBuilder
+    private var chatTitlebarToolbar: some ToolbarContent {
+        ToolbarItem(placement: .principal) {
+            Button(action: onToggleInspector) {
+                HStack(spacing: 8) {
+                    ChatTitleButtonInline(
+                        title: chat.title,
+                        chatId: chat.id,
+                        avatarPath: avatarPath
+                    )
+
+                    ZStack {
+                        MacSpinningIndicator()
+                            .frame(width: 14, height: 14)
+                            .opacity(loadingIndicatorVisible ? 1 : 0)
+                    }
+                    .frame(width: 14, height: 14)
+                }
+                .padding(.vertical, 2)
+            }
+            .buttonStyle(.plain)
+        }
+        // ChatTitleButtonInline already draws its own plate.
+        .sharedBackgroundVisibility(.hidden)
+    }
+
     var body: some View {
         MessagesPane(
             store: store,
@@ -84,27 +110,8 @@ struct ChatScreen: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
             }
-            .overlay(alignment: .top) {
-                HStack(spacing: 8) {
-                    ChatTitleButtonInline(
-                        title: chat.title,
-                        chatId: chat.id,
-                        avatarPath: avatarPath
-                    )
-                    .onTapGesture {
-                        onToggleInspector()
-                    }
-
-                    ZStack {
-                        MacSpinningIndicator()
-                            .frame(width: 14, height: 14)
-                            .opacity(loadingIndicatorVisible ? 1 : 0)
-                    }
-                    .frame(width: 14, height: 14)
-                }
-                .padding(.top, headerDebug.resolvedToolbarOffsetY)
-                .padding(.horizontal, 16)
-                .frame(maxWidth: .infinity)
+            .toolbar {
+                chatTitlebarToolbar
             }
             .task(id: chat.id) {
                 draft = ""
@@ -140,4 +147,32 @@ private struct MacSpinningIndicator: NSViewRepresentable {
     func updateNSView(_ nsView: NSProgressIndicator, context: Context) {
         nsView.startAnimation(nil)
     }
+}
+
+private struct ChatScreenPreviewContainer: View {
+    @StateObject private var store = TelegramStore.preview
+
+    private let chat = TGChat(
+        id: 101,
+        title: "Preview Playground",
+        kind: .basicGroup,
+        order: 9_999_999,
+        lastMessagePreview: "Looks great. Let's ship this setup.",
+        lastMessageDate: Int(Date().timeIntervalSince1970) - 75
+    )
+
+    var body: some View {
+        ChatScreen(
+            store: store,
+            chat: chat,
+            avatarPath: nil,
+            onToggleInspector: {}
+        )
+        .environmentObject(store)
+        .frame(width: 980, height: 680)
+    }
+}
+
+#Preview("ChatScreen") {
+    ChatScreenPreviewContainer()
 }

@@ -184,11 +184,26 @@ struct MessageBubble: View {
                     .padding(.horizontal, 12)
                 }
             }
-            .background(bubbleBackground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .background {
+                let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+
+                if msg.isOutgoing {
+                    shape.fill(Color(nsColor: .systemBlue).opacity(0.5))
+                } else {
+                    ZStack {
+                        shape
+                            .fill(Color.white.opacity(0.2))
+
+                        Color.clear
+                            .glassEffect(.clear, in: shape)
+                            .clipShape(shape)
+                    }
+                }
+            }
             .overlay {
                 if !heavyEffectsDisabled {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+                        .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
                 }
             }
 
@@ -496,7 +511,7 @@ private struct BubbleTextView: View {
 
     var body: some View {
         selectableText
-            .foregroundStyle(isOutgoing ? .white : .primary)
+            .foregroundStyle(.white)
         .fixedSize(horizontal: false, vertical: true)
         .onAppear {
             let textSignature = textRenderSignature
@@ -586,4 +601,51 @@ private struct BubbleTextView: View {
         }
         return AttributedString("[unsupported message]")
     }
+}
+
+private struct MessageBubblePreviewContainer: View {
+    @StateObject private var store = TelegramStore.preview
+
+    private var incomingMessage: TGMessage {
+        TGMessage(
+            id: 10_001,
+            chatId: 101,
+            date: Int(Date().timeIntervalSince1970) - 120,
+            isOutgoing: false,
+            senderUserId: 7_002,
+            text: "Morning! The SwiftUI snapshot now renders instantly."
+        )
+    }
+
+    private var outgoingMessage: TGMessage {
+        TGMessage(
+            id: 10_002,
+            chatId: 101,
+            date: Int(Date().timeIntervalSince1970) - 75,
+            isOutgoing: true,
+            senderUserId: 7_001,
+            text: "Nice. I also disabled network calls in preview mode."
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            MessageBubble(
+                store: store,
+                msg: incomingMessage,
+                currentChatId: 101
+            )
+            MessageBubble(
+                store: store,
+                msg: outgoingMessage,
+                currentChatId: 101
+            )
+        }
+        .padding(16)
+        .frame(width: 720)
+    }
+}
+
+#Preview("MessageBubble") {
+    MessageBubblePreviewContainer()
 }

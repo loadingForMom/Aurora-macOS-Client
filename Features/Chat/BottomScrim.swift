@@ -29,3 +29,19 @@ struct BottomScrim: View {
             .allowsHitTesting(false)
     }
 }
+
+#Preview("BottomScrim") {
+    ZStack(alignment: .bottom) {
+        LinearGradient(
+            colors: [
+                Color(nsColor: .windowBackgroundColor),
+                Color(nsColor: .underPageBackgroundColor)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+
+        BottomScrim(height: 170)
+    }
+    .frame(width: 540, height: 280)
+}

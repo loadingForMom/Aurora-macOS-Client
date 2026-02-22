@@ -709,7 +709,6 @@ private struct HeroActionButton: View {
 private struct PinnedHeaderChrome: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
-    @EnvironmentObject private var headerDebug: ChatHeaderDebugState
 
     let title: String
     let avatar: NSImage?
@@ -727,7 +726,7 @@ private struct PinnedHeaderChrome: View {
     var body: some View {
         ZStack(alignment: .top) {
             chromeBackground
-                .offset(y: headerDebug.resolvedInspectorGlassOffsetY)
+                .offset(y: ChatHeaderFixedMetrics.inspectorGlassOffsetY)
                 .opacity(chromeAlpha)
 
             VStack(spacing: titleSpacing) {
@@ -1058,4 +1057,27 @@ private extension NSImage {
         guard let cropped = cg.cropping(to: CGRect(x: 0, y: y, width: w, height: stripH)) else { return nil }
         return NSImage(cgImage: cropped, size: NSSize(width: w, height: stripH))
     }
+}
+
+private struct ChatInspectorViewPreviewContainer: View {
+    @StateObject private var store = TelegramStore.preview
+
+    private let chat = TGChat(
+        id: 101,
+        title: "Preview Playground",
+        kind: .basicGroup,
+        order: 9_999_999,
+        lastMessagePreview: "Looks great. Let's ship this setup.",
+        lastMessageDate: Int(Date().timeIntervalSince1970) - 75
+    )
+
+    var body: some View {
+        ChatInspectorView(chat: chat)
+            .environmentObject(store)
+            .frame(width: 380, height: 820)
+    }
+}
+
+#Preview("ChatInspectorView") {
+    ChatInspectorViewPreviewContainer()
 }

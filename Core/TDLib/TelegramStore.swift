@@ -9,11 +9,21 @@ import OSLog
 import GRDB
 
 final class TelegramStore: ObservableObject {
+    enum Mode {
+        case live
+        case preview
+    }
+
+    static var preview: TelegramStore {
+        TelegramStore(mode: .preview)
+    }
+
     let log = Logger(subsystem: "com.aurora.app", category: "store")
+    let mode: Mode
     // TDLib
-    let td = TDLibClient()
+    let td: TDLibClientType
     private lazy var updateProcessor: TDLibUpdateProcessor = TDLibUpdateProcessor(store: self)
-    private let receiver: TDLibReceiver
+    private let receiver: TDLibReceiver?
     private let tdlibHighPriorityRequestQueue = DispatchQueue(label: "com.aurora.app.tdlib.request.high.queue", qos: .userInitiated)
     private let tdlibLowPriorityRequestQueue = DispatchQueue(label: "com.aurora.app.tdlib.request.low.queue", qos: .utility)
     private let userPrefetchQueue = DispatchQueue(label: "com.aurora.app.user.prefetch.queue", qos: .utility)
@@ -266,9 +276,12 @@ final class TelegramStore: ObservableObject {
 
     // MARK: - Init
 
-    init() {
+    init(mode: Mode = .live, tdClient: TDLibClientType? = nil) {
+        self.mode = mode
+        self.td = tdClient ?? Self.makeTDClient(mode: mode)
         do {
-            let db = try AppDatabase()
+            let dbMode: AppDatabase.StorageMode = (mode == .preview) ? .preview : .persistent
+            let db = try AppDatabase(storageMode: dbMode)
             database = db
         } catch {
             fatalError("Failed to initialize app database: \(error)")
@@ -277,26 +290,128 @@ final class TelegramStore: ObservableObject {
         databaseRepository = AppDatabaseRepository(dbWriter: dbPool)
         databaseBatchWriter = DatabaseBatchWriter(repository: databaseRepository)
 
-        
-        guard let receiver = td.makeReceiver() else {
-            fatalError("TDLib client not initialized")
-        }
-        self.receiver = receiver
-        receiver.start()
-        Task { [updateProcessor] in
-            await updateProcessor.start(stream: receiver.stream)
-        }
-
-        td.send(#"{"@type":"getOption","name":"version"}"#)
-
         if let n = UserDefaults.standard.object(forKey: cacheLimitBytesKey) as? NSNumber {
             cacheLimitBytes = n.int64Value
         }
 
-        updateAuthorizationSnapshot(state: authState, authorized: isAuthorized)
-        restorePendingMessagesFromDatabase()
-        startPendingCleanupTimer()
+        switch mode {
+        case .live:
+            guard let receiver = td.makeReceiver() else {
+                fatalError("TDLib client not initialized")
+            }
+            self.receiver = receiver
+            receiver.start()
+            Task { [updateProcessor] in
+                await updateProcessor.start(stream: receiver.stream)
+            }
+            td.send(#"{"@type":"getOption","name":"version"}"#)
+            updateAuthorizationSnapshot(state: authState, authorized: isAuthorized)
+            restorePendingMessagesFromDatabase()
+            startPendingCleanupTimer()
+        case .preview:
+            self.receiver = nil
+            configurePreviewState()
+        }
     }
+
+    private static func makeTDClient(mode: Mode) -> TDLibClientType {
+        switch mode {
+        case .live:
+            return TDLibClient()
+        case .preview:
+            return MockTDLibClient()
+        }
+    }
+
+    private func configurePreviewState() {
+        authState = "authorizationStateReady"
+        isAuthorized = true
+        didLoadInitialData = true
+        didSendTdlibParameters = true
+        didRequestInitialStorageStats = true
+        updateAuthorizationSnapshot(state: authState, authorized: isAuthorized)
+
+        let now = Int(Date().timeIntervalSince1970)
+        let me = TGUser(id: 7_001, firstName: "Aurora", lastName: "Preview", username: "aurora_preview")
+        let teammate = TGUser(id: 7_002, firstName: "Alex", lastName: "Taylor", username: "alex")
+
+        let chatAId: Int64 = 101
+        let chatBId: Int64 = 202
+        let messages: [TGMessage] = [
+            TGMessage(
+                id: 3_001,
+                chatId: chatAId,
+                date: now - 480,
+                isOutgoing: false,
+                senderUserId: teammate.id,
+                text: "Morning! The SwiftUI snapshot now renders instantly."
+            ),
+            TGMessage(
+                id: 3_002,
+                chatId: chatAId,
+                date: now - 210,
+                isOutgoing: true,
+                senderUserId: me.id,
+                text: "Nice. I also disabled network calls in preview mode."
+            ),
+            TGMessage(
+                id: 3_003,
+                chatId: chatAId,
+                date: now - 75,
+                isOutgoing: false,
+                senderUserId: teammate.id,
+                text: "Looks great. Let's ship this setup."
+            ),
+            TGMessage(
+                id: 4_001,
+                chatId: chatBId,
+                date: now - 1_300,
+                isOutgoing: false,
+                senderUserId: teammate.id,
+                text: "Draft for release notes is in the docs."
+            )
+        ]
+
+        let chats: [TGChat] = [
+            TGChat(
+                id: chatAId,
+                title: "Preview Playground",
+                kind: .basicGroup,
+                order: 9_999_999,
+                lastMessagePreview: "Looks great. Let's ship this setup.",
+                lastMessageDate: now - 75,
+                unreadCount: 0,
+                lastReadInboxMessageId: 3_003,
+                lastMessageId: 3_003
+            ),
+            TGChat(
+                id: chatBId,
+                title: "Product Notes",
+                kind: .privateChat,
+                order: 9_999_000,
+                lastMessagePreview: "Draft for release notes is in the docs.",
+                lastMessageDate: now - 1_300,
+                unreadCount: 1,
+                lastReadInboxMessageId: 0,
+                lastMessageId: 4_001
+            )
+        ]
+
+        myUserId = me.id
+        userCache[me.id] = me
+        userCache[teammate.id] = teammate
+        selectedChatId = chatAId
+        historyWindowLimitByChatId[chatAId] = 160
+        historyWindowLimitByChatId[chatBId] = 160
+
+        databaseRepository.upsertUser(me)
+        databaseRepository.upsertUser(teammate)
+        databaseRepository.upsertChats(chats)
+        databaseRepository.upsertMessages(messages)
+        databaseRepository.upsertChatLastMessage(chatId: chatAId, messageId: 3_003, preview: "Looks great. Let's ship this setup.", date: now - 75)
+        databaseRepository.upsertChatLastMessage(chatId: chatBId, messageId: 4_001, preview: "Draft for release notes is in the docs.", date: now - 1_300)
+    }
+
     // MARK: - Computed
 
     @MainActor
@@ -1161,7 +1276,9 @@ final class TelegramStore: ObservableObject {
         downloadLimiter.reset()
         Task { await messageStore.reset() }
 
-        startPendingCleanupTimer()
+        if mode == .live {
+            startPendingCleanupTimer()
+        }
     }
 
     private func authorizationSnapshot() -> (state: String, isAuthorized: Bool) {

@@ -122,3 +122,57 @@ struct ChatMessageGroupView: View {
         ChatPerfTrace.recordHeavyEffectsDisabled(chatId: chat.id, count: group.messages.count)
     }
 }
+
+private struct ChatMessageGroupViewPreviewContainer: View {
+    @StateObject private var store = TelegramStore.preview
+
+    private let chat = TGChat(
+        id: 101,
+        title: "Preview Playground",
+        kind: .basicGroup
+    )
+
+    private var previewGroup: MessageGroup {
+        let now = Int(Date().timeIntervalSince1970)
+        return MessageGroup(
+            id: "preview-group",
+            isOutgoing: false,
+            senderUserId: 7_002,
+            messages: [
+                TGMessage(
+                    id: 1,
+                    chatId: 101,
+                    date: now - 120,
+                    isOutgoing: false,
+                    senderUserId: 7_002,
+                    text: "Morning! The SwiftUI snapshot now renders instantly."
+                ),
+                TGMessage(
+                    id: 2,
+                    chatId: 101,
+                    date: now - 95,
+                    isOutgoing: false,
+                    senderUserId: 7_002,
+                    text: "Looks great. Let's ship this setup."
+                )
+            ]
+        )
+    }
+
+    var body: some View {
+        ScrollView {
+            ChatMessageGroupView(
+                store: store,
+                chat: chat,
+                group: previewGroup
+            )
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+        .frame(width: 680, height: 260)
+    }
+}
+
+#Preview("ChatMessageGroupView") {
+    ChatMessageGroupViewPreviewContainer()
+}

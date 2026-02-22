@@ -53,12 +53,17 @@
       <EnvironmentVariables>
          <EnvironmentVariable
             key = "TELEGRAM_API_ID"
-            value = "24409333"
-            isEnabled = "YES">
+            value = ""
+            isEnabled = "NO">
          </EnvironmentVariable>
          <EnvironmentVariable
             key = "TELEGRAM_API_HASH"
-            value = "bbfbf06d0895594a6a38ba0cd1c67949"
+            value = ""
+            isEnabled = "NO">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "ENV_FILE_PATH"
+            value = "$(PROJECT_DIR)/Aurora.env"
             isEnabled = "YES">
          </EnvironmentVariable>
       </EnvironmentVariables>

@@ -62,3 +62,22 @@ struct ChatTitleButton: View {
         .contentShape(Rectangle())
     }
 }
+
+private struct ChatTitleButtonPreviewContainer: View {
+    @StateObject private var store = TelegramStore.preview
+
+    var body: some View {
+        ChatTitleButton(
+            title: "Preview Playground",
+            chatId: 101,
+            avatarPath: nil
+        )
+        .environmentObject(store)
+        .frame(width: 260, height: 48)
+        .padding(.horizontal, 8)
+    }
+}
+
+#Preview("ChatTitleButton") {
+    ChatTitleButtonPreviewContainer()
+}

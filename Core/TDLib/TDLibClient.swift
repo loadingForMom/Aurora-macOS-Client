@@ -8,7 +8,24 @@
 import Foundation
 import OSLog
 
-final class TDLibClient {
+protocol TDLibClientType: AnyObject {
+    func send(function: [String: Any], priority: TDLibClient.SendPriority)
+    func makeReceiver() -> TDLibReceiver?
+    func send(_ json: String, priority: TDLibClient.SendPriority)
+    func stop()
+}
+
+extension TDLibClientType {
+    func send(function: [String: Any]) {
+        send(function: function, priority: .high)
+    }
+
+    func send(_ json: String) {
+        send(json, priority: .high)
+    }
+}
+
+final class TDLibClient: TDLibClientType {
     enum SendPriority: String {
         case high
         case low
@@ -106,4 +123,22 @@ final class TDLibClient {
             next.withCString { td_json_client_send(client, $0) }
         }
     }
+}
+
+final class MockTDLibClient: TDLibClientType {
+    func send(function: [String: Any], priority: TDLibClient.SendPriority) {
+        _ = function
+        _ = priority
+    }
+
+    func makeReceiver() -> TDLibReceiver? {
+        nil
+    }
+
+    func send(_ json: String, priority: TDLibClient.SendPriority) {
+        _ = json
+        _ = priority
+    }
+
+    func stop() {}
 }
