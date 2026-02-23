@@ -245,7 +245,7 @@ struct MessageMediaAttachmentView: View {
                     .resizable()
                     .scaledToFill()
                     .frame(width: size.width, height: size.height)
-                    .clipped()
+                    
             }
 
             if descriptor.kind == .video {

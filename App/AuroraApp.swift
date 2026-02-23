@@ -10,6 +10,7 @@ import SwiftUI
 @main
 struct AuroraApp: App {
     @StateObject private var store: TelegramStore
+    @StateObject private var settingsStore: SettingsStore
 
     init() {
         let isPreview = ProcessInfo.isRunningForPreviews
@@ -20,12 +21,14 @@ struct AuroraApp: App {
 
         let storeMode: TelegramStore.Mode = isPreview ? .preview : .live
         _store = StateObject(wrappedValue: TelegramStore(mode: storeMode))
+        _settingsStore = StateObject(wrappedValue: SettingsStore.shared)
     }
 
     var body: some Scene {
         WindowGroup {
             ContentView(store: store)
                 .environmentObject(store)
+                .environmentObject(settingsStore)
                 .frame(minWidth: 780, minHeight: 620)
         }
         .defaultSize(width: 980, height: 680)
@@ -39,6 +42,7 @@ struct AuroraApp: App {
         Settings {
             SettingsRootView(store: store)
                 .environmentObject(store)
+                .environmentObject(settingsStore)
         }
         // Xcode-style: settings is a fixed panel sized to its content.
         .windowResizability(.contentSize)

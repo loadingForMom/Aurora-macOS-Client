@@ -171,6 +171,7 @@ private struct SidebarProfileHeader: View {
 
 private struct GeneralSettingsView: View {
     @ObservedObject var store: TelegramStore
+    @EnvironmentObject private var settingsStore: SettingsStore
     @AppStorage("general_energy_saving") private var energySaving = false
     @AppStorage("general_spellcheck") private var spellcheck = true
     @AppStorage("general_interface_style") private var interfaceStyle = 0
@@ -242,6 +243,25 @@ private struct GeneralSettingsView: View {
                     Text("Светлый").tag(1)
                     Text("Тёмный").tag(2)
                 }
+            }
+
+            Section("AI (LM Studio)") {
+                TextField("Base URL", text: $settingsStore.baseURLString)
+
+                SecureField("API key (optional)", text: $settingsStore.apiKey)
+
+                TextField("Model", text: $settingsStore.modelName)
+
+                Stepper(value: $settingsStore.aiContextMessageCount, in: 1...30) {
+                    LabeledContent("Сообщений в контексте") {
+                        Text("\(settingsStore.aiContextMessageCount)")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Text("Endpoint: {Base URL}/v1/chat/completions")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
 
             Section("Быстрый доступ") {
@@ -756,9 +776,11 @@ private struct DonutChart: View {
 
 private struct SettingsRootViewPreviewContainer: View {
     @StateObject private var store = TelegramStore.preview
+    @StateObject private var settingsStore = SettingsStore()
 
     var body: some View {
         SettingsRootView(store: store)
+            .environmentObject(settingsStore)
             .frame(width: 980, height: 640)
     }
 }

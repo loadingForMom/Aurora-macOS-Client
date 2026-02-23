@@ -476,7 +476,7 @@ private struct PosterBackground: View {
                             .resizable()
                             .scaledToFill()
                             .frame(width: width, height: headerHeight)
-                            .clipped()
+                            
                             .blur(radius: posterBlurRadius, opaque: true)
                             .overlay(photoDimming)
                             .overlay(Color.black.opacity(0.06 * frostAmount))

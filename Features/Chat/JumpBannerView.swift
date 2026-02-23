@@ -12,7 +12,7 @@ struct JumpBannerView: View {
         if let text {
             Text(text)
                 .font(.caption.weight(.semibold))
-                .padding(.horizontal, 12)
+                .padding(.horizontal, 16)
                 .padding(.vertical, 8)
                 .background(.regularMaterial, in: Capsule(style: .continuous))
                 .overlay(

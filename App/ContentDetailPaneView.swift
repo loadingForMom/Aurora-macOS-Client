@@ -35,7 +35,8 @@ struct ContentDetailPaneView: View {
             if let chat = selectedChat {
                 ChatScreen(
                     store: store,
-                    chat: chat
+                    chat: chat,
+                    inspectorShown: $inspectorShown
                 )
                 .id(chat.id)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

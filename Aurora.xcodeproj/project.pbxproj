@@ -24,6 +24,7 @@
 		84D085082F094D2C00C35112 /* libtdjson.1.8.59.dylib in CopyFiles */ = {isa = PBXBuildFile; fileRef = 84D085052F094CED00C35112 /* libtdjson.1.8.59.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 		84D0850A2F094EE800C35112 /* TDLibClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085092F094D8400C35112 /* TDLibClient.swift */; };
 		84D0850C2F094FC700C35112 /* Config.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D0850B2F094FC000C35112 /* Config.swift */; };
+		D1A100012F50000100A0B0C1 /* SettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A101012F50000100A0B0C1 /* SettingsStore.swift */; };
 		84D0850E2F095F3200C35112 /* TelegramModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D0850D2F095F2F00C35112 /* TelegramModels.swift */; };
 		84D085122F095FA000C35112 /* TelegramStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085112F095F9B00C35112 /* TelegramStore.swift */; };
 		84D0851D2F09691700C35112 /* ChatInspectorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D0851C2F09689200C35112 /* ChatInspectorView.swift */; };
@@ -31,6 +32,11 @@
 		84D0851F2F09691700C35112 /* MessageGroupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D0851A2F09686100C35112 /* MessageGroupView.swift */; };
 		84D085202F09691700C35112 /* MessagesPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085192F09684A00C35112 /* MessagesPane.swift */; };
 		84D085222F09691700C35112 /* ChatScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085172F09680600C35112 /* ChatScreen.swift */; };
+		D1A100022F50000100A0B0C1 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A101022F50000100A0B0C1 /* Models.swift */; };
+		D1A100032F50000100A0B0C1 /* AIService.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A101032F50000100A0B0C1 /* AIService.swift */; };
+		D1A100042F50000100A0B0C1 /* ChatViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A101042F50000100A0B0C1 /* ChatViewModel.swift */; };
+		D1A100052F50000100A0B0C1 /* SuggestionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A101052F50000100A0B0C1 /* SuggestionsView.swift */; };
+		C0A110022F46000100A0B0C1 /* ChatTopProfileAvatarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A110012F46000100A0B0C1 /* ChatTopProfileAvatarView.swift */; };
 		84D085242F096ED700C35112 /* MessageBubble.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085232F096ED500C35112 /* MessageBubble.swift */; };
 		84D085262F096F4600C35112 /* ChatRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085252F096F4500C35112 /* ChatRow.swift */; };
 		84D085F02F1B123400C35112 /* MessageTextPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D085EF2F1B123400C35112 /* MessageTextPipeline.swift */; };
@@ -101,12 +107,18 @@
 		84D085052F094CED00C35112 /* libtdjson.1.8.59.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libtdjson.1.8.59.dylib; path = Vendor/TDLib/lib/libtdjson.1.8.59.dylib; sourceTree = "<group>"; };
 		84D085092F094D8400C35112 /* TDLibClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TDLibClient.swift; sourceTree = "<group>"; };
 		84D0850B2F094FC000C35112 /* Config.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Config.swift; sourceTree = "<group>"; };
+		D1A101012F50000100A0B0C1 /* SettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStore.swift; sourceTree = "<group>"; };
 		84D0850D2F095F2F00C35112 /* TelegramModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelegramModels.swift; sourceTree = "<group>"; };
 		84D085112F095F9B00C35112 /* TelegramStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelegramStore.swift; sourceTree = "<group>"; };
 		84D085172F09680600C35112 /* ChatScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatScreen.swift; sourceTree = "<group>"; };
 		84D085192F09684A00C35112 /* MessagesPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessagesPane.swift; sourceTree = "<group>"; };
 		84D0851A2F09686100C35112 /* MessageGroupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageGroupView.swift; sourceTree = "<group>"; };
 		84D0851B2F09687C00C35112 /* ComposerBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerBar.swift; sourceTree = "<group>"; };
+		D1A101022F50000100A0B0C1 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		D1A101032F50000100A0B0C1 /* AIService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIService.swift; sourceTree = "<group>"; };
+		D1A101042F50000100A0B0C1 /* ChatViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatViewModel.swift; sourceTree = "<group>"; };
+		D1A101052F50000100A0B0C1 /* SuggestionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SuggestionsView.swift; sourceTree = "<group>"; };
+		C0A110012F46000100A0B0C1 /* ChatTopProfileAvatarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTopProfileAvatarView.swift; sourceTree = "<group>"; };
 		84D0851C2F09689200C35112 /* ChatInspectorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatInspectorView.swift; sourceTree = "<group>"; };
 		84D085232F096ED500C35112 /* MessageBubble.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageBubble.swift; sourceTree = "<group>"; };
 		84D085252F096F4500C35112 /* ChatRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatRow.swift; sourceTree = "<group>"; };
@@ -260,6 +272,7 @@
 			isa = PBXGroup;
 			children = (
 				84D0850B2F094FC000C35112 /* Config.swift */,
+				D1A101012F50000100A0B0C1 /* SettingsStore.swift */,
 			);
 			path = Config;
 			sourceTree = "<group>";
@@ -294,11 +307,16 @@
 				B3F008002F40000100A0B0C1 /* JumpBannerView.swift */,
 				B3F003002F40000100A0B0C1 /* ScrollStateCoordinator.swift */,
 				B3F004002F40000100A0B0C1 /* VisibilityBatcher.swift */,
+				D1A101022F50000100A0B0C1 /* Models.swift */,
+				D1A101032F50000100A0B0C1 /* AIService.swift */,
 					844D56B42F14410600C3EE13 /* ChatListViewModel.swift */,
 					844D56B52F14410600C3EE13 /* ChatMessagesViewModel.swift */,
+					D1A101042F50000100A0B0C1 /* ChatViewModel.swift */,
 					84D0851C2F09689200C35112 /* ChatInspectorView.swift */,
 					B3F010002F40000100A0B0C1 /* InspectorAvatarLoader.swift */,
 					84D0851B2F09687C00C35112 /* ComposerBar.swift */,
+					D1A101052F50000100A0B0C1 /* SuggestionsView.swift */,
+					C0A110012F46000100A0B0C1 /* ChatTopProfileAvatarView.swift */,
 					84D0851A2F09686100C35112 /* MessageGroupView.swift */,
 					84D085192F09684A00C35112 /* MessagesPane.swift */,
 				84D085172F09680600C35112 /* ChatScreen.swift */,
@@ -443,10 +461,12 @@
 				84C742122F114B8F0041D863 /* ImageMemCache.swift in Sources */,
 				84C742132F114B8F0041D863 /* ThumbnailService.swift in Sources */,
 				84EE1A0F2F0D368400890773 /* TelegramStore+Timeline.swift in Sources */,
-					84D0851D2F09691700C35112 /* ChatInspectorView.swift in Sources */,
-					B3F010012F40000100A0B0C1 /* InspectorAvatarLoader.swift in Sources */,
-					84EE1A152F0D36CD00890773 /* TelegramStore+Parsing.swift.swift in Sources */,
-					84D0851E2F09691700C35112 /* ComposerBar.swift in Sources */,
+				84D0851D2F09691700C35112 /* ChatInspectorView.swift in Sources */,
+				B3F010012F40000100A0B0C1 /* InspectorAvatarLoader.swift in Sources */,
+				84EE1A152F0D36CD00890773 /* TelegramStore+Parsing.swift.swift in Sources */,
+				84D0851E2F09691700C35112 /* ComposerBar.swift in Sources */,
+				D1A100052F50000100A0B0C1 /* SuggestionsView.swift in Sources */,
+				C0A110022F46000100A0B0C1 /* ChatTopProfileAvatarView.swift in Sources */,
 				84EE1A042F0D35B700890773 /* TelegramStore+TDLibParameters.swift in Sources */,
 				84D0851F2F09691700C35112 /* MessageGroupView.swift in Sources */,
 				B3F005012F40000100A0B0C1 /* MessageRowContainer.swift in Sources */,
@@ -466,6 +486,9 @@
 				84EE1A172F0D36EE00890773 /* ThumbHash.swift in Sources */,
 				84D085262F096F4600C35112 /* ChatRow.swift in Sources */,
 				84D085222F09691700C35112 /* ChatScreen.swift in Sources */,
+				D1A100022F50000100A0B0C1 /* Models.swift in Sources */,
+				D1A100032F50000100A0B0C1 /* AIService.swift in Sources */,
+				D1A100042F50000100A0B0C1 /* ChatViewModel.swift in Sources */,
 				84D085122F095FA000C35112 /* TelegramStore.swift in Sources */,
 				9F1A0C1B2F20000100A0B0C1 /* TelegramStore+HistoryPaginationContext.swift in Sources */,
 				84E6878B2F09869100C89BE7 /* BottomScrim.swift in Sources */,
@@ -473,6 +496,7 @@
 				84D0850A2F094EE800C35112 /* TDLibClient.swift in Sources */,
 				BC57861F25EA4C37AEF186D0 /* AppDatabase.swift in Sources */,
 				84D0850C2F094FC700C35112 /* Config.swift in Sources */,
+				D1A100012F50000100A0B0C1 /* SettingsStore.swift in Sources */,
 				84E6878E2F09BFB600C89BE7 /* SettingsRootView.swift in Sources */,
 				84EE1A022F0D359500890773 /* TelegramStore+UpdateHandling.swift in Sources */,
 				84EE1A0D2F0D366B00890773 /* TelegramStore+ChatState.swift in Sources */,
