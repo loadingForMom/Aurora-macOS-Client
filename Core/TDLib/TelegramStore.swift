@@ -1109,18 +1109,32 @@ final class TelegramStore: ObservableObject {
         maxClamp: Int? = nil,
         kindOverride: String? = nil
     ) async -> NSImage? {
-        chatAvatarNSImage(
+        let meta = chatAvatarMetaByChatId[chatId]
+        let fallbackPath = chatAvatarPathByChatId[chatId]
+        let image = await avatarService.chatAvatarNSImageAsync(
             chatId: chatId,
             pointSize: pointSize,
             preferHiRes: preferHiRes,
             maxClamp: maxClamp,
-            kindOverride: kindOverride
+            kindOverride: kindOverride,
+            meta: meta,
+            fallbackPath: fallbackPath
         )
+
+        if image == nil, let meta {
+            if preferHiRes, let bigId = meta.bigFileId {
+                scheduleDownloadFile(fileId: bigId, priority: 10, reason: "visible-avatar-hires:\(chatId)")
+            } else if let smallId = meta.smallFileId ?? meta.bigFileId {
+                scheduleDownloadFile(fileId: smallId, priority: 16, reason: "visible-avatar:\(chatId)")
+            }
+        }
+
+        return image
     }
 
     @MainActor
     func chatAvatarNSImageAsync(chatId: Int64) async -> NSImage? {
-        chatAvatarNSImage(chatId: chatId)
+        await chatAvatarNSImageAsync(chatId: chatId, pointSize: 40, preferHiRes: false)
     }
 
     // MARK: - Authorization

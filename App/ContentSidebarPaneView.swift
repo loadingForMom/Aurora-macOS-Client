@@ -32,7 +32,6 @@ struct ContentSidebarPaneView: View {
                 ChatRow(
                     chat: chat,
                     previewText: sidebarPreview(for: chat),
-                    avatarPath: avatarPath,
                     avatarRevision: avatarRevision,
                     avatarImageProvider: { [store, chatId, avatarPath] in
                         if let image = await store.chatAvatarNSImageAsync(
@@ -46,6 +45,7 @@ struct ContentSidebarPaneView: View {
                         return await DiskImageCache.shared.imageAsync(path: avatarPath)
                     }
                 )
+                .equatable()
                 .tag(chat.id as Int64?)
                 .contentShape(Rectangle())
                 .onTapGesture {
@@ -78,9 +78,11 @@ struct ContentSidebarPaneView: View {
             viewModel.updateSearchQuery(nextQuery)
         }
         .onReceive(store.$chatAvatarPathByChatId.removeDuplicates()) { nextPaths in
+            guard avatarPathByChatId != nextPaths else { return }
             avatarPathByChatId = nextPaths
         }
         .onReceive(store.$chatAvatarVersionByChatId.removeDuplicates()) { nextVersions in
+            guard avatarVersionByChatId != nextVersions else { return }
             avatarVersionByChatId = nextVersions
         }
         .onAppear {

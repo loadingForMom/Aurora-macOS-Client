@@ -45,19 +45,45 @@ struct ContentView: View {
     let store: TelegramStore
     @State private var inspectorShown: Bool = false
     @State private var listSelection: Int64? = nil
-    @State private var storeSelectedChatId: Int64? = nil
     @State private var isAuthorized: Bool = false
     @State private var hostWindow: NSWindow? = nil
     @State private var didApplyWindowChromeFix: Bool = false
 
     private var selectedChatIdForUI: Int64? {
-        listSelection ?? storeSelectedChatId
+        listSelection
+    }
+
+    private var sidebarSelectionBinding: Binding<Int64?> {
+        Binding(
+            get: { listSelection },
+            set: { newChatId in
+                let oldChatId = listSelection
+                guard oldChatId != newChatId else { return }
+                listSelection = newChatId
+#if DEBUG
+                PerfCounters.bumpEvent(
+                    "ContentView.onChange.listSelection",
+                    details: "old=\(oldChatId.map(String.init) ?? "nil") new=\(newChatId.map(String.init) ?? "nil")"
+                )
+#endif
+                SwiftUIPublishTrace.uiEvent(
+                    name: "onChange_selectedChat",
+                    chatId: newChatId ?? oldChatId,
+                    payload: "old=\(oldChatId.map(String.init) ?? "n/a") new=\(newChatId.map(String.init) ?? "n/a")",
+                    reason: "fromSelectionChange"
+                )
+                guard let id = newChatId else { return }
+                // Let List commit the visual selection before triggering store side effects.
+                DispatchQueue.main.async {
+                    store.selectChat(id)
+                }
+            }
+        )
     }
 
     init(store: TelegramStore) {
         self.store = store
         _listSelection = State(initialValue: store.selectedChatId)
-        _storeSelectedChatId = State(initialValue: store.selectedChatId)
         _isAuthorized = State(initialValue: store.isAuthorized)
     }
 
@@ -120,44 +146,30 @@ struct ContentView: View {
             ContentMainPaneView(
                 store: store,
                 selectedChatId: selectedChatIdForUI,
-                listSelection: $listSelection,
+                listSelection: sidebarSelectionBinding,
                 inspectorShown: $inspectorShown
             )
             .task {
 #if DEBUG
                 PerfCounters.bumpEvent(
                     "ContentView.task",
-                    details: "selection=\(listSelection.map(String.init) ?? "nil") storeSelection=\(storeSelectedChatId.map(String.init) ?? "nil")"
+                    details: "selection=\(listSelection.map(String.init) ?? "nil") storeSelection=\(store.selectedChatId.map(String.init) ?? "nil")"
                 )
 #endif
-                if listSelection == nil, let storeSelection = storeSelectedChatId {
+                if listSelection == nil, let storeSelection = store.selectedChatId {
                     listSelection = storeSelection
                 }
-                if let id = listSelection ?? storeSelectedChatId {
+                if let id = listSelection {
                     SwiftUIPublishTrace.uiEvent(
                         name: "task_restoreSelectedChat",
                         chatId: id,
                         payload: "chatId=\(id)",
                         reason: "fromSelectionChange"
                     )
-                    store.selectChat(id, forceReload: false)
+                    DispatchQueue.main.async {
+                        store.selectChat(id, forceReload: false)
+                    }
                 }
-            }
-            .onChange(of: listSelection) { oldChatId, newChatId in
-#if DEBUG
-                PerfCounters.bumpEvent(
-                    "ContentView.onChange.listSelection",
-                    details: "old=\(oldChatId.map(String.init) ?? "nil") new=\(newChatId.map(String.init) ?? "nil")"
-                )
-#endif
-                SwiftUIPublishTrace.uiEvent(
-                    name: "onChange_selectedChat",
-                    chatId: newChatId ?? oldChatId,
-                    payload: "old=\(oldChatId.map(String.init) ?? "n/a") new=\(newChatId.map(String.init) ?? "n/a")",
-                    reason: "fromSelectionChange"
-                )
-                guard let id = newChatId else { return }
-                store.selectChat(id)
             }
             .onReceive(store.$selectedChatId.removeDuplicates()) { newChatId in
 #if DEBUG
@@ -166,9 +178,11 @@ struct ContentView: View {
                     details: "new=\(newChatId.map(String.init) ?? "nil")"
                 )
 #endif
-                storeSelectedChatId = newChatId
                 guard listSelection != newChatId else { return }
-                listSelection = newChatId
+                DispatchQueue.main.async {
+                    guard listSelection != newChatId else { return }
+                    listSelection = newChatId
+                }
             }
 
             if !isAuthorized {

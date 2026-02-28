@@ -232,12 +232,17 @@ struct AvatarCircle: View {
     }
 }
 
-struct ChatRow: View {
+struct ChatRow: View, Equatable {
     let chat: TGChat
     let previewText: String
-    let avatarPath: String?
     let avatarRevision: String
     let avatarImageProvider: () async -> NSImage?
+
+    static func == (lhs: ChatRow, rhs: ChatRow) -> Bool {
+        lhs.chat == rhs.chat
+            && lhs.previewText == rhs.previewText
+            && lhs.avatarRevision == rhs.avatarRevision
+    }
 
     private var avatarIdentity: AvatarCacheKey {
         AvatarCacheKey(
@@ -313,7 +318,6 @@ private struct ChatRowPreviewContainer: View {
             ChatRow(
                 chat: chat,
                 previewText: chat.lastMessagePreview,
-                avatarPath: avatarPath,
                 avatarRevision: avatarRevision,
                 avatarImageProvider: { [store, avatarPath] in
                     if let image = await store.chatAvatarNSImageAsync(

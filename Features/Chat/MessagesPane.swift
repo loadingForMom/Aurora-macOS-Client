@@ -996,6 +996,24 @@ struct MessagesPane: View {
             return
         }
 
+        // Keep the first visible frame responsive: asynchronous builds can be
+        // repeatedly cancelled while snapshots are still streaming in.
+        if !didInitialScrollToBottom, rows.isEmpty, !nextRenderMessages.isEmpty {
+            let initialRows = Self.buildRows(
+                chatId: expectedChatId,
+                messages: nextRenderMessages,
+                groupGap: currentGroupGap,
+                majorGap: currentMajorGap
+            )
+            windowMessages = fullWindowMessages
+            renderMessages = nextRenderMessages
+            rows = initialRows
+            renderRange = nextRenderRange
+            previousRenderMessageIds = nextRenderIds
+            Self.finalizeApplyTrace(traceInfo, chatId: expectedChatId)
+            return
+        }
+
         rowBuildTask = Task.detached(priority: .userInitiated) { [token, expectedChatId, nextRenderMessages, previousRenderMessages, previousRows, currentGroupGap, currentMajorGap, fullWindowMessages, nextRenderRange, traceInfo] in
             defer {
                 Self.finalizeApplyTrace(traceInfo, chatId: expectedChatId)
@@ -1486,7 +1504,7 @@ struct MessagesPane: View {
     }
 
     @MainActor
-    private func handleContentMinYPreferenceChange(_ minY: CGFloat) {
+    private func handleContentMinYChange(_ minY: CGFloat) {
 #if DEBUG
         PerfCounters.bumpEvent(
             "MessagesPane.preference.contentMinY",
@@ -2231,16 +2249,13 @@ struct MessagesPane: View {
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 14)
-                .background(
-                    GeometryReader { geometry in
-                        Color.clear.preference(
-                            key: ContentMinYPreferenceKey.self,
-                            value: geometry.frame(in: .named(scrollSpaceName)).minY
-                        )
-                    }
-                )
             }
-            .coordinateSpace(name: scrollSpaceName)
+            .coordinateSpace(.named(scrollSpaceName))
+            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                -geometry.contentOffset.y
+            } action: { _, minY in
+                handleContentMinYChange(minY)
+            }
             .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
             .opacity((didInitialScrollToBottom || windowMessages.isEmpty) ? 1 : 0)
             .background(
@@ -2298,9 +2313,6 @@ struct MessagesPane: View {
                         source: request.source
                     )
                 }
-            }
-            .onPreferenceChange(ContentMinYPreferenceKey.self) { minY in
-                handleContentMinYPreferenceChange(minY)
             }
             .onPreferenceChange(GroupRowMinYPreferenceKey.self) { map in
                 handleGroupRowMinYPreferenceChange(map)
@@ -2493,14 +2505,6 @@ struct MessageGroup: Identifiable, Hashable, Sendable {
     let isOutgoing: Bool
     let senderUserId: Int64?
     var messages: [TGMessage]
-}
-
-struct ContentMinYPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = -.greatestFiniteMagnitude
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
 }
 
 struct GroupRowMinYPreferenceKey: PreferenceKey {

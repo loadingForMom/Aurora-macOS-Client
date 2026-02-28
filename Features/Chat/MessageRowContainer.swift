@@ -89,6 +89,7 @@ struct MessageRowContainer: View, Equatable {
         switch row {
         case .group:
             if shouldMeasureMinY {
+                // swiftui-allow:geometryreader Required to publish exact row offset for prepend-anchor restoration.
                 GeometryReader { geometry in
                     Color.clear.preference(
                         key: GroupRowMinYPreferenceKey.self,

@@ -51,6 +51,7 @@ private struct _PinnedTitleSlotProbe: View {
                 .font(.headline)
                 .lineLimit(1)
                 .background(
+                    // swiftui-allow:geometryreader Required to capture the pinned-title minY for handoff progress.
                     GeometryReader { geo in
                         Color.clear.preference(
                             key: _PinnedTitleMinYKey.self,
@@ -308,6 +309,7 @@ struct ChatInspectorView: View {
             details: "chatId=\(chat.id) handoffProgress=\(handoffProgress) chromeAlpha=\(chromeAlpha)"
         )
 #endif
+        // swiftui-allow:geometryreader Required to bucket width for avatar decode/prefetch workload.
         GeometryReader { geo in
             let width = geo.size.width
 
@@ -329,6 +331,7 @@ struct ChatInspectorView: View {
                         Color.clear
                             .frame(height: 0)
                             .background(
+                                // swiftui-allow:geometryreader Required to track scroll-top minY with sub-point precision.
                                 GeometryReader { geo in
                                     Color.clear.preference(
                                         key: _ScrollTopMinYKey.self,
@@ -357,7 +360,7 @@ struct ChatInspectorView: View {
                     .padding(.horizontal, 16)
                     .padding(.bottom, 28)
                 }
-                .coordinateSpace(name: _InspectorCS.scroll)
+                .coordinateSpace(.named(_InspectorCS.scroll))
                 .ignoresSafeArea(.container, edges: .top)
                 .overlay(alignment: .top) {
                     _PinnedTitleSlotProbe(
@@ -462,6 +465,7 @@ private struct PosterBackground: View {
     let liquidGlassTint: CGFloat
 
     var body: some View {
+        // swiftui-allow:geometryreader Required to stretch poster strip to the live container size.
         GeometryReader { geo in
             let totalHeight = geo.size.height
             let width = geo.size.width
@@ -664,6 +668,7 @@ private struct HeroHeader: View {
                         .opacity(0.001)
                         .accessibilityHidden(true)
                         .background(
+                            // swiftui-allow:geometryreader Required to measure hero-title minY for pin alignment.
                             GeometryReader { geo in
                                 Color.clear.preference(
                                     key: _HeroTitleMinYKey.self,

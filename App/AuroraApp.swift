@@ -16,7 +16,6 @@ struct AuroraApp: App {
         let isPreview = ProcessInfo.isRunningForPreviews
         if !isPreview {
             Env.loadIfNeeded()
-            AppSessionLogRecorder.shared.startIfNeeded()
         }
 
         let storeMode: TelegramStore.Mode = isPreview ? .preview : .live

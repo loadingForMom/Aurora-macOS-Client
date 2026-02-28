@@ -5,8 +5,8 @@
 import Foundation
 import AppKit
 
-nonisolated final class AvatarService {
-    struct ChatAvatarMeta {
+nonisolated final class AvatarService: @unchecked Sendable {
+    struct ChatAvatarMeta: Sendable {
         var smallFileId: Int32?
         var bigFileId: Int32?
         var smallPath: String?
@@ -15,6 +15,11 @@ nonisolated final class AvatarService {
 
     private let imageMemCache = ImageMemCache()
     private let thumbnailService = ThumbnailService()
+    private let avatarDecodeQueue = DispatchQueue(
+        label: "com.aurora.app.avatar.decode",
+        qos: .utility,
+        attributes: .concurrent
+    )
 
     private let defaultListThumbMaxPx: Int = 128
     private let defaultProfileThumbMaxPx: Int = 128
@@ -56,19 +61,40 @@ nonisolated final class AvatarService {
         chatAvatarMetaByChatId: [Int64: ChatAvatarMeta],
         chatAvatarPathByChatId: [Int64: String]
     ) -> NSImage? {
+        let meta = chatAvatarMetaByChatId[chatId]
+        let fallbackPath = chatAvatarPathByChatId[chatId]
+        return chatAvatarNSImage(
+            chatId: chatId,
+            pointSize: pointSize,
+            preferHiRes: preferHiRes,
+            maxClamp: maxClamp,
+            kindOverride: kindOverride,
+            meta: meta,
+            fallbackPath: fallbackPath
+        )
+    }
+
+    func chatAvatarNSImage(
+        chatId: Int64,
+        pointSize: CGFloat,
+        preferHiRes: Bool,
+        maxClamp: Int?,
+        kindOverride: String?,
+        meta: ChatAvatarMeta?,
+        fallbackPath: String?
+    ) -> NSImage? {
         let cap = maxClamp ?? (preferHiRes ? defaultInspectorThumbMaxPx : defaultListThumbMaxPx)
         let maxPx = maxPixel(forPointSize: pointSize, clampTo: cap)
 
-        let meta = chatAvatarMetaByChatId[chatId]
         let src: String? = {
             if preferHiRes {
                 if let p = meta?.bigPath, !p.isEmpty { return p }
                 if let p = meta?.smallPath, !p.isEmpty { return p }
-                return chatAvatarPathByChatId[chatId]
+                return fallbackPath
             } else {
                 if let p = meta?.smallPath, !p.isEmpty { return p }
                 if let p = meta?.bigPath, !p.isEmpty { return p }
-                return chatAvatarPathByChatId[chatId]
+                return fallbackPath
             }
         }()
 
@@ -89,6 +115,35 @@ nonisolated final class AvatarService {
             maxPixel: maxPx,
             jpegQuality: q
         )
+    }
+
+    func chatAvatarNSImageAsync(
+        chatId: Int64,
+        pointSize: CGFloat,
+        preferHiRes: Bool,
+        maxClamp: Int?,
+        kindOverride: String?,
+        meta: ChatAvatarMeta?,
+        fallbackPath: String?
+    ) async -> NSImage? {
+        await withCheckedContinuation { continuation in
+            avatarDecodeQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let image = self.chatAvatarNSImage(
+                    chatId: chatId,
+                    pointSize: pointSize,
+                    preferHiRes: preferHiRes,
+                    maxClamp: maxClamp,
+                    kindOverride: kindOverride,
+                    meta: meta,
+                    fallbackPath: fallbackPath
+                )
+                continuation.resume(returning: image)
+            }
+        }
     }
 
     func prefetchChatAvatarHiResIfNeeded(
